@@ -37,6 +37,14 @@ Browser tests were driven with Playwright/Chromium from the owner's PC (Windows,
 - [x] `fail2ban-client status sshd` works (jail active, backend systemd).
 - [x] Syncthing: UI 127.0.0.1:8384 only, 22000 tcp/udp public, `/srv/syncthing` owned by 1000:1000; backup syncs `note.txt`, skips `/config`.
 
+## T5 Restore (host move)
+Clean snapshot (Debian 13, 1.9 GB, blank 20 GB `/dev/sdb`) -> `bootstrap` (`DATA_DISK=/dev/sdb`) -> Box data put back on the local SFTP target (checksum verified) -> `restore` with the same `DOMAIN=ente.test`.
+- [x] **Restore time: 167 s** (Docker + Caddy + rclone install included; DB restore ~2 s; 125 objects / 418 MB copied).
+- [x] DB after restore: 2 users, 61 files, 2 collections (same as before); `museum.yaml` byte-identical to the original (same sha256), lockdown block (admin + disabled sign-ups) preserved; 125 objects in the bucket (= Box); objects on the data disk; temp dir with decrypted config removed.
+- [x] Browser (Playwright, new local CA so certificate errors ignored): owner and family log in with their original passwords; owner sees 51 items (Test album with video tile), family 10 (Family album); full-size viewer loads originals (2400 px); public album link (same token and key) opens logged out: "Join Ente Test album, 51 memories", thumbnails rendered.
+- [x] `backup-setup` on the restored host (remotes and key reused, no passphrase prompt), first backup success, `check` all OK.
+- Not covered: the restored server had a new Caddy local CA (test mode); in production a real certificate is issued once DNS points at the new IP.
+
 ## T6 Low RAM (PARTIAL: VM still has 1.9 GB; a real 1 GB run is pending)
 - [x] `LOW_RAM=yes` applied by `install`: museum `GOMEMLIMIT=150MiB`, silo `GOMEMLIMIT=200MiB`, postgres `shared_buffers=64MB`, zram + backup `--transfers 2 --buffer-size 4M`; override merged with `docker compose config`.
 - [x] 200 distinct photos (221 MB) uploaded in 24 s; backup afterwards succeeded; `journalctl -k`: 0 OOM messages; `check` all OK.
@@ -65,4 +73,4 @@ Browser tests were driven with Playwright/Chromium from the owner's PC (Windows,
 - Booting with the data disk missing leaves Silo stopped until the disk is back and `docker compose up -d` is run (by design).
 
 ## Pending
-T5 restore (needs a clean snapshot revert), T6 at 1 GB, CLI step, desktop app.
+T6 at 1 GB (needs the VM resized), CLI step, desktop app.
