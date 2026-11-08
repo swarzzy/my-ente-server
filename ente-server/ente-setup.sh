@@ -15,6 +15,7 @@ CADDY_ROOT=/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
 INT_BEGIN='# BEGIN ente-setup internal'
 INT_END='# END ente-setup internal'
 FAILS=0
+MUSEUM_CFG_CHANGED=0
 CMD=
 
 # ---------------------------------------------------------------- helpers
@@ -303,7 +304,7 @@ sync_internal() {
       echo "$INT_END"
     } >>"$tmp"
   fi
-  if ! cmp -s "$tmp" "$m"; then cat "$tmp" >"$m"; log "updated internal block in museum.yaml"; fi # in place: keep inode for the bind mount
+  if ! cmp -s "$tmp" "$m"; then cat "$tmp" >"$m"; MUSEUM_CFG_CHANGED=1; log "updated internal block in museum.yaml"; fi # in place: keep inode for the bind mount
   rm -f "$tmp"
   python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$m" || die "museum.yaml invalid after internal edit"
 }
@@ -416,6 +417,7 @@ EOF
 
 cmd_install() {
   load_env
+  local pre
   apt-get update -q; apt_install curl ca-certificates python3-yaml gnupg
   if [[ -n $DATA_DISK ]]; then mountpoint -q "$DATA_MNT" || die "$DATA_MNT not mounted; run bootstrap first"; fi
   install_docker
@@ -423,7 +425,9 @@ cmd_install() {
   run_quickstart
   configure_host
   log "starting containers"
+  pre=$(dc ps -q museum 2>/dev/null || true)
   dc up -d
+  if [[ -n $pre && $MUSEUM_CFG_CHANGED == 1 ]]; then log "museum.yaml changed, restarting museum"; dc restart museum >/dev/null; fi
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
   if url_ok "https://api.$DOMAIN/ping" 20; then log "https://api.$DOMAIN/ping OK"
@@ -614,7 +618,8 @@ cmd_restore() {
   rclone listremotes | grep -qx 'box-crypt:' && rclone config delete box-crypt
   make_box_remotes once
   tmp=$(mktemp -d /root/ente-restore.XXXXXX)
-  trap 'rm -rf "$tmp"' EXIT
+  # shellcheck disable=SC2064 # expand now: $tmp is local to this function
+  trap "rm -rf '$tmp'" EXIT
   log "fetching config backup"
   rclone copy box-crypt: "$tmp" --checkers 4
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
