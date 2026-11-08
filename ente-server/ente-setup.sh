@@ -406,7 +406,7 @@ print_test_steps() {
 Test mode - on the Windows PC (as admin / for your user):
   1. Hosts file C:\\Windows\\System32\\drivers\\etc\\hosts, add:
        $(host_ip) api.$DOMAIN web.$DOMAIN albums.$DOMAIN s3.$DOMAIN
-  2. Copy the root cert:  scp $ADMIN_USER@$(host_ip):$CADDY_ROOT root.crt   (or sudo-copy it first)
+  2. Copy the root cert:  scp $ADMIN_USER@$(host_ip):/usr/local/share/ca-certificates/ente-test-caddy-root.crt root.crt
      Import-Certificate -FilePath root.crt -CertStoreLocation Cert:\\CurrentUser\\Root
      (Edge/Chrome/Ente desktop use the Windows store; Firefox needs its own setting)
   3. Open https://web.$DOMAIN ; desktop app: 7 taps on the welcome screen, endpoint https://api.$DOMAIN
@@ -451,12 +451,12 @@ cmd_lockdown() {
   local rows first id a
   if [[ -n $(internal_admin) ]] && internal_locked; then log "already locked down (admin $(internal_admin))"; return 0; fi
   wait_healthy museum 60
-  rows=$(dc exec -T postgres psql -U pguser -d ente_db -At -F '|' -c "SELECT user_id, to_timestamp(creation_time/1000000) FROM users ORDER BY creation_time;")
+  rows=$(dc exec -T postgres psql -U pguser -d ente_db -At -F '|' -c "SELECT user_id, to_timestamp(creation_time/1000000) FROM users ORDER BY creation_time;" </dev/null)
   [[ -n $rows ]] || die "no users yet; sign up the owner first"
   echo "Users (oldest first):"; echo "user_id|created"; echo "$rows"
   first=${rows%%$'\n'*}; id=${first%%|*}
   [[ $id =~ ^[0-9]+$ ]] || die "unexpected user_id '$id'"
-  read -rp "Make user_id $id (oldest) the admin and close sign-ups? [y/N] " a
+  read -rp "Make user_id $id (oldest) the admin and close sign-ups? [y/N] " a || die "no answer (stdin closed)"
   [[ $a == y || $a == Y ]] || die "aborted"
   sync_internal "$id" yes
   dc restart museum >/dev/null
