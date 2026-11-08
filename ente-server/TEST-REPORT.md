@@ -13,7 +13,7 @@ Browser tests were driven with Playwright/Chromium from the owner's PC (Windows,
 - [x] Web app: owner and family signed up; 50 photos (2.4 MB each) + 1 video (275 MB, 1:00) uploaded; video stored as 20 MB `part.N` objects (multipart); thumbnails render (36 in gallery), full-size viewer opens ("2 / 51"), album created, public link `albums.ente.test/?t=...` opens logged-out with 51 memories and thumbnails.
 - [ ] Windows desktop app: not tested.
 - [x] `lockdown`: owner (oldest user) set as admin, `disable-registration: true`; third sign-up -> HTTP 403, existing login -> 200; re-run is a no-op.
-- [ ] Ente CLI `update-subscription --no-limit`: not tested (GitHub was returning 503/timeouts when downloading the CLI).
+- [ ] Ente CLI `update-subscription --no-limit`: not tested. Left to the owner (running a downloaded CLI binary was not permitted in the test session). Unverified in the brief: whether `ente account login ... --host` exists in CLI v0.3.0 (the CLI may expect an `endpoint.api` entry in its `config.yaml` instead). The test server's local CA is regenerated on every fresh install, so import the CA of the server under test, or reach the API through `ssh -L 8080:127.0.0.1:8080 ops@<vm>` and point the CLI at `http://localhost:8080`.
 
 ## T2 Idempotency
 - [x] Re-running `bootstrap`, `install` and `backup-setup`: no diff in any touched file (sha256 of fstab, hosts, sshd drop-in, sudoers, authorized_keys, apt confs, fail2ban, Caddyfile, daemon.json, compose/museum/override, ufw rules), no duplicated lines (1 swapfile line, 1 hosts line), containers not recreated (same Created timestamps).
@@ -33,10 +33,6 @@ Browser tests were driven with Playwright/Chromium from the owner's PC (Windows,
 - [ ] Real Storage Box (port 23, `ssh-copy-id -s`): not tested (no Box).
 - Rclone with Silo down: retries for several minutes, then "not deleting files as there were IO errors" (nothing deleted on the Box).
 
-## T7
-- [x] `fail2ban-client status sshd` works (jail active, backend systemd).
-- [x] Syncthing: UI 127.0.0.1:8384 only, 22000 tcp/udp public, `/srv/syncthing` owned by 1000:1000; backup syncs `note.txt`, skips `/config`.
-
 ## T5 Restore (host move)
 Clean snapshot (Debian 13, 1.9 GB, blank 20 GB `/dev/sdb`) -> `bootstrap` (`DATA_DISK=/dev/sdb`) -> Box data put back on the local SFTP target (checksum verified) -> `restore` with the same `DOMAIN=ente.test`.
 - [x] **Restore time: 167 s** (Docker + Caddy + rclone install included; DB restore ~2 s; 125 objects / 418 MB copied).
@@ -53,6 +49,10 @@ Restored host from T5, VM shrunk to 1 GB, `bootstrap` + `install` re-run (zram 4
 - System: idle after boot `used` 545 MB; max `used` 708 MB; minimum `available` 191 MB; swap used peaked at 400 MB (zram 223 MB + swapfile 70 MB at the end). `free -m` after the runs: total 899, used 607, buff/cache 336, available 291.
 - Idle floor outside the containers (2 GB run, RSS): dockerd 60, containerd 54, caddy 53, fail2ban 25 MB, kernel slab ~120 MB. 1 GB works for this workload but with little headroom (minimum available 191 MB); 2 GB is the comfortable size.
 - Note: `LOW_RAM=auto` is decided when a subcommand runs. A host bootstrapped at 2 GB and later shrunk needs `bootstrap` (zram) and `install` (container limits) re-run.
+
+## T7
+- [x] `fail2ban-client status sshd` works (jail active, backend systemd).
+- [x] Syncthing: UI 127.0.0.1:8384 only, 22000 tcp/udp public, `/srv/syncthing` owned by 1000:1000; backup syncs `note.txt`, skips `/config`.
 
 ## Deviations from the brief
 1. `ADMIN_USER` gets a `NOPASSWD` sudoers drop-in (key-only user has no password).
