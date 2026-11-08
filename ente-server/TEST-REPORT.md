@@ -45,12 +45,14 @@ Clean snapshot (Debian 13, 1.9 GB, blank 20 GB `/dev/sdb`) -> `bootstrap` (`DATA
 - [x] `backup-setup` on the restored host (remotes and key reused, no passphrase prompt), first backup success, `check` all OK.
 - Not covered: the restored server had a new Caddy local CA (test mode); in production a real certificate is issued once DNS points at the new IP.
 
-## T6 Low RAM (PARTIAL: VM still has 1.9 GB; a real 1 GB run is pending)
-- [x] `LOW_RAM=yes` applied by `install`: museum `GOMEMLIMIT=150MiB`, silo `GOMEMLIMIT=200MiB`, postgres `shared_buffers=64MB`, zram + backup `--transfers 2 --buffer-size 4M`; override merged with `docker compose config`.
-- [x] 200 distinct photos (221 MB) uploaded in 24 s; backup afterwards succeeded; `journalctl -k`: 0 OOM messages; `check` all OK.
-- `docker stats` (MiB): museum idle 35 / peak 76, postgres 43 / 104, silo 86 / 247, web 13.5 / 13.6. `free -m` at the end: used 993, buff/cache 942, available 912, swap used 423 of 2905.
-- Non-container idle floor (RSS): dockerd 60, containerd 54, caddy 53, fail2ban 25, kernel slab ~120 MB.
-- [ ] Pending: same run with the VM at 1 GB (needs the owner to resize the VM).
+## T6 Low RAM (VM at 899 MB total RAM, `LOW_RAM=auto` -> yes)
+Restored host from T5, VM shrunk to 1 GB, `bootstrap` + `install` re-run (zram 450 MB zstd + 2 GB swapfile; museum `GOMEMLIMIT=150MiB`, silo `200MiB`, postgres `shared_buffers=64MB`, backup `--transfers 2 --buffer-size 4M`).
+- [x] 200 distinct photos (221 MB) uploaded in 24 s; then a second 230 MB video (multipart, 328 `part.*` objects on the data disk in total); backup after each: success.
+- [x] `journalctl -k -b`: **0 OOM messages**; container restart counts all 0; `check` all OK.
+- `docker stats` (MiB), idle -> peak during photos + backup: museum 42 -> 81, postgres 49 -> 94, silo 81 -> 187, web 2 -> 6. During the video upload + backup: museum 72, postgres 64, silo 139, web 5.
+- System: idle after boot `used` 545 MB; max `used` 708 MB; minimum `available` 191 MB; swap used peaked at 400 MB (zram 223 MB + swapfile 70 MB at the end). `free -m` after the runs: total 899, used 607, buff/cache 336, available 291.
+- Idle floor outside the containers (2 GB run, RSS): dockerd 60, containerd 54, caddy 53, fail2ban 25 MB, kernel slab ~120 MB. 1 GB works for this workload but with little headroom (minimum available 191 MB); 2 GB is the comfortable size.
+- Note: `LOW_RAM=auto` is decided when a subcommand runs. A host bootstrapped at 2 GB and later shrunk needs `bootstrap` (zram) and `install` (container limits) re-run.
 
 ## Deviations from the brief
 1. `ADMIN_USER` gets a `NOPASSWD` sudoers drop-in (key-only user has no password).
@@ -73,4 +75,4 @@ Clean snapshot (Debian 13, 1.9 GB, blank 20 GB `/dev/sdb`) -> `bootstrap` (`DATA
 - Booting with the data disk missing leaves Silo stopped until the disk is back and `docker compose up -d` is run (by design).
 
 ## Pending
-T6 at 1 GB (needs the VM resized), CLI step, desktop app.
+CLI step (`update-subscription --no-limit`), Windows desktop app, real Storage Box.
