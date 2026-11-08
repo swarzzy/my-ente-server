@@ -46,6 +46,12 @@ What a run does: dumps Postgres (verified, written atomically), copies `museum.y
 are moved to `box:deleted/<date>` and purged after 60 days; a run that would delete more than 500 objects stops with an error.
 `HC_URL` (optional) is pinged only after a fully successful run.
 
+**S3 instead of a Storage Box** (e.g. IDrive e2): set `BACKUP_TARGET=s3` plus `BACKUP_S3_PROVIDER/ENDPOINT/REGION/BUCKET`
+(see the example file). `backup-setup` then asks for the S3 access key ID and secret (kept only in root's `rclone.conf`) instead of
+installing an SSH key. The layout is the same under `<bucket>/`: `objects/`, `config/` (encrypted), `deleted/<date>/`. Use a key
+limited to that bucket. If versioning is on, old versions stay in the bucket and count against its quota; if Object Lock is on,
+moving files to `deleted/` may be refused (not tested). Changing the S3 settings later only needs `backup-setup` again.
+
 Also set daily snapshots on the Box in the Hetzner Console; they are your protection against a bad sync.
 
 Run now: `sudo systemctl start --no-block ente-backup.service`; logs: `journalctl -u ente-backup.service`.

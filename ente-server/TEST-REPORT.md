@@ -33,6 +33,12 @@ Browser tests were driven with Playwright/Chromium from the owner's PC (Windows,
 - [ ] Real Storage Box (port 23, `ssh-copy-id -s`): not tested (no Box).
 - Rclone with Silo down: retries for several minutes, then "not deleting files as there were IO errors" (nothing deleted on the Box).
 
+## T4b S3 backup target (`BACKUP_TARGET=s3`, added during testing)
+- [x] Local: second bucket on the VM's Silo. Parity 527/527 objects; `config/` names encrypted and readable through `box-crypt`; deleted object moved to `deleted/2026-11-08/`; dummy `deleted/2000-01-01` pruned; a lowered `--max-delete` (3) aborts with exit 7; re-running `backup-setup` asks for nothing; `check` OK.
+- [x] Real IDrive e2 (`s3.eu-west-4.idrivee2.com`, bucket `test`, versioning enabled, free 10 GB): first full backup 874 MiB / 527 objects in 6 min 41 s (through the tunnel below), parity 527/527, encrypted `config/`, delete -> `deleted/DATE`, prune of `2000-01-01`, incremental runs ~7 s, `check` OK. e2 secret and passphrase: 0 hits in the script log, journal, `/etc/ente-backup.env` and the backup script.
+- The home ISP does not connect to the e2 endpoint from the VM (GitHub and rclone.org work); the PC reaches it through its VPN. The e2 run used `ssh -R 1080` from the PC (SOCKS proxy on the VM) with `HTTPS_PROXY=socks5://127.0.0.1:1080` set via a test-only systemd drop-in, since removed. A real EU VPS does not have this problem.
+- [ ] Not run: `restore` end-to-end with an S3 target (shared code with the SFTP restore that passed, plus the key prompts), Object Lock.
+
 ## T5 Restore (host move)
 Clean snapshot (Debian 13, 1.9 GB, blank 20 GB `/dev/sdb`) -> `bootstrap` (`DATA_DISK=/dev/sdb`) -> Box data put back on the local SFTP target (checksum verified) -> `restore` with the same `DOMAIN=ente.test`.
 - [x] **Restore time: 167 s** (Docker + Caddy + rclone install included; DB restore ~2 s; 125 objects / 418 MB copied).
@@ -64,6 +70,8 @@ Restored host from T5, VM shrunk to 1 GB, `bootstrap` + `install` re-run (zram 4
 7. `ssh-copy-id` asks for the Box password itself (not `read -rs`); only the backup passphrase is read by the script. Neither is stored in the config, log or history.
 8. `install` restarts museum when `museum.yaml` changed while it was running (otherwise a changed `internal:` block was ignored).
 9. Quickstart facts held (images, ports, `are_local_buckets`, `endpoint`, `public-albums`, no `internal:`). Differences: `museum.yaml` is created mode 644 (kept; inside the root-only 700 directory) and `apps:` lists more services (photobook, public-locker, public-paste, public-memories, accounts, cast, embed-albums) than the brief names; only `public-albums` is changed.
+11. New `BACKUP_TARGET=s3` option (IDrive e2 / any S3 bucket) next to the Storage Box default, requested for testing; the brief only required the Box.
+12. `rclone config update` is not used: it contacts the endpoint and fails when it is unreachable (`invalid character '<'` from an ISP block page). Non-secret remote fields are edited in `rclone.conf` directly.
 10. `--max-delete` stops the run but the objects processed before the stop have already been moved to `box:deleted/DATE` (recoverable for 60 days).
 
 ## Open issues and risks

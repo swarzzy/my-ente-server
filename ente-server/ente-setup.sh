@@ -67,6 +67,13 @@ load_env() {
   DATA_DISK=${DATA_DISK:-}; LOW_RAM=${LOW_RAM:-auto}; BOX_HOST=${BOX_HOST:-}; BOX_USER=${BOX_USER:-}
   BOX_PORT=${BOX_PORT:-23}; HC_URL=${HC_URL:-}; FAIL2BAN=${FAIL2BAN:-yes}; SYNCTHING=${SYNCTHING:-no}
   FORCE_FORMAT=${FORCE_FORMAT:-no}; DOMAIN=${DOMAIN:-}
+  BACKUP_TARGET=${BACKUP_TARGET:-sftp}; BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}
+  BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}; BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+  case $BACKUP_TARGET in
+    sftp) BOX_ROOT=box: ;;
+    s3) BOX_ROOT=box:$BACKUP_S3_BUCKET/ ;;
+    *) die "BACKUP_TARGET must be sftp or s3" ;;
+  esac
   [[ $DOMAIN =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z0-9-]+$ ]] || die "DOMAIN missing or invalid"
   case $MODE in
     production) [[ $DOMAIN != *.test && $DOMAIN != *example.com ]] || die "DOMAIN=$DOMAIN is a placeholder; set your real domain" ;;
@@ -84,6 +91,9 @@ load_env() {
 }
 
 need() { local v; for v in "$@"; do [[ -n ${!v} ]] || die "$v is not set in $ENV_FILE"; done; }
+need_backup() {
+  if [[ $BACKUP_TARGET == s3 ]]; then need BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET; else need BOX_HOST BOX_USER; fi
+}
 
 # ---------------------------------------------------------------- bootstrap
 setup_data_disk() {
@@ -482,6 +492,7 @@ install_rclone() {
 }
 
 ensure_box_key() {
+  if [[ $BACKUP_TARGET == s3 ]]; then return 0; fi # S3 uses keys prompted in make_box_remotes, no SSH key
   need BOX_HOST BOX_USER
   install -d -m 700 /root/.ssh
   [[ -f $BOX_KEY ]] || ssh-keygen -q -t ed25519 -N '' -C "ente-backup@$(hostname)" -f "$BOX_KEY"
@@ -505,13 +516,41 @@ ensure_box_key() {
   ok "Box key login works"
 }
 
-make_box_remotes() { # [confirm]
-  local pass
-  rclone config create box sftp host="$BOX_HOST" user="$BOX_USER" port="$BOX_PORT" \
-    key_file="$BOX_KEY" known_hosts_file=/root/.ssh/known_hosts >/dev/null
-  if rclone listremotes | grep -qx 'box-crypt:' && [[ ${1:-} != force ]]; then log "box-crypt remote exists, keeping passphrase"; return 0; fi
+# rclone_set REMOTE key=value...: edit rclone.conf directly; `rclone config update` contacts the endpoint and fails when it is unreachable.
+rclone_set() {
+  local conf r=$1; shift
+  conf=$(rclone config file | tail -1)
+  python3 - "$conf" "$r" "$@" <<'PY'
+import configparser, sys
+conf, remote, *kv = sys.argv[1:]
+cp = configparser.RawConfigParser(); cp.optionxform = str; cp.read(conf)
+for a in kv:
+    k, v = a.split("=", 1)
+    cp.set(remote, k, v)
+with open(conf, "w") as f:
+    cp.write(f)
+PY
+}
+
+make_box_remotes() { # [confirm|once]: confirm = new passphrase, once = existing one; prompts are skipped for remotes that exist
+  local pass kid sec
+  if [[ $BACKUP_TARGET == s3 ]]; then
+    if rclone listremotes | grep -qx 'box:'; then
+      rclone_set box provider="$BACKUP_S3_PROVIDER" endpoint="$BACKUP_S3_ENDPOINT" region="$BACKUP_S3_REGION" no_check_bucket=true
+    else
+      read -rp "S3 access key ID: " kid || die "no answer (stdin closed)"
+      ask_secret sec "S3 secret access key"
+      rclone config create box s3 provider="$BACKUP_S3_PROVIDER" endpoint="$BACKUP_S3_ENDPOINT" region="$BACKUP_S3_REGION"         access_key_id="$kid" secret_access_key="$sec" no_check_bucket=true >/dev/null
+    fi
+  else
+    rclone config create box sftp host="$BOX_HOST" user="$BOX_USER" port="$BOX_PORT"       key_file="$BOX_KEY" known_hosts_file=/root/.ssh/known_hosts >/dev/null
+  fi
+  if rclone listremotes | grep -qx 'box-crypt:'; then
+    rclone_set box-crypt remote="${BOX_ROOT}config"
+    log "box-crypt remote exists, keeping passphrase"; return 0
+  fi
   ask_secret pass "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "${1:-confirm}"
-  rclone config create box-crypt crypt remote=box:config password="$pass" --obscure >/dev/null
+  rclone config create box-crypt crypt remote="${BOX_ROOT}config" password="$pass" --obscure >/dev/null
 }
 
 make_s3_remote() {
@@ -530,6 +569,7 @@ PY
 install_backup_units() {
   write_file /etc/ente-backup.env 600 <<EOF
 HC_URL="$HC_URL"
+BOX_ROOT="$BOX_ROOT"
 REQUIRE_MOUNT=$([[ -n $DATA_DISK ]] && echo yes || echo no)
 LOW_RAM=$LOW_RAM
 SYNCTHING=$SYNCTHING
@@ -539,6 +579,7 @@ EOF
 # Managed by ente-setup.sh. Config comes from /etc/ente-backup.env via systemd.
 set -euo pipefail
 umask 077
+BOX_ROOT="${BOX_ROOT:-box:}"
 if [[ "${REQUIRE_MOUNT:-no}" == yes ]] && ! mountpoint -q /srv/ente-data; then
   echo "ERROR: /srv/ente-data is not mounted; refusing to back up an empty bucket" >&2; exit 1
 fi
@@ -554,14 +595,14 @@ mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
 rclone sync "$DUMPS" box-crypt: --checkers 4
-rclone sync ente-s3:b2-eu-cen box:objects --size-only "${OPTS[@]}" \
-  --max-delete 500 --backup-dir "box:deleted/$(date +%F)"
+rclone sync ente-s3:b2-eu-cen "${BOX_ROOT}objects" --size-only "${OPTS[@]}" \
+  --max-delete 500 --backup-dir "${BOX_ROOT}deleted/$(date +%F)"
 if [[ "${SYNCTHING:-no}" == yes ]]; then
-  rclone sync /srv/syncthing box:syncthing --exclude '/config/**' --checkers 4
+  rclone sync /srv/syncthing "${BOX_ROOT}syncthing" --exclude '/config/**' --checkers 4
 fi
 cutoff=$(date -d '60 days ago' +%F)
-for d in $(rclone lsf --dirs-only box:deleted 2>/dev/null || true); do
-  if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ && "${d%/}" < "$cutoff" ]]; then rclone purge "box:deleted/${d%/}"; fi
+for d in $(rclone lsf --dirs-only "${BOX_ROOT}deleted" 2>/dev/null || true); do
+  if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ && "${d%/}" < "$cutoff" ]]; then rclone purge "${BOX_ROOT}deleted/${d%/}"; fi
 done
 if [[ -n "${HC_URL:-}" ]]; then curl -fsS -m 10 --retry 3 "$HC_URL" > /dev/null; fi
 EOF
@@ -595,7 +636,7 @@ EOF
 }
 
 cmd_backup_setup() {
-  load_env; need BOX_HOST BOX_USER
+  load_env; need_backup
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
   install_rclone
   ensure_box_key
@@ -608,7 +649,7 @@ cmd_backup_setup() {
 
 # ---------------------------------------------------------------- restore
 cmd_restore() {
-  load_env; need BOX_HOST BOX_USER
+  load_env; need_backup
   local tmp dump t0=$SECONDS
   [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR already exists; restore is for a fresh server"
   if [[ -n $DATA_DISK ]]; then mountpoint -q "$DATA_MNT" || die "$DATA_MNT not mounted; run bootstrap first"; fi
@@ -638,7 +679,7 @@ cmd_restore() {
   log "restoring objects (this can take long)"
   local opts=(--checkers 4 --transfers 4)
   [[ $LOW_RAM == yes ]] && opts=(--checkers 4 --transfers 2 --buffer-size 4M)
-  rclone copy box:objects ente-s3:b2-eu-cen "${opts[@]}"
+  rclone copy "${BOX_ROOT}objects" ente-s3:b2-eu-cen "${opts[@]}"
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
@@ -695,7 +736,7 @@ cmd_check() {
   res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
   if [[ -z $ts ]]; then warn "backup has not run yet"
   elif [[ $res == success ]]; then ok "last backup finished $ts: $res"; else bad "last backup $ts: $res"; fi
-  if out=$(rclone check ente-s3:b2-eu-cen box:objects --one-way --size-only --checkers 4 2>&1); then ok "rclone check: bucket is on the Box"
+  if out=$(rclone check ente-s3:b2-eu-cen "${BOX_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: bucket is on the backup target"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   echo "== system"
   df -h / ${DATA_DISK:+"$DATA_MNT"} | sed 's/^/        /'
