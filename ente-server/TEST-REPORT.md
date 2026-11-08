@@ -37,5 +37,32 @@ Browser tests were driven with Playwright/Chromium from the owner's PC (Windows,
 - [x] `fail2ban-client status sshd` works (jail active, backend systemd).
 - [x] Syncthing: UI 127.0.0.1:8384 only, 22000 tcp/udp public, `/srv/syncthing` owned by 1000:1000; backup syncs `note.txt`, skips `/config`.
 
+## T6 Low RAM (PARTIAL: VM still has 1.9 GB; a real 1 GB run is pending)
+- [x] `LOW_RAM=yes` applied by `install`: museum `GOMEMLIMIT=150MiB`, silo `GOMEMLIMIT=200MiB`, postgres `shared_buffers=64MB`, zram + backup `--transfers 2 --buffer-size 4M`; override merged with `docker compose config`.
+- [x] 200 distinct photos (221 MB) uploaded in 24 s; backup afterwards succeeded; `journalctl -k`: 0 OOM messages; `check` all OK.
+- `docker stats` (MiB): museum idle 35 / peak 76, postgres 43 / 104, silo 86 / 247, web 13.5 / 13.6. `free -m` at the end: used 993, buff/cache 942, available 912, swap used 423 of 2905.
+- Non-container idle floor (RSS): dockerd 60, containerd 54, caddy 53, fail2ban 25, kernel slab ~120 MB.
+- [ ] Pending: same run with the VM at 1 GB (needs the owner to resize the VM).
+
+## Deviations from the brief
+1. `ADMIN_USER` gets a `NOPASSWD` sudoers drop-in (key-only user has no password).
+2. Caddy proxies to `127.0.0.1:PORT`, not `localhost` (avoids `::1` resolution surprises).
+3. Docker `daemon.json` with log rotation (10 MB x 3), so container logs cannot fill a small disk.
+4. Backup script: dump written atomically (`.tmp` + `mv`), refused if empty or unreadable by `pg_restore -l`; prune loop only touches `YYYY-MM-DD/` names; low-RAM flags replace `--transfers 4`.
+5. New config value `BOX_PORT` (default 23) so backups can be tested against a local SFTP server.
+6. `backup-setup` records all host key types with `ssh-keyscan` (when the host has no `known_hosts` entry) and prints fingerprints: with only the key type ssh negotiated, rclone failed with `knownhosts: key mismatch`.
+7. `ssh-copy-id` asks for the Box password itself (not `read -rs`); only the backup passphrase is read by the script. Neither is stored in the config, log or history.
+8. `install` restarts museum when `museum.yaml` changed while it was running (otherwise a changed `internal:` block was ignored).
+9. Quickstart facts held (images, ports, `are_local_buckets`, `endpoint`, `public-albums`, no `internal:`). Differences: `museum.yaml` is created mode 644 (kept; inside the root-only 700 directory) and `apps:` lists more services (photobook, public-locker, public-paste, public-memories, accounts, cast, embed-albums) than the brief names; only `public-albums` is changed.
+10. `--max-delete` stops the run but the objects processed before the stop have already been moved to `box:deleted/DATE` (recoverable for 60 days).
+
+## Open issues and risks
+- Museum logs request bodies for metadata endpoints (sign-up email, SRP parameters, file sizes, base64 ciphertext; sensitive endpoints are `redacted`). It never contains photo plaintext, but it is more than the brief's "no request-body logging". Upstream behaviour; Docker log rotation bounds retention.
+- Real Storage Box (port 23, `ssh-copy-id -s`, 10-connection limit, snapshots) not tested; local SFTP only. Compare the printed host-key fingerprints with Hetzner's.
+- Windows desktop app, Ente CLI `update-subscription --no-limit` (GitHub was down), phones and real Let's Encrypt not tested.
+- The backup passphrase is passed to `rclone config create` on its command line (briefly visible in `ps` to root only).
+- Backup `sync` of `/var/backups/ente` keeps 7 daily DB dumps on the Box; `box:deleted` keeps 60 days. Daily Box snapshots (Hetzner Console) remain the protection against a bad sync.
+- Booting with the data disk missing leaves Silo stopped until the disk is back and `docker compose up -d` is run (by design).
+
 ## Pending
-T5 restore, T6 low RAM, CLI step, desktop app.
+T5 restore (needs a clean snapshot revert), T6 at 1 GB, CLI step, desktop app.
