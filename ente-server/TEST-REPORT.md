@@ -1,86 +1,48 @@
-# Test report (work in progress)
+# Test report - small VPS + two S3 buckets
 
-Environment: Debian 13 VM, 1.9 GB RAM, 40 GB system disk (14 GB root partition), second 20 GB disk `/dev/sdb`,
-`MODE=test` (`DOMAIN=ente.test`), no public IP. Backup target: local SFTP on the VM (no Storage Box available).
-Browser tests were driven with Playwright/Chromium from the owner's PC (Windows, hosts entry + test root CA trusted).
+Environment: real VPS (Debian 13, 1 vCPU, 2 GB RAM, 25 GB disk, public IPv4), domain `swwz-storage.site` (A records for
+`api.`/`web.`/`albums.`), photo bucket IDrive e2 (`s3.eu-west-4.idrivee2.com`), backup bucket Backblaze B2 (`us-east-005`, 10 GB test).
+Browser tests: Playwright/Chromium on the owner's PC against the public hostnames (real Let's Encrypt certificates).
+Earlier tests of the full-featured version (local Silo, data disk, test mode, low RAM, Syncthing) are in git tag `full-featured-v1`.
 
-## T1 Fresh install (data disk attached)
-- [x] `bootstrap` + `install` finish. `ops` second login works; `sshd -T`: `passwordauthentication no`, `permitrootlogin no`, `allowusers ops`, `maxauthtries 3`.
-- [x] museum healthy; all containers `restart=unless-stopped`; socat not running.
-- [x] `ss -tlnp`: 8080/3000/3002/3200 on 127.0.0.1 only; 3201 and 5432 not listening. From the PC, `VM_IP:3200`/`:8080` not tested (UFW allows only 22/80/443).
-- [x] `curl https://api.ente.test/ping` OK without `-k` (VM and PC).
-- [x] Data disk mounted at `/srv/ente-data` by UUID (`nofail`); objects land there (`/srv/ente-data/silo/b2-eu-cen/...`); Postgres volume stays on `/var/lib/docker` (system disk).
-- [x] Web app: owner and family signed up; 50 photos (2.4 MB each) + 1 video (275 MB, 1:00) uploaded; video stored as 20 MB `part.N` objects (multipart); thumbnails render (36 in gallery), full-size viewer opens ("2 / 51"), album created, public link `albums.ente.test/?t=...` opens logged-out with 51 memories and thumbnails.
-- [ ] Windows desktop app: not tested.
-- [x] `lockdown`: owner (oldest user) set as admin, `disable-registration: true`; third sign-up -> HTTP 403, existing login -> 200; re-run is a no-op.
-- [ ] Ente CLI `update-subscription --no-limit`: not tested. Left to the owner (running a downloaded CLI binary was not permitted in the test session). Unverified in the brief: whether `ente account login ... --host` exists in CLI v0.3.0 (the CLI may expect an `endpoint.api` entry in its `config.yaml` instead). The test server's local CA is regenerated on every fresh install, so import the CA of the server under test, or reach the API through `ssh -L 8080:127.0.0.1:8080 ops@<vm>` and point the CLI at `http://localhost:8080`.
+## Fresh install (`deploy`)
+- [x] `bootstrap` + `install` + `backup-setup` finish; museum healthy; `check`: all OK (containers, restart policies, 8080/3000/3002 on 127.0.0.1 only, 3200/3201/5432 not listening, sshd, ufw, caddy, HTTPS, photo bucket, CORS preflight, backup, no OOM).
+- [x] Museum runs with a single bucket entry (`b2-eu-cen` -> e2); the two unused quickstart buckets are removed. No Silo/socat started.
+- [x] Real Let's Encrypt certificates for the three hostnames.
+- [x] Web app (browser): sign-up, 12 photos uploaded directly to e2 (originals + thumbnails as separate objects), 25 s / 65 MB video uploaded multipart (2 parts + complete POST, all HTTP 200, no CORS errors), album created, thumbnails and viewer decrypt correctly.
+- [x] `lockdown`: oldest user becomes admin, `disable-registration: true`; new sign-up -> HTTP 403.
+- [ ] Not tested: Windows/Android apps, public album link in a private window (this run), Ente CLI `--no-limit`.
 
-## T2 Idempotency
-- [x] Re-running `bootstrap`, `install` and `backup-setup`: no diff in any touched file (sha256 of fstab, hosts, sshd drop-in, sudoers, authorized_keys, apt confs, fail2ban, Caddyfile, daemon.json, compose/museum/override, ufw rules), no duplicated lines (1 swapfile line, 1 hosts line), containers not recreated (same Created timestamps).
+## Idempotency
+- [x] Re-running `deploy`: sha256 of fstab, hosts, sshd drop-in, sudoers, authorized_keys, apt confs, fail2ban, Caddyfile, daemon.json, compose/museum/override, backup env/script/units, rclone.conf all unchanged; same container IDs and creation times; ufw rules unchanged.
+- [x] Re-running `backup-setup` asks for nothing and keeps remotes.
 
-## T3 Reboot and missing disk
-- [x] After reboot: disk mounted, Ente reachable, timer scheduled, `check` all OK.
-- [x] Disk unmounted: backup exits 1 ("not mounted"), Box unchanged (3 objects, no `deleted/`); `docker compose up minio` refused: `bind source path does not exist: /srv/ente-data/silo`.
-- [x] Bogus UUID in fstab + reboot: VM boots (`nofail`), museum/postgres/web up, silo not running; `check` reports FAIL for minio, port 3200, mount. Recovered after restoring fstab.
+## Backups (e2 -> B2)
+- [x] First run ok; photo bucket and `objects/` equal: 26 objects, 75.1 MiB; `config/` names encrypted, `backup-crypt:` lists `ente_db-DATE.dump`, `museum.yaml`, `compose.yaml`, `compose.override.yaml`.
+- [x] Guard: backup bucket holding a different instance's backup (changed `key.encryption`) -> refused. Wrong passphrase -> refused (found and fixed: `rclone cat` of an unreadable name exits 0 with empty output).
+- [x] `check`'s `rclone check` ok after the run.
+- Tested in the earlier version (backup code unchanged except remote names/creation): delete -> `deleted/DATE`, prune of old folders, `--max-delete` abort, `HC_URL` only after success, file modes 600/700, no secrets in log/journal.
 
-## T4 Backups (local SFTP target, not a real Storage Box)
-- [x] First run ok; `box:config` names encrypted; bucket and `box:objects` object counts equal (5/5, later 125 files).
-- [x] `HC_URL` ping arrives after a good run (1 hit), not after a failed one (silo stopped, hits unchanged).
-- [x] Deleted object moved to `box:deleted/DATE/...`; box object count down by one.
-- [x] Dummy `box:deleted/2000-01-01` pruned, today's folder kept.
-- [x] `--max-delete 500`: run stops with error ("--max-delete threshold reached"). Note: up to 500 objects are moved to `deleted/DATE` before the abort.
-- [x] `/var/backups/ente` 700, files 600; `/etc/ente-backup.env`, rclone.conf, key 600. Passphrase and Silo secret: 0 hits in `/var/log/ente-setup.log` and the journal.
-- [ ] Real Storage Box (port 23, `ssh-copy-id -s`): not tested (no Box).
-- Rclone with Silo down: retries for several minutes, then "not deleting files as there were IO errors" (nothing deleted on the Box).
-
-## T4b S3 backup target (`BACKUP_TARGET=s3`, added during testing)
-- [x] Local: second bucket on the VM's Silo. Parity 527/527 objects; `config/` names encrypted and readable through `box-crypt`; deleted object moved to `deleted/2026-11-08/`; dummy `deleted/2000-01-01` pruned; a lowered `--max-delete` (3) aborts with exit 7; re-running `backup-setup` asks for nothing; `check` OK.
-- [x] Real IDrive e2 (`s3.eu-west-4.idrivee2.com`, bucket `test`, versioning enabled, free 10 GB): first full backup 874 MiB / 527 objects in 6 min 41 s (through the tunnel below), parity 527/527, encrypted `config/`, delete -> `deleted/DATE`, prune of `2000-01-01`, incremental runs ~7 s, `check` OK. e2 secret and passphrase: 0 hits in the script log, journal, `/etc/ente-backup.env` and the backup script.
-- The home ISP does not connect to the e2 endpoint from the VM (GitHub and rclone.org work); the PC reaches it through its VPN. The e2 run used `ssh -R 1080` from the PC (SOCKS proxy on the VM) with `HTTPS_PROXY=socks5://127.0.0.1:1080` set via a test-only systemd drop-in, since removed. A real EU VPS does not have this problem.
-- [ ] Not run: `restore` end-to-end with an S3 target (shared code with the SFTP restore that passed, plus the key prompts), Object Lock.
-
-## T5 Restore (host move)
-Clean snapshot (Debian 13, 1.9 GB, blank 20 GB `/dev/sdb`) -> `bootstrap` (`DATA_DISK=/dev/sdb`) -> Box data put back on the local SFTP target (checksum verified) -> `restore` with the same `DOMAIN=ente.test`.
-- [x] **Restore time: 167 s** (Docker + Caddy + rclone install included; DB restore ~2 s; 125 objects / 418 MB copied).
-- [x] DB after restore: 2 users, 61 files, 2 collections (same as before); `museum.yaml` byte-identical to the original (same sha256), lockdown block (admin + disabled sign-ups) preserved; 125 objects in the bucket (= Box); objects on the data disk; temp dir with decrypted config removed.
-- [x] Browser (Playwright, new local CA so certificate errors ignored): owner and family log in with their original passwords; owner sees 51 items (Test album with video tile), family 10 (Family album); full-size viewer loads originals (2400 px); public album link (same token and key) opens logged out: "Join Ente Test album, 51 memories", thumbnails rendered.
-- [x] `backup-setup` on the restored host (remotes and key reused, no passphrase prompt), first backup success, `check` all OK.
-- Not covered: the restored server had a new Caddy local CA (test mode); in production a real certificate is issued once DNS points at the new IP.
-
-## T6 Low RAM (VM at 899 MB total RAM, `LOW_RAM=auto` -> yes)
-Restored host from T5, VM shrunk to 1 GB, `bootstrap` + `install` re-run (zram 450 MB zstd + 2 GB swapfile; museum `GOMEMLIMIT=150MiB`, silo `200MiB`, postgres `shared_buffers=64MB`, backup `--transfers 2 --buffer-size 4M`).
-- [x] 200 distinct photos (221 MB) uploaded in 24 s; then a second 230 MB video (multipart, 328 `part.*` objects on the data disk in total); backup after each: success.
-- [x] `journalctl -k -b`: **0 OOM messages**; container restart counts all 0; `check` all OK.
-- `docker stats` (MiB), idle -> peak during photos + backup: museum 42 -> 81, postgres 49 -> 94, silo 81 -> 187, web 2 -> 6. During the video upload + backup: museum 72, postgres 64, silo 139, web 5.
-- System: idle after boot `used` 545 MB; max `used` 708 MB; minimum `available` 191 MB; swap used peaked at 400 MB (zram 223 MB + swapfile 70 MB at the end). `free -m` after the runs: total 899, used 607, buff/cache 336, available 291.
-- Idle floor outside the containers (2 GB run, RSS): dockerd 60, containerd 54, caddy 53, fail2ban 25 MB, kernel slab ~120 MB. 1 GB works for this workload but with little headroom (minimum available 191 MB); 2 GB is the comfortable size.
-- Note: `LOW_RAM=auto` is decided when a subcommand runs. A host bootstrapped at 2 GB and later shrunk needs `bootstrap` (zram) and `install` (container limits) re-run.
-
-## T7
-- [x] `fail2ban-client status sshd` works (jail active, backend systemd).
-- [x] Syncthing: UI 127.0.0.1:8384 only, 22000 tcp/udp public, `/srv/syncthing` owned by 1000:1000; backup syncs `note.txt`, skips `/config`.
-
-## Deviations from the brief
-1. `ADMIN_USER` gets a `NOPASSWD` sudoers drop-in (key-only user has no password).
-2. Caddy proxies to `127.0.0.1:PORT`, not `localhost` (avoids `::1` resolution surprises).
-3. Docker `daemon.json` with log rotation (10 MB x 3), so container logs cannot fill a small disk.
-4. Backup script: dump written atomically (`.tmp` + `mv`), refused if empty or unreadable by `pg_restore -l`; prune loop only touches `YYYY-MM-DD/` names; low-RAM flags replace `--transfers 4`.
-5. New config value `BOX_PORT` (default 23) so backups can be tested against a local SFTP server.
-6. `backup-setup` records all host key types with `ssh-keyscan` (when the host has no `known_hosts` entry) and prints fingerprints: with only the key type ssh negotiated, rclone failed with `knownhosts: key mismatch`.
-7. `ssh-copy-id` asks for the Box password itself (not `read -rs`); only the backup passphrase is read by the script. Neither is stored in the config, log or history.
-8. `install` restarts museum when `museum.yaml` changed while it was running (otherwise a changed `internal:` block was ignored).
-9. Quickstart facts held (images, ports, `are_local_buckets`, `endpoint`, `public-albums`, no `internal:`). Differences: `museum.yaml` is created mode 644 (kept; inside the root-only 700 directory) and `apps:` lists more services (photobook, public-locker, public-paste, public-memories, accounts, cast, embed-albums) than the brief names; only `public-albums` is changed.
-11. New `BACKUP_TARGET=s3` option (IDrive e2 / any S3 bucket) next to the Storage Box default, requested for testing; the brief only required the Box.
-12. `rclone config update` is not used: it contacts the endpoint and fails when it is unreachable (`invalid character '<'` from an ISP block page). Non-secret remote fields are edited in `rclone.conf` directly.
-10. `--max-delete` stops the run but the objects processed before the stop have already been moved to `box:deleted/DATE` (recoverable for 60 days).
-
-## Open issues and risks
-- Museum logs request bodies for metadata endpoints (sign-up email, SRP parameters, file sizes, base64 ciphertext; sensitive endpoints are `redacted`). It never contains photo plaintext, but it is more than the brief's "no request-body logging". Upstream behaviour; Docker log rotation bounds retention.
-- Real Storage Box (port 23, `ssh-copy-id -s`, 10-connection limit, snapshots) not tested; local SFTP only. Compare the printed host-key fingerprints with Hetzner's.
-- Windows desktop app, Ente CLI `update-subscription --no-limit` (GitHub was down), phones and real Let's Encrypt not tested.
-- The backup passphrase is passed to `rclone config create` on its command line (briefly visible in `ps` to root only).
-- Backup `sync` of `/var/backups/ente` keeps 7 daily DB dumps on the Box; `box:deleted` keeps 60 days. Daily Box snapshots (Hetzner Console) remain the protection against a bad sync.
-- Booting with the data disk missing leaves Silo stopped until the disk is back and `docker compose up -d` is run (by design).
+## Restore (host move) on a freshly reset VPS
+- [x] Clean Debian 13 -> `deploy` with `RESTORE=yes` (same domain, same bucket keys and passphrase): **restore step 84 s**; whole `deploy` about 4 min.
+- [x] DB identical: 11 users / 13 files / 3 collections; `museum.yaml` byte-identical (sha256 equal), lockdown block preserved, temp directory with decrypted config removed.
+- [x] Existing photos kept in e2 (bucket not empty -> nothing copied). Browser: existing user logs in with the original password on the restored server, sees 12 memories, viewer opens and decrypts the original; no HTTP errors.
+- [x] `check` all OK on the restored host after `backup-setup`.
 
 ## Pending
-CLI step (`update-subscription --no-limit`), Windows desktop app, real Storage Box.
+- Fresh install of the *simplified* script on a clean state (needs empty backup bucket): see "Open issues".
+
+## Deviations from the original brief
+1. Storage is an external S3 bucket (`STORAGE` Silo mode, data disk, Storage Box, Syncthing, test mode and zram were removed to keep the script small; see git tag `full-featured-v1`).
+2. Bucket keys and the backup passphrase may come from `ente-setup.secrets` or the environment (non-interactive `deploy`); they are prompted when missing.
+3. rclone remotes are written to `rclone.conf` directly and the passphrase goes through `rclone obscure -` on stdin: no secret in any command line.
+4. `ADMIN_USER` gets `NOPASSWD` sudo (key-only user). Caddy proxies to `127.0.0.1`. Docker log rotation. Backup dump written atomically and verified.
+5. All `apt` calls wait up to 10 minutes for the dpkg lock (fresh images run unattended-upgrades at first boot; found on the reset VPS).
+6. CORS is set on the photo bucket by the script (boto3 `put_bucket_cors`), origins `web.` and `albums.`.
+7. Quickstart facts held (images, ports, `endpoint`, `public-albums`, no `internal:`). `museum.yaml` is created mode 644 (inside the root-only 700 dir); `apps:` lists more services than the brief names.
+
+## Open issues and risks
+- Museum accepts a single configured bucket; verified for uploads/downloads/multipart on e2. Replication to a second bucket is not configured (backup is the second copy).
+- e2/B2 endpoints must be reachable by every user (incl. those in Russia); not testable from here.
+- Backup traffic goes bucket -> VPS -> bucket; B2 keeps old file versions unless a lifecycle rule limits them.
+- First 13-file batch upload in headless Chromium stalled at 12/13 once (video queued behind processing); the same video alone uploaded fine. Not reproduced against the server logs; likely the browser test, not storage.

@@ -1,99 +1,83 @@
 # ente-server
 
-One script, `ente-setup.sh`, turns a fresh Debian 12/13 KVM VPS into a working, backed-up
-[Ente Photos](https://ente.com) server: Caddy (TLS) in front of Museum, the web apps and Silo (S3), all
-containers on `127.0.0.1` only, daily encrypted backups to a Hetzner Storage Box.
+One script, `ente-setup.sh`, turns a fresh Debian 12/13 VPS into a working, backed-up
+[Ente Photos](https://ente.com) server:
 
-Every subcommand is safe to re-run. Logs go to `/var/log/ente-setup.log` (no secrets).
-Secrets (backup passphrase, Box password) are only ever typed at a prompt.
+- **Caddy** (Let's Encrypt TLS) is the only public service; Museum, the web apps and Postgres run in Docker on `127.0.0.1`.
+- **Photos** are stored in an external S3 bucket (IDrive e2, Backblaze B2, Wasabi, ...). Apps upload and download
+  straight to that bucket through links Museum signs, so the VPS needs almost no disk (25 GB is plenty).
+- **Backups** go daily to a second S3 bucket: encrypted DB dump + `museum.yaml`, plus a mirror of the photo bucket.
+
+Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
+The full-featured previous version (local Silo storage, data disk, Storage Box, Syncthing, test mode) is git tag `full-featured-v1`.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `ente-setup.sh` | the script |
-| `ente-setup.env.example` | config template; copy to `ente-setup.env` (git-ignored) |
+| `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
+| `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 
-## Fresh production install
+Both copies are git-ignored. Anything missing from the secrets file is asked at a prompt (never echoed, logged or stored in the env file).
 
-1. **DNS.** A/AAAA for `api.`, `web.`, `albums.`, `s3.` under your domain (or one wildcard), TTL 300, pointing at the server.
-2. **Config.** Copy `ente-server/` to the server, `cp ente-setup.env.example ente-setup.env`, edit it
-   (`DOMAIN`, `ADMIN_USER`, `ADMIN_SSH_PUBKEY`, `BOX_*`, `DATA_DISK` if you have a separate disk). Use `chmod 600`.
-3. **As root:** `./ente-setup.sh bootstrap`
-   - Creates `ADMIN_USER` (sudo, no password), hardens sshd (key only, no root login, `AllowUsers`), UFW (22/80/443),
-     unattended-upgrades with reboot at 02:00 when needed, 2 GB swap, fail2ban, and formats/mounts `DATA_DISK` at `/srv/ente-data`.
-   - **Before closing the root session, open a second terminal and log in as `ADMIN_USER`.**
-4. **As `ADMIN_USER`:** `sudo ./ente-setup.sh install`
-   - Installs Docker and Caddy, runs Ente's quickstart, edits its files (each edit is asserted), writes `compose.override.yaml` and the Caddyfile, starts everything.
-   - Save `/opt/my-ente/museum.yaml` in your password manager. It holds the keys needed to read the database.
-5. **Sign up the owner first** at `https://web.<domain>`, then family. Codes: `sudo ./ente-setup.sh codes` (no SMTP, so they are in the museum log).
-6. `sudo ./ente-setup.sh lockdown` – shows users, makes the oldest the admin (after you confirm), closes sign-ups.
-7. `sudo ./ente-setup.sh backup-setup` – see Backups.
+## Fresh install
+
+1. **Buckets.** Create two buckets at two providers if you can. The key for the photo bucket needs read/write/delete and
+   permission to set CORS (the script sets it; if the provider refuses it prints what to set by hand).
+   Backup bucket: on versioned buckets (B2 keeps old versions by default) add a lifecycle rule "keep only the last version".
+2. **DNS.** A (and AAAA) records for `api.`, `web.` and `albums.` under your domain → the VPS, TTL 300.
+3. **Config.** Copy `ente-server/` to the VPS, create `ente-setup.env` and `ente-setup.secrets` from the examples.
+   `BACKUP_PASSPHRASE` encrypts the config backup: keep it in a password manager, without it the backup is unreadable.
+4. **As root:** `./ente-setup.sh deploy` = `bootstrap` + `install` + `backup-setup`. About 5 minutes.
+   - `bootstrap`: updates, `ADMIN_USER` (sudo, key only), sshd hardening (no passwords, no root login), UFW 22/80/443,
+     unattended upgrades (reboot 02:00 only when needed), 2 GB swap, fail2ban.
+     **Open a second terminal and log in as `ADMIN_USER` before closing the root session** (root login is now off).
+   - `install`: Docker, Caddy, Ente's quickstart; edits its files (each edit asserted; fails loudly if the quickstart changed),
+     checks the photo bucket (read/write/delete), sets CORS, starts everything.
+   - `backup-setup`: rclone remotes, systemd timer (03:00 daily, catches up if missed), first run started.
+5. Save `/opt/my-ente/museum.yaml` in your password manager (it holds the keys the database needs).
+6. **Sign up the owner first** at `https://web.<domain>`, then family. No SMTP, so codes are in the log: `sudo ./ente-setup.sh codes`.
+7. `sudo ./ente-setup.sh lockdown` shows users, makes the oldest the admin (after you confirm) and closes sign-ups.
 8. Apps: on Android/Windows tap the welcome screen 7 times and enter `https://api.<domain>`.
-9. Lift the storage limit from your PC with the Ente CLI:
-   `ente account login --account home-server --app photos --host https://api.<domain>` then
-   `ente admin user update-subscription EMAIL --no-limit --account home-server` (login must be < 10 min old).
+9. Storage limit (10 GB by default) is lifted from your PC with the Ente CLI:
+   `ente account login`, then `ente admin user update-subscription EMAIL --no-limit` (the login must be < 10 min old). See Ente's CLI docs for pointing it at a custom server.
+
+Run steps separately instead of `deploy` if you prefer: `bootstrap`, `install`, `backup-setup`.
 
 ## Backups
 
-`backup-setup` needs `BOX_HOST`/`BOX_USER`. It creates `/root/.ssh/storagebox`, records the Box host keys
-(**compare the fingerprints it prints with Hetzner's**), installs the key with `ssh-copy-id` (asks for the Box
-password), asks twice for a **backup passphrase** (keep it in your password manager; without it the config backups are unreadable),
-creates the rclone remotes `ente-s3`, `box`, `box-crypt`, and installs `ente-backup.timer` (03:00 daily, catches up if missed).
-
-What a run does: dumps Postgres (verified, written atomically), copies `museum.yaml`/`compose*.yaml`, syncs these to `box-crypt:`
-(= `box:config`, names and contents encrypted), then mirrors the bucket to `box:objects`. Objects deleted from the bucket
-are moved to `box:deleted/<date>` and purged after 60 days; a run that would delete more than 500 objects stops with an error.
+A run (`systemctl start --no-block ente-backup.service`, logs `journalctl -u ente-backup.service`):
+dumps Postgres (verified, atomic), copies `museum.yaml`/`compose*.yaml`, syncs them to `<backup bucket>/config` (names and contents
+encrypted with `BACKUP_PASSPHRASE`), mirrors the photo bucket to `<backup bucket>/objects`. Objects deleted from the photo bucket move to
+`deleted/<date>/` and are purged after 60 days; a run that would delete more than 500 objects stops with an error.
 `HC_URL` (optional) is pinged only after a fully successful run.
 
-**S3 instead of a Storage Box** (e.g. IDrive e2): set `BACKUP_TARGET=s3` plus `BACKUP_S3_PROVIDER/ENDPOINT/REGION/BUCKET`
-(see the example file). `backup-setup` then asks for the S3 access key ID and secret (kept only in root's `rclone.conf`) instead of
-installing an SSH key. The layout is the same under `<bucket>/`: `objects/`, `config/` (encrypted), `deleted/<date>/`. Use a key
-limited to that bucket. If versioning is on, old versions stay in the bucket and count against its quota; if Object Lock is on,
-moving files to `deleted/` may be refused (not tested). Changing the S3 settings later only needs `backup-setup` again.
-
-Also set daily snapshots on the Box in the Hetzner Console; they are your protection against a bad sync.
-
-Run now: `sudo systemctl start --no-block ente-backup.service`; logs: `journalctl -u ente-backup.service`.
+`backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, or one the passphrase cannot read.
 
 ## Monthly: `sudo ./ente-setup.sh check`
 
-OK/FAIL report: containers, restart policy, localhost-only ports, sshd, UFW, Caddy, backup timer and last result,
-`rclone check` bucket vs Box, disk, OOM kills, pending reboot. Also look at Box usage in the Hetzner Console.
+OK/FAIL report: containers, restart policy, localhost-only ports, sshd, UFW, Caddy, HTTPS, photo bucket + CORS, backup timer and last
+result, `rclone check` photo bucket vs backup, disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
 
 ## Updates
 
 `sudo ./ente-setup.sh update` (pull images, recreate changed containers, prune). Ente images are untagged `latest`;
-read Ente's release notes first if you can. OS updates install themselves; reboots happen at 02:00 only if required.
+read Ente's release notes first. OS updates install themselves.
 
-## Moving to another host (restore)
+## Moving to a new VPS / disaster recovery (`restore`)
 
-1. New VPS: `bootstrap` with the **same `DOMAIN`** and the same config (use a data disk if the old one had one).
-2. `sudo ./ente-setup.sh restore` – asks for the Box password (new key) and the backup passphrase, fetches
-   `box-crypt:`, restores `museum.yaml`, the newest DB dump and all objects, regenerates the override and Caddyfile for this host,
-   starts everything and prints the DNS change.
-3. Point DNS (A/AAAA of the four names, TTL 300) at the new IP; certificates are issued when DNS resolves.
-4. `sudo ./ente-setup.sh backup-setup`, then `check`. Remove the old server once all is confirmed.
+1. New VPS, point DNS later. Put the **same** `ente-setup.env` and secrets there (same `DOMAIN`, same buckets, same `BACKUP_PASSPHRASE`) and set `RESTORE=yes`.
+2. `./ente-setup.sh deploy` (bootstrap, then `restore`, then `backup-setup`). `restore` fetches the encrypted config backup,
+   puts back `museum.yaml`, restores the newest DB dump, and uses the photos already in the photo bucket
+   (only if that bucket is empty does it copy them back from the backup). About 2 minutes for a small library.
+3. Point DNS (`api.`, `web.`, `albums.`, TTL 300) at the new IP; certificates are issued once it resolves. Run `check`.
 
-Apps keep working because the hostnames do not change.
+Apps keep working because the hostnames do not change. To restore into a *new* photo bucket, set the new `S3_*` values:
+objects are copied from the backup bucket.
 
-## Data disk
+## Notes and limits
 
-`DATA_DISK=/dev/vdb` in `bootstrap`: refuses the root disk and any disk with a partition/filesystem/signature
-(`FORCE_FORMAT=yes` overrides). It is formatted ext4 (label `ente-data`) and mounted by UUID with `nofail`.
-Silo's objects live in `/srv/ente-data/silo`; Silo refuses to start (and the backup refuses to run) if the disk is not mounted.
-If the disk was missing at boot, attach it, `mount /srv/ente-data`, then `cd /opt/my-ente && docker compose up -d`.
-
-## Test mode (VM without public IP)
-
-`MODE=test`, `DOMAIN=ente.test`. Prints a loud banner; never use on a real server. Same path as production except:
-Caddy issues certificates from its own local CA (`local_certs`), hostnames are mapped to 127.0.0.1 in `/etc/hosts`,
-the CA is trusted on the VM and mounted into museum, and `internal.hardcoded-ott` makes `anything@ente.test` use code `123456`.
-`install` prints the hosts-file and certificate-import steps for your PC. To test backups without a Storage Box set
-`BOX_HOST=127.0.0.1 BOX_USER=<local user> BOX_PORT=22` and authorize `/root/.ssh/storagebox.pub` for that user.
-Phones do not trust the local CA, so phone tests need the real server.
-
-## Syncthing (optional)
-
-`SYNCTHING=yes`, then `sudo ./ente-setup.sh syncthing` and re-run `backup-setup`. UI on `127.0.0.1:8384`
-(`ssh -L 8384:127.0.0.1:8384 user@server`), sync port 22000 public, data in `/srv/syncthing`.
+- Users in countries that throttle foreign hosts need to reach the photo bucket's endpoint directly; pick a provider that works for them.
+- The VPS downloads and re-uploads every photo for the backup (bucket → VPS → bucket). Fine for hundreds of GB, slow for the first run.
+- Museum logs some request metadata (never photo plaintext); Docker log rotation bounds it (10 MB x 3).
