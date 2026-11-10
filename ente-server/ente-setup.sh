@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 server into a backed-up Ente Photos server.
-# Usage: ente-setup.sh <bootstrap|install|codes|lockdown|backup-setup|restore|check|update|syncthing>
+# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update|syncthing>
 # Config: ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
+# Secrets: prompted, or taken from the environment / ente-setup.secrets (mode 600, same variables, see the example).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${ENV_FILE:-$SCRIPT_DIR/ente-setup.env}
+SECRETS_FILE=${SECRETS_FILE:-$SCRIPT_DIR/ente-setup.secrets}
 LOG=/var/log/ente-setup.log
 ENTE_DIR=/opt/my-ente
 DATA_MNT=/srv/ente-data
@@ -58,17 +60,39 @@ ask_secret() {
   done
 }
 
+# secret_var VAR PROMPT [confirm]: keep VAR if already set (environment / secrets file), else ask on a terminal.
+secret_var() {
+  [[ -z ${!1:-} ]] || return 0
+  [[ -t 0 ]] || die "$1 is not set and there is no terminal to ask on (set it in the environment or $SECRETS_FILE)"
+  ask_secret "$1" "$2" "${3:-}"
+}
+
 load_env() {
   [[ $EUID -eq 0 ]] || die "run as root"
   [[ -f $ENV_FILE ]] || die "config $ENV_FILE not found (copy ente-setup.env.example)"
   # shellcheck source=/dev/null
   . "$ENV_FILE"
+  if [[ -f $SECRETS_FILE ]]; then
+    [[ $(stat -c %a "$SECRETS_FILE") =~ ^[46]00$ ]] || die "$SECRETS_FILE must be mode 600"
+    # shellcheck source=/dev/null
+    . "$SECRETS_FILE"
+  fi
   MODE=${MODE:-production}; ADMIN_USER=${ADMIN_USER:-}; ADMIN_SSH_PUBKEY=${ADMIN_SSH_PUBKEY:-}
   DATA_DISK=${DATA_DISK:-}; LOW_RAM=${LOW_RAM:-auto}; BOX_HOST=${BOX_HOST:-}; BOX_USER=${BOX_USER:-}
   BOX_PORT=${BOX_PORT:-23}; HC_URL=${HC_URL:-}; FAIL2BAN=${FAIL2BAN:-yes}; SYNCTHING=${SYNCTHING:-no}
   FORCE_FORMAT=${FORCE_FORMAT:-no}; DOMAIN=${DOMAIN:-}
   BACKUP_TARGET=${BACKUP_TARGET:-sftp}; BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}
   BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}; BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+  STORAGE=${STORAGE:-silo}; S3_PROVIDER=${S3_PROVIDER:-Other}; S3_ENDPOINT=${S3_ENDPOINT:-}; S3_REGION=${S3_REGION:-}
+  S3_BUCKET=${S3_BUCKET:-}; S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-https://web.$DOMAIN,https://albums.$DOMAIN}; RESTORE=${RESTORE:-no}
+  S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}; BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}
+  BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
+  LOCAL_CA=no; [[ $MODE == test && $STORAGE == silo ]] && LOCAL_CA=yes
+  case $STORAGE in
+    silo) SRC_BUCKET=b2-eu-cen ;;
+    s3) SRC_BUCKET=$S3_BUCKET; [[ -z $DATA_DISK ]] || die "DATA_DISK is only for STORAGE=silo" ;;
+    *) die "STORAGE must be silo or s3" ;;
+  esac
   case $BACKUP_TARGET in
     sftp) BOX_ROOT=box: ;;
     s3) BOX_ROOT=box:$BACKUP_S3_BUCKET/ ;;
@@ -90,6 +114,11 @@ load_env() {
   fi
 }
 
+need_storage() {
+  [[ $STORAGE == s3 ]] || return 0
+  need S3_ENDPOINT S3_REGION S3_BUCKET
+  [[ $S3_ENDPOINT != *://* ]] || die "S3_ENDPOINT must be a bare hostname, without https://"
+}
 need() { local v; for v in "$@"; do [[ -n ${!v} ]] || die "$v is not set in $ENV_FILE"; done; }
 need_backup() {
   if [[ $BACKUP_TARGET == s3 ]]; then need BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET; else need BOX_HOST BOX_USER; fi
@@ -273,7 +302,7 @@ for k in ("key", "secret", "endpoint", "region", "bucket"):
 assert m["db"]["host"] == "postgres" and m["db"]["port"] == 5432
 assert "public-albums" in m["apps"] and "key" in m and "jwt" in m
 PY
-  for p in 8080 3000 3002 3200; do
+  for p in 8080 3000 3002 $([[ $STORAGE == silo ]] && echo 3200); do
     sed -Ei "s/^( *- )(127\.0\.0\.1:)?$p:$p( |\$)/\1127.0.0.1:$p:$p\3/" "$c"
     grep -Eq "^ *- 127\.0\.0\.1:$p:$p( |\$)" "$c" || die "compose.yaml: port line for $p not found"
   done
@@ -281,15 +310,87 @@ PY
   sed -Ei "s|^( *ENTE_API_ORIGIN:).*|\1 https://api.$DOMAIN|" "$c"
   grep -qE "^ *ENTE_API_ORIGIN: https://api\.${DOMAIN//./\\.}\$" "$c" || die "compose.yaml: ENTE_API_ORIGIN edit failed"
 
-  sed -Ei 's/^( *are_local_buckets:) *(true|false)/\1 false/' "$m"
-  [[ $(grep -Ec '^ *are_local_buckets: false' "$m") == 1 && $(grep -Ec '^ *are_local_buckets: true' "$m") == 0 ]] || die "museum.yaml: are_local_buckets edit failed"
-  sed -Ei "s|^( *endpoint:).*|\1 s3.$DOMAIN|" "$m"
-  n=$(grep -Fc "endpoint: s3.$DOMAIN" "$m")
-  [[ $n == 3 ]] || die "museum.yaml: expected 3 bucket endpoints, got $n"
+  if [[ $STORAGE == silo ]]; then
+    sed -Ei 's/^( *are_local_buckets:) *(true|false)/\1 false/' "$m"
+    [[ $(grep -Ec '^ *are_local_buckets: false' "$m") == 1 && $(grep -Ec '^ *are_local_buckets: true' "$m") == 0 ]] || die "museum.yaml: are_local_buckets edit failed"
+    sed -Ei "s|^( *endpoint:).*|\1 s3.$DOMAIN|" "$m"
+    n=$(grep -Fc "endpoint: s3.$DOMAIN" "$m")
+    [[ $n == 3 ]] || die "museum.yaml: expected 3 bucket endpoints, got $n"
+  else
+    edit_museum_s3 "$m"
+  fi
   sed -Ei "s|^( *public-albums:).*|\1 https://albums.$DOMAIN|" "$m"
   grep -Fq "public-albums: https://albums.$DOMAIN" "$m" || die "museum.yaml: public-albums edit failed"
   python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$c" || die "compose.yaml invalid after edits"
   python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$m" || die "museum.yaml invalid after edits"
+}
+
+# STORAGE=s3: point the b2-eu-cen bucket at the external bucket and drop the two unused Silo buckets (idempotent).
+edit_museum_s3() {
+  secret_var S3_ACCESS_KEY "S3 access key ID (primary bucket)"
+  secret_var S3_SECRET_KEY "S3 secret access key (primary bucket)"
+  S3_ENDPOINT=$S3_ENDPOINT S3_REGION=$S3_REGION S3_BUCKET=$S3_BUCKET S3_ACCESS_KEY=$S3_ACCESS_KEY S3_SECRET_KEY=$S3_SECRET_KEY \
+    python3 - "$1" <<'PY' || die "museum.yaml: S3 edit failed (quickstart layout changed?)"
+import json, os, re, sys, yaml
+path = sys.argv[1]; e = os.environ
+vals = {"key": e["S3_ACCESS_KEY"], "secret": e["S3_SECRET_KEY"], "endpoint": e["S3_ENDPOINT"],
+        "region": e["S3_REGION"], "bucket": e["S3_BUCKET"]}
+out = []; blk = None
+for ln in open(path).read().split("\n"):
+    m = re.match(r"^( *)([A-Za-z0-9_-]+):\s*$", ln)
+    ind = len(ln) - len(ln.lstrip())
+    if blk and ln.strip() and ind <= blk[0]: blk = None
+    if blk and blk[1] == "drop": continue
+    if m and ind == 6 and m.group(2) in ("b2-eu-cen", "wasabi-eu-central-2-v3", "scw-eu-fr-v3"):
+        blk = (ind, "keep" if m.group(2) == "b2-eu-cen" else "drop")
+        if blk[1] == "drop": continue
+    elif blk:
+        k = re.match(r"^( +)(key|secret|endpoint|region|bucket):", ln)
+        if k: ln = "%s%s: %s" % (k.group(1), k.group(2), json.dumps(vals[k.group(2)]))
+    if re.match(r"^ *are_local_buckets:", ln): ln = re.sub(r":.*", ": false", ln)
+    out.append(ln)
+open(path, "w").write("\n".join(out))
+d = yaml.safe_load(open(path))["s3"]
+assert d["are_local_buckets"] is False and d["use_path_style_urls"] is True
+assert [k for k in d if isinstance(d[k], dict)] == ["b2-eu-cen"], list(d)
+assert {k: d["b2-eu-cen"][k] for k in vals} == vals
+PY
+}
+
+# museum_val FIELD: key|secret|endpoint|region|bucket of the primary bucket in museum.yaml
+museum_val() {
+  python3 - "$ENTE_DIR/museum.yaml" "$1" <<'PY'
+import sys, yaml
+print(yaml.safe_load(open(sys.argv[1]))["s3"]["b2-eu-cen"][sys.argv[2]])
+PY
+}
+
+# STORAGE=s3: prove the primary bucket works (read, write, delete) and set CORS so the web app can upload straight to it.
+s3_prepare() {
+  [[ $STORAGE == s3 ]] || return 0
+  dpkg -s python3-boto3 >/dev/null 2>&1 || apt_install python3-boto3
+  S3_ENDPOINT=$(museum_val endpoint) S3_REGION=$(museum_val region) S3_BUCKET=$(museum_val bucket) \
+    S3_ACCESS_KEY=$(museum_val key) S3_SECRET_KEY=$(museum_val secret) S3_CORS_ORIGINS=$S3_CORS_ORIGINS \
+    python3 - <<'PY' || die "primary S3 bucket check failed"
+import os, boto3
+from botocore.config import Config
+e = os.environ
+try: cfg = Config(s3={"addressing_style": "path"}, request_checksum_calculation="when_required", response_checksum_validation="when_required")
+except TypeError: cfg = Config(s3={"addressing_style": "path"})
+c = boto3.client("s3", endpoint_url="https://" + e["S3_ENDPOINT"], region_name=e["S3_REGION"], aws_access_key_id=e["S3_ACCESS_KEY"],
+                 aws_secret_access_key=e["S3_SECRET_KEY"], config=cfg)
+b = e["S3_BUCKET"]
+c.head_bucket(Bucket=b)
+c.put_object(Bucket=b, Key="ente-setup-probe", Body=b"probe"); c.get_object(Bucket=b, Key="ente-setup-probe")["Body"].read(); c.delete_object(Bucket=b, Key="ente-setup-probe")
+print("  OK    primary bucket %s: read/write/delete work" % b)
+rule = {"AllowedOrigins": e["S3_CORS_ORIGINS"].split(","), "AllowedMethods": ["GET", "HEAD", "POST", "PUT", "DELETE"],
+        "AllowedHeaders": ["*"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 3000}
+try:
+    c.put_bucket_cors(Bucket=b, CORSConfiguration={"CORSRules": [rule]})
+    print("  OK    CORS set for", e["S3_CORS_ORIGINS"])
+except Exception as x:
+    print("  WARN  could not set CORS (%s); set it by hand or web uploads fail: origins %s, methods GET/HEAD/POST/PUT/DELETE, headers *, expose ETag" % (type(x).__name__, e["S3_CORS_ORIGINS"]))
+PY
 }
 
 internal_admin() { sed -n 's/^  admins: \[\(.*\)\]$/\1/p' "$ENTE_DIR/museum.yaml"; }
@@ -322,7 +423,7 @@ sync_internal() {
 gen_caddyfile() {
   local pair
   if [[ $MODE == test ]]; then printf '{\n\tlocal_certs\n}\n\n'; fi
-  for pair in api:8080 web:3000 albums:3002 s3:3200; do
+  for pair in api:8080 web:3000 albums:3002 $([[ $STORAGE == silo ]] && echo s3:3200); do
     printf '%s.%s {\n\treverse_proxy 127.0.0.1:%s\n}\n' "${pair%%:*}" "$DOMAIN" "${pair##*:}"
   done
 }
@@ -332,13 +433,13 @@ gen_override() {
   echo "  museum:"
   echo "    restart: unless-stopped"
   echo "    oom_score_adj: -300"
-  if [[ $MODE == test ]]; then echo "    extra_hosts: [\"s3.$DOMAIN:host-gateway\"]"; fi
-  if [[ $LOW_RAM == yes || $MODE == test ]]; then
+  if [[ $LOCAL_CA == yes ]]; then echo "    extra_hosts: [\"s3.$DOMAIN:host-gateway\"]"; fi
+  if [[ $LOW_RAM == yes || $LOCAL_CA == yes ]]; then
     echo "    environment:"
     if [[ $LOW_RAM == yes ]]; then echo "      GOMEMLIMIT: 150MiB"; fi
-    if [[ $MODE == test ]]; then echo "      SSL_CERT_FILE: /etc/ssl/certs/ente-test-bundle.pem"; fi
+    if [[ $LOCAL_CA == yes ]]; then echo "      SSL_CERT_FILE: /etc/ssl/certs/ente-test-bundle.pem"; fi
   fi
-  if [[ $MODE == test ]]; then
+  if [[ $LOCAL_CA == yes ]]; then
     echo "    volumes:"
     echo "      - $ENTE_DIR/test-ca-bundle.pem:/etc/ssl/certs/ente-test-bundle.pem:ro"
   fi
@@ -349,8 +450,8 @@ gen_override() {
   echo "    oom_score_adj: -500"
   if [[ $LOW_RAM == yes ]]; then echo "    command: postgres -c shared_buffers=64MB -c maintenance_work_mem=32MB"; fi
   echo "  minio:"
-  echo "    restart: unless-stopped"
-  if [[ $LOW_RAM == yes ]]; then echo "    environment:"; echo "      GOMEMLIMIT: 200MiB"; fi
+  if [[ $STORAGE == s3 ]]; then echo "    profiles: [\"off\"]"; else echo "    restart: unless-stopped"; fi
+  if [[ $STORAGE == silo && $LOW_RAM == yes ]]; then echo "    environment:"; echo "      GOMEMLIMIT: 200MiB"; fi
   if [[ -n $DATA_DISK ]]; then
     echo "    volumes:"
     echo "      - type: bind"
@@ -375,18 +476,20 @@ setup_test_env() {
   local i
   [[ $MODE == test ]] || return 0
   sed -i '/# ente-setup$/d' /etc/hosts
-  echo "127.0.0.1 api.$DOMAIN web.$DOMAIN albums.$DOMAIN s3.$DOMAIN # ente-setup" >>/etc/hosts
+  echo "127.0.0.1 api.$DOMAIN web.$DOMAIN albums.$DOMAIN s3.$DOMAIN # ente-setup" >>/etc/hosts # harmless extra name in s3 mode
   for i in $(seq 1 30); do [[ -f $CADDY_ROOT ]] && break; sleep 2; done
   [[ -f $CADDY_ROOT ]] || die "Caddy local root CA not found at $CADDY_ROOT"
   if ! cmp -s "$CADDY_ROOT" /usr/local/share/ca-certificates/ente-test-caddy-root.crt 2>/dev/null; then
     install -m 644 "$CADDY_ROOT" /usr/local/share/ca-certificates/ente-test-caddy-root.crt
     update-ca-certificates >/dev/null
   fi
-  write_file "$ENTE_DIR/test-ca-bundle.pem" 644 < <(cat /etc/ssl/certs/ca-certificates.crt "$CADDY_ROOT")
+  if [[ $LOCAL_CA == yes ]]; then write_file "$ENTE_DIR/test-ca-bundle.pem" 644 < <(cat /etc/ssl/certs/ca-certificates.crt "$CADDY_ROOT"); fi
 }
 
 configure_host() {
+  need_storage
   apply_edits
+  s3_prepare
   sync_internal
   setup_caddy_config
   setup_test_env
@@ -409,6 +512,8 @@ wait_healthy() { # service [timeout]
 }
 
 url_ok() { local i; for i in $(seq 1 "${2:-20}"); do curl -fsS -m 5 "$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+
+dns_names() { if [[ $STORAGE == silo ]]; then echo "api., web., albums., s3.$DOMAIN"; else echo "api., web., albums.$DOMAIN"; fi; }
 
 print_test_steps() {
   [[ $MODE == test ]] || return 0
@@ -442,7 +547,7 @@ cmd_install() {
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
   if url_ok "https://api.$DOMAIN/ping" 20; then log "https://api.$DOMAIN/ping OK"
   elif [[ $MODE == test ]]; then die "https://api.$DOMAIN/ping failed in test mode"
-  else warn "https://api.$DOMAIN/ping not reachable yet - point DNS A/AAAA (TTL 300) for api., web., albums., s3.$DOMAIN to this server"; fi
+  else warn "https://api.$DOMAIN/ping not reachable yet - point DNS A/AAAA (TTL 300) for $(dns_names) to this server"; fi
   cat <<EOF
 
 Ente is up.
@@ -516,60 +621,116 @@ ensure_box_key() {
   ok "Box key login works"
 }
 
-# rclone_set REMOTE key=value...: edit rclone.conf directly; `rclone config update` contacts the endpoint and fails when it is unreachable.
+# rclone_set REMOTE < key=value lines: create/update a remote in rclone.conf directly, so secrets never appear in a command line
+# and nothing contacts the endpoint (`rclone config create/update` does, and fails when it is unreachable).
 rclone_set() {
-  local conf r=$1; shift
+  local conf
   conf=$(rclone config file | tail -1)
-  python3 - "$conf" "$r" "$@" <<'PY'
+  mkdir -p "$(dirname "$conf")"
+  (umask 077; python3 -c '
 import configparser, sys
-conf, remote, *kv = sys.argv[1:]
+conf, remote = sys.argv[1:]
 cp = configparser.RawConfigParser(); cp.optionxform = str; cp.read(conf)
-for a in kv:
-    k, v = a.split("=", 1)
-    cp.set(remote, k, v)
-with open(conf, "w") as f:
-    cp.write(f)
-PY
+if not cp.has_section(remote): cp.add_section(remote)
+for line in sys.stdin.read().splitlines():
+    if line:
+        k, v = line.split("=", 1); cp.set(remote, k, v)
+with open(conf, "w") as f: cp.write(f)
+' "$conf" "$1")
 }
 
 make_box_remotes() { # [confirm|once]: confirm = new passphrase, once = existing one; prompts are skipped for remotes that exist
-  local pass kid sec
+  local obs
   if [[ $BACKUP_TARGET == s3 ]]; then
     if rclone listremotes | grep -qx 'box:'; then
-      rclone_set box provider="$BACKUP_S3_PROVIDER" endpoint="$BACKUP_S3_ENDPOINT" region="$BACKUP_S3_REGION" no_check_bucket=true
+      rclone_set box <<EOF
+provider=$BACKUP_S3_PROVIDER
+endpoint=$BACKUP_S3_ENDPOINT
+region=$BACKUP_S3_REGION
+no_check_bucket=true
+EOF
     else
-      read -rp "S3 access key ID: " kid || die "no answer (stdin closed)"
-      ask_secret sec "S3 secret access key"
-      rclone config create box s3 provider="$BACKUP_S3_PROVIDER" endpoint="$BACKUP_S3_ENDPOINT" region="$BACKUP_S3_REGION"         access_key_id="$kid" secret_access_key="$sec" no_check_bucket=true >/dev/null
+      secret_var BACKUP_S3_ACCESS_KEY "Backup S3 access key ID"
+      secret_var BACKUP_S3_SECRET_KEY "Backup S3 secret access key"
+      rclone_set box <<EOF
+type=s3
+provider=$BACKUP_S3_PROVIDER
+endpoint=$BACKUP_S3_ENDPOINT
+region=$BACKUP_S3_REGION
+access_key_id=$BACKUP_S3_ACCESS_KEY
+secret_access_key=$BACKUP_S3_SECRET_KEY
+no_check_bucket=true
+EOF
     fi
   else
-    rclone config create box sftp host="$BOX_HOST" user="$BOX_USER" port="$BOX_PORT"       key_file="$BOX_KEY" known_hosts_file=/root/.ssh/known_hosts >/dev/null
+    rclone_set box <<EOF
+type=sftp
+host=$BOX_HOST
+user=$BOX_USER
+port=$BOX_PORT
+key_file=$BOX_KEY
+known_hosts_file=/root/.ssh/known_hosts
+EOF
   fi
   if rclone listremotes | grep -qx 'box-crypt:'; then
-    rclone_set box-crypt remote="${BOX_ROOT}config"
+    rclone_set box-crypt <<<"remote=${BOX_ROOT}config"
     log "box-crypt remote exists, keeping passphrase"; return 0
   fi
-  ask_secret pass "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "${1:-confirm}"
-  rclone config create box-crypt crypt remote="${BOX_ROOT}config" password="$pass" --obscure >/dev/null
+  secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "${1:-confirm}"
+  obs=$(rclone obscure - <<<"$BACKUP_PASSPHRASE")
+  rclone_set box-crypt <<EOF
+type=crypt
+remote=${BOX_ROOT}config
+password=$obs
+EOF
 }
 
+# The primary bucket (what the backup reads): Silo on localhost, or the external S3 bucket from museum.yaml.
 make_s3_remote() {
-  local kv
-  kv=$(python3 - "$ENTE_DIR/museum.yaml" <<'PY'
+  if [[ $STORAGE == s3 ]]; then
+    rclone_set ente-s3 <<EOF
+type=s3
+provider=$S3_PROVIDER
+endpoint=$(museum_val endpoint)
+region=$(museum_val region)
+access_key_id=$(museum_val key)
+secret_access_key=$(museum_val secret)
+no_check_bucket=true
+EOF
+  else
+    rclone_set ente-s3 <<EOF
+type=s3
+provider=Minio
+endpoint=http://127.0.0.1:3200
+region=$(museum_val region)
+access_key_id=$(museum_val key)
+secret_access_key=$(museum_val secret)
+EOF
+  fi
+}
+
+# Refuse to sync over a backup that belongs to another Ente instance (a fresh install pointed at an old backup would wipe it).
+check_backup_owner() {
+  local theirs
+  [[ -n $(rclone lsf "${BOX_ROOT}config" 2>/dev/null | head -1 || true) ]] || return 0
+  theirs=$(mktemp); chmod 600 "$theirs"
+  if ! rclone cat box-crypt:museum.yaml >"$theirs" 2>/dev/null || [[ ! -s $theirs ]]; then
+    rm -f "$theirs"; die "the backup target already holds a backup that this passphrase cannot read; refusing to overwrite it"
+  fi
+  if ! python3 - "$ENTE_DIR/museum.yaml" "$theirs" <<'PY'
 import sys, yaml
-b = yaml.safe_load(open(sys.argv[1]))["s3"]["b2-eu-cen"]
-print(b["key"]); print(b["secret"]); print(b["region"])
+a, b = (yaml.safe_load(open(f))["key"]["encryption"] for f in sys.argv[1:])
+sys.exit(a != b)
 PY
-  )
-  { read -r k; read -r s; read -r r; } <<<"$kv"
-  rclone config create ente-s3 s3 provider=Minio endpoint=http://127.0.0.1:3200 \
-    access_key_id="$k" secret_access_key="$s" region="$r" >/dev/null
+  then rm -f "$theirs"; die "the backup target holds the backup of a DIFFERENT Ente instance; refusing to overwrite it (use 'restore' on a fresh server, or a new bucket/folder)"; fi
+  rm -f "$theirs"
 }
 
 install_backup_units() {
   write_file /etc/ente-backup.env 600 <<EOF
 HC_URL="$HC_URL"
 BOX_ROOT="$BOX_ROOT"
+SRC_BUCKET="$SRC_BUCKET"
 REQUIRE_MOUNT=$([[ -n $DATA_DISK ]] && echo yes || echo no)
 LOW_RAM=$LOW_RAM
 SYNCTHING=$SYNCTHING
@@ -595,7 +756,7 @@ mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
 rclone sync "$DUMPS" box-crypt: --checkers 4
-rclone sync ente-s3:b2-eu-cen "${BOX_ROOT}objects" --size-only "${OPTS[@]}" \
+rclone sync "ente-s3:${SRC_BUCKET:-b2-eu-cen}" "${BOX_ROOT}objects" --size-only "${OPTS[@]}" \
   --max-delete 500 --backup-dir "${BOX_ROOT}deleted/$(date +%F)"
 if [[ "${SYNCTHING:-no}" == yes ]]; then
   rclone sync /srv/syncthing "${BOX_ROOT}syncthing" --exclude '/config/**' --checkers 4
@@ -636,12 +797,13 @@ EOF
 }
 
 cmd_backup_setup() {
-  load_env; need_backup
+  load_env; need_backup; need_storage
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
   install_rclone
   ensure_box_key
   make_box_remotes
   make_s3_remote
+  check_backup_owner
   install_backup_units
   systemctl start --no-block ente-backup.service
   log "backup configured; first run started: journalctl -fu ente-backup.service"
@@ -649,7 +811,7 @@ cmd_backup_setup() {
 
 # ---------------------------------------------------------------- restore
 cmd_restore() {
-  load_env; need_backup
+  load_env; need_backup; need_storage
   local tmp dump t0=$SECONDS
   [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR already exists; restore is for a fresh server"
   if [[ -n $DATA_DISK ]]; then mountpoint -q "$DATA_MNT" || die "$DATA_MNT not mounted; run bootstrap first"; fi
@@ -670,8 +832,8 @@ cmd_restore() {
   install -m 644 "$tmp/museum.yaml" "$ENTE_DIR/museum.yaml"
   configure_host
   make_s3_remote
-  log "starting postgres and silo"
-  dc up -d --wait postgres minio
+  log "starting postgres$([[ $STORAGE == silo ]] && echo ' and silo')"
+  dc up -d --wait postgres $([[ $STORAGE == silo ]] && echo minio)
   log "restoring database $(basename "$dump")"
   dc cp "$dump" postgres:/tmp/restore.dump
   dc exec -T postgres pg_restore -U pguser -d ente_db --clean --if-exists /tmp/restore.dump || die "pg_restore failed"
@@ -679,7 +841,11 @@ cmd_restore() {
   log "restoring objects (this can take long)"
   local opts=(--checkers 4 --transfers 4)
   [[ $LOW_RAM == yes ]] && opts=(--checkers 4 --transfers 2 --buffer-size 4M)
-  rclone copy "${BOX_ROOT}objects" ente-s3:b2-eu-cen "${opts[@]}"
+  if [[ $STORAGE == s3 && -n $(rclone lsf "ente-s3:$SRC_BUCKET" --max-depth 1 2>/dev/null | head -1 || true) ]]; then
+    log "primary bucket $SRC_BUCKET already holds objects; keeping them (not copying from the backup)"
+  else
+    rclone copy "${BOX_ROOT}objects" "ente-s3:$SRC_BUCKET" "${opts[@]}"
+  fi
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
@@ -687,7 +853,7 @@ cmd_restore() {
   cat <<EOF
 
 Restored. Next:
-  1. DNS: point A/AAAA of api., web., albums., s3.$DOMAIN to $(host_ip) (TTL 300). Certificates are issued once DNS resolves.
+  1. DNS: point A/AAAA of $(dns_names) to $(host_ip) (TTL 300). Certificates are issued once DNS resolves.
   2. $0 backup-setup   (installs the timer; remotes and key already exist)
   3. $0 check
 EOF
@@ -699,7 +865,7 @@ cmd_check() {
   load_env
   local s cid st pol p addrs ts res n out
   echo "== containers"
-  for s in museum web postgres minio; do
+  for s in museum web postgres $([[ $STORAGE == silo ]] && echo minio); do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
     if [[ -z $cid ]]; then bad "$s not running"; continue; fi
     st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")
@@ -709,13 +875,14 @@ cmd_check() {
   done
   if [[ -z $(dc ps -q socat 2>/dev/null || true) ]]; then ok "socat not running"; else bad "socat is running"; fi
   echo "== ports"
-  for p in 8080 3000 3002 3200; do
+  for p in 8080 3000 3002 $([[ $STORAGE == silo ]] && echo 3200); do
     addrs=$(ss -Htln "sport = :$p" | awk '{print $4}')
     if [[ -z $addrs ]]; then bad "port $p not listening"
     elif grep -qvE '^127\.0\.0\.1:' <<<"$addrs"; then bad "port $p exposed beyond localhost: $(echo "$addrs" | tr '\n' ' ')"
     else ok "port $p on 127.0.0.1 only"; fi
   done
-  for p in 3201 5432; do
+  for p in 3200 3201 5432; do
+    [[ $p == 3200 && $STORAGE == silo ]] && continue
     if [[ -z $(ss -Htln "sport = :$p") ]]; then ok "port $p not listening"; else bad "port $p is listening"; fi
   done
   echo "== ssh / firewall"
@@ -730,23 +897,38 @@ cmd_check() {
   if [[ -n $DATA_DISK ]]; then
     if mountpoint -q "$DATA_MNT"; then ok "$DATA_MNT mounted"; else bad "$DATA_MNT not mounted"; fi
   fi
+  if [[ $STORAGE == s3 ]]; then
+    echo "== primary storage"
+    if out=$(rclone lsf "ente-s3:$SRC_BUCKET" --max-depth 1 2>&1 >/dev/null); then ok "bucket $SRC_BUCKET reachable"; else bad "bucket $SRC_BUCKET: $out"; fi
+    out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT"       "https://$(museum_val endpoint)/$SRC_BUCKET/ente-check" 2>&1 || true)
+    if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight from https://web.$DOMAIN allowed"; else bad "CORS preflight from https://web.$DOMAIN not allowed (web uploads will fail)"; fi
+  fi
   echo "== backup"
   if systemctl is-enabled --quiet ente-backup.timer 2>/dev/null; then ok "timer enabled, next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value)"; else bad "ente-backup.timer not enabled"; fi
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
   res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
   if [[ -z $ts ]]; then warn "backup has not run yet"
   elif [[ $res == success ]]; then ok "last backup finished $ts: $res"; else bad "last backup $ts: $res"; fi
-  if out=$(rclone check ente-s3:b2-eu-cen "${BOX_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: bucket is on the backup target"
+  if out=$(rclone check "ente-s3:$SRC_BUCKET" "${BOX_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: bucket is on the backup target"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   echo "== system"
   df -h / ${DATA_DISK:+"$DATA_MNT"} | sed 's/^/        /'
-  warn "check Storage Box usage in the Hetzner Console"
+  warn "check the backup target's usage in its console (Hetzner / S3 provider)"
   n=$(journalctl -k -q --since '30 days ago' 2>/dev/null | grep -ciE 'out of memory|oom-kill' || true)
   if [[ $n == 0 ]]; then ok "no OOM kills in 30 days"; else bad "$n OOM kernel messages (journalctl -k | grep -i oom)"; fi
   if [[ -e /var/run/reboot-required ]]; then warn "reboot required"; else ok "no reboot pending"; fi
   echo
   if ((FAILS)); then echo "$FAILS check(s) FAILED"; return 1; fi
   echo "all checks passed"
+}
+
+# ---------------------------------------------------------------- deploy
+# bootstrap + (install | restore) + backup-setup in one go, from the config and secrets given.
+cmd_deploy() {
+  cmd_bootstrap
+  if [[ $RESTORE == yes ]]; then cmd_restore; else cmd_install; fi
+  cmd_backup_setup
+  log "deploy finished. Next: sign up the owner, then '$0 lockdown'."
 }
 
 # ---------------------------------------------------------------- syncthing
@@ -777,11 +959,12 @@ EOF
 }
 
 # ---------------------------------------------------------------- main
-usage() { echo "usage: $0 {bootstrap|install|codes|lockdown|backup-setup|restore|check|update|syncthing}" >&2; exit 2; }
+usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update|syncthing}" >&2; exit 2; }
 
 main() {
   CMD=$1
   case $CMD in
+    deploy) load_env; cmd_deploy ;;
     bootstrap) cmd_bootstrap ;;
     install) cmd_install ;;
     codes) cmd_codes ;;
