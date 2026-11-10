@@ -34,6 +34,11 @@ Earlier tests of the full-featured version (local Silo, data disk, test mode, lo
 - [x] Browser: full batch of 12 photos + 65 MB video: 13/13 uploaded. The video's multipart upload finishes slowly when many files upload at once in headless Chromium (stuck at 12/13 for more than 4 minutes, done within 10); alone or with one photo it takes under 90 s. Server logs clean, every PUT to e2 returned 200.
 - [x] Backup run: photo bucket and `objects/` equal, 66 objects / 157.9 MiB; `check` all OK. DB: 5 users, 33 files.
 
+## Independent review and fixes (blind review by a second agent, then retested on the VPS)
+Fixed: invalid/placeholder admin key now refused before sshd hardening; `KbdInteractiveAuthentication no` added and verified; backup-owner guard fails closed on listing errors; `update` no longer swallows failures and takes a backup first; restore is resumable and always tops up missing objects (copy only); any `museum.yaml` change restarts museum (in-place edit keeps the bind-mount inode); S3 keys are not demanded again when `museum.yaml` already holds them; `RCLONE_CONFIG` fixed independent of sudo's HOME; `sshd -T | awk` SIGPIPE race removed; `deploy` collects all secrets before changing anything; incomplete quickstart dir detected; environment wins over blank values in the secrets file; dump sync `--max-delete 20`; `check` flags a backup older than 36 h.
+Not changed: `MaxAuthTries 3` (per brief, documented), unpinned installers (documented), OTP codes in the log from `codes`.
+Retest on the VPS: bad key refused (root login untouched); `install` without secrets file OK; `update` (backup first) OK; `deploy` re-run changes only the sshd drop-in and backup script as expected; teardown + `restore` OK (5 users / 33 files, 20 s); simulated interrupted restore re-run cleans up and completes; `check` all OK.
+
 ## Deviations from the original brief
 1. Storage is an external S3 bucket (`STORAGE` Silo mode, data disk, Storage Box, Syncthing, test mode and zram were removed to keep the script small; see git tag `full-featured-v1`).
 2. Bucket keys and the backup passphrase may come from `ente-setup.secrets` or the environment (non-interactive `deploy`); they are prompted when missing.

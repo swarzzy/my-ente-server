@@ -14,9 +14,12 @@ ENTE_DIR=/opt/my-ente
 QUICKSTART_URL=https://raw.githubusercontent.com/ente/ente/main/server/quickstart.sh
 INT_BEGIN='# BEGIN ente-setup internal'
 INT_END='# END ente-setup internal'
+# the backup service uses this path; do not depend on sudo's HOME
+export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 FAILS=0
 MUSEUM_CFG_CHANGED=0
 CMD=
+SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE'
 
 # ---------------------------------------------------------------- helpers
 log()  { printf '%s [%s] %s\n' "$(date '+%F %T')" "$CMD" "$*"; }
@@ -70,9 +73,12 @@ load_env() {
   # shellcheck source=/dev/null
   . "$ENV_FILE"
   if [[ -f $SECRETS_FILE ]]; then
+    local v e
     [[ $(stat -c %a "$SECRETS_FILE") =~ ^[46]00$ ]] || die "$SECRETS_FILE must be mode 600"
+    for v in $SECRET_VARS; do declare -g "_env_$v=${!v:-}"; done
     # shellcheck source=/dev/null
     . "$SECRETS_FILE"
+    for v in $SECRET_VARS; do e=_env_$v; [[ -z ${!e} ]] || declare -g "$v=${!e}"; done # variables set in the environment win
   fi
   DOMAIN=${DOMAIN:-}; ADMIN_USER=${ADMIN_USER:-}; ADMIN_SSH_PUBKEY=${ADMIN_SSH_PUBKEY:-}; FAIL2BAN=${FAIL2BAN:-yes}
   HC_URL=${HC_URL:-}; RESTORE=${RESTORE:-no}
@@ -109,13 +115,14 @@ EOF
   [[ -d /etc/ssh/sshd_config.d ]] || die "/etc/ssh/sshd_config.d missing"
   write_file /etc/ssh/sshd_config.d/10-hardening.conf <<EOF
 PasswordAuthentication no
+KbdInteractiveAuthentication no
 PermitRootLogin no
 AllowUsers $ADMIN_USER
 MaxAuthTries 3
 EOF
   sshd -t || die "sshd config invalid"
-  n=$(sshd -T | grep -Ec '^(passwordauthentication no|permitrootlogin no|allowusers '"$ADMIN_USER"'|maxauthtries 3)$' || true)
-  if ((n != 4)); then
+  n=$(sshd -T | grep -Ec '^(passwordauthentication no|kbdinteractiveauthentication no|permitrootlogin no|allowusers '"$ADMIN_USER"'|maxauthtries 3)$' || true)
+  if ((n != 5)); then
     rm -f /etc/ssh/sshd_config.d/10-hardening.conf
     die "sshd -T does not show the hardening (no Include for sshd_config.d?); drop-in removed"
   fi
@@ -126,14 +133,16 @@ EOF
 cmd_bootstrap() {
   load_env; need ADMIN_USER ADMIN_SSH_PUBKEY
   [[ $ADMIN_USER =~ ^[a-z_][a-z0-9_-]*$ && $ADMIN_USER != root ]] || die "ADMIN_USER invalid"
-  [[ $ADMIN_SSH_PUBKEY =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]] || die "ADMIN_SSH_PUBKEY does not look like a public key"
+  local kf; kf=$(mktemp); printf '%s\n' "$ADMIN_SSH_PUBKEY" >"$kf"
+  ssh-keygen -l -f "$kf" >/dev/null 2>&1 || { rm -f "$kf"; die "ADMIN_SSH_PUBKEY is not a valid public key (placeholder or truncated?); refusing, it would lock you out"; }
+  rm -f "$kf"
   log "updating packages"
   apt_get update
   apt_get -y -o Dpkg::Options::=--force-confold upgrade
   apt_install sudo ufw curl ca-certificates gnupg unattended-upgrades python3-yaml unzip openssh-server
   setup_ssh
   local sshport
-  sshport=$(sshd -T | awk '$1 == "port" {print $2; exit}')
+  sshport=$(sshd -T | awk '$1 == "port" {print $2}' | head -1 || true)
   ufw allow "${sshport:-22}/tcp" >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
   ufw --force enable >/dev/null
   write_file /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -197,7 +206,8 @@ install_rclone() {
 }
 
 run_quickstart() {
-  [[ -d $ENTE_DIR ]] && { log "$ENTE_DIR exists, skipping quickstart"; return 0; }
+  if [[ -f $ENTE_DIR/compose.yaml && -f $ENTE_DIR/museum.yaml ]]; then log "$ENTE_DIR exists, skipping quickstart"; return 0; fi
+  [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR exists but is incomplete (failed quickstart?); remove it and re-run"
   log "running Ente quickstart (answering n)"
   (cd /opt && printf 'n\n' | sh -c "$(curl -fsSL "$QUICKSTART_URL")") >/dev/null || die "quickstart failed"
   [[ -f $ENTE_DIR/compose.yaml && -f $ENTE_DIR/museum.yaml ]] || die "quickstart did not create compose.yaml/museum.yaml"
@@ -207,8 +217,6 @@ run_quickstart() {
 apply_edits() {
   local c=$ENTE_DIR/compose.yaml m=$ENTE_DIR/museum.yaml p
   chmod 700 "$ENTE_DIR"
-  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
-  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
   python3 - "$c" "$m" <<'PY' || die "quickstart output no longer matches the expected layout; not patching blindly"
 import sys, yaml
 c = yaml.safe_load(open(sys.argv[1])); m = yaml.safe_load(open(sys.argv[2]))
@@ -229,8 +237,14 @@ PY
   grep -q '^ *ENTE_API_ORIGIN:' "$c" || die "compose.yaml: ENTE_API_ORIGIN not found"
   sed -Ei "s|^( *ENTE_API_ORIGIN:).*|\1 https://api.$DOMAIN|" "$c"
   grep -qE "^ *ENTE_API_ORIGIN: https://api\.${DOMAIN//./\\.}\$" "$c" || die "compose.yaml: ENTE_API_ORIGIN edit failed"
-  sed -Ei "s|^( *public-albums:).*|\1 https://albums.$DOMAIN|" "$m"
+  sed -E "s|^( *public-albums:).*|\1 https://albums.$DOMAIN|" "$m" >"$m.new"; cat "$m.new" >"$m"; rm -f "$m.new" # in place: keep the inode for the bind mount
   grep -Fq "public-albums: https://albums.$DOMAIN" "$m" || die "museum.yaml: public-albums edit failed"
+  if [[ -z $S3_ACCESS_KEY || -z $S3_SECRET_KEY ]] && museum_s3_configured; then
+    local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
+    eval "$(museum_s3)"; S3_ACCESS_KEY=$M_KEY; S3_SECRET_KEY=$M_SECRET # keep the keys already in museum.yaml
+  fi
+  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
+  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
   edit_museum_s3 "$m"
   yaml_ok "$c"; yaml_ok "$m"
 }
@@ -271,6 +285,15 @@ museum_s3() {
 import shlex, sys, yaml
 b = yaml.safe_load(open(sys.argv[1]))["s3"]["b2-eu-cen"]
 for k in ("key", "secret", "endpoint", "region", "bucket"): print("M_%s=%s" % (k.upper(), shlex.quote(str(b[k]))))
+PY
+}
+
+# true when museum.yaml already points at the configured photo bucket (and is not the quickstart's local MinIO)
+museum_s3_configured() {
+  python3 - "$ENTE_DIR/museum.yaml" "$S3_ENDPOINT" "$S3_BUCKET" <<'PY'
+import sys, yaml
+b = yaml.safe_load(open(sys.argv[1]))["s3"]["b2-eu-cen"]
+sys.exit(not (b["endpoint"] == sys.argv[2] and b["bucket"] == sys.argv[3] and not str(b["key"]).startswith("minio-user-")))
 PY
 }
 
@@ -327,9 +350,11 @@ sync_internal() {
 }
 
 configure_host() {
+  local h0; h0=$(sha256sum "$ENTE_DIR/museum.yaml")
   apply_edits
   s3_prepare
   sync_internal
+  [[ $(sha256sum "$ENTE_DIR/museum.yaml") == "$h0" ]] || MUSEUM_CFG_CHANGED=1
   write_file /etc/caddy/Caddyfile <<EOF
 api.$DOMAIN {
 	reverse_proxy 127.0.0.1:8080
@@ -427,7 +452,15 @@ cmd_lockdown() {
 
 cmd_update() {
   load_env
-  dc pull && dc up -d && docker image prune -f >/dev/null
+  if systemctl cat ente-backup.service >/dev/null 2>&1; then
+    log "running a backup first (rollback point)"
+    systemctl start ente-backup.service || die "backup failed; not updating"
+  else
+    warn "no backup configured yet; updating without a rollback point"
+  fi
+  dc pull
+  dc up -d
+  docker image prune -f >/dev/null
   log "updated"
 }
 
@@ -499,8 +532,10 @@ EOF
 
 # Refuse to sync over a backup that belongs to another Ente instance (a fresh install pointed at an old backup would wipe it).
 check_backup_owner() {
-  local theirs
-  [[ -n $(rclone lsf "${BACKUP_ROOT}config" 2>/dev/null | head -1 || true) ]] || return 0
+  local theirs rc=0 listing
+  listing=$(rclone lsf "${BACKUP_ROOT}config" 2>/dev/null) || rc=$?
+  ((rc == 0 || rc == 3)) || die "cannot list the backup bucket (rclone exit $rc); not touching it"
+  [[ -n $listing ]] || return 0
   theirs=$(mktemp); chmod 600 "$theirs"
   if ! rclone cat backup-crypt:museum.yaml >"$theirs" 2>/dev/null || [[ ! -s $theirs ]]; then
     rm -f "$theirs"; die "the backup bucket already holds a backup that this passphrase cannot read; refusing to overwrite it"
@@ -535,7 +570,7 @@ docker compose exec -T postgres pg_restore -l < "$dump.tmp" > /dev/null || { ech
 mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
-rclone sync "$DUMPS" backup-crypt: --checkers 4
+rclone sync "$DUMPS" backup-crypt: --checkers 4 --max-delete 20
 rclone sync "ente-s3:$PHOTO_BUCKET" "${BACKUP_ROOT}objects" --size-only "${OPTS[@]}" \
   --max-delete 500 --backup-dir "${BACKUP_ROOT}deleted/$(date +%F)"
 cutoff=$(date -d '60 days ago' +%F)
@@ -591,6 +626,11 @@ cmd_backup_setup() {
 cmd_restore() {
   load_env
   local tmp dump t0=$SECONDS
+  if [[ -e $ENTE_DIR/.restore-incomplete ]]; then
+    log "previous restore did not finish; cleaning up and starting over"
+    dc down -v >/dev/null 2>&1 || true
+    rm -rf "$ENTE_DIR"
+  fi
   [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR already exists; restore is for a fresh server"
   apt_get update; apt_install curl ca-certificates python3-yaml gnupg
   install_docker; install_caddy; install_rclone
@@ -603,7 +643,7 @@ cmd_restore() {
   rclone copy backup-crypt: "$tmp" --checkers 4
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
-  install -d -m 700 "$ENTE_DIR"
+  install -d -m 700 "$ENTE_DIR"; touch "$ENTE_DIR/.restore-incomplete"
   install -m 600 "$tmp/compose.yaml" "$ENTE_DIR/compose.yaml"
   install -m 644 "$tmp/museum.yaml" "$ENTE_DIR/museum.yaml"
   configure_host
@@ -614,15 +654,12 @@ cmd_restore() {
   dc cp "$dump" postgres:/tmp/restore.dump
   dc exec -T postgres pg_restore -U pguser -d ente_db --clean --if-exists /tmp/restore.dump || die "pg_restore failed"
   dc exec -T postgres rm -f /tmp/restore.dump
-  if [[ -n $(rclone lsf "ente-s3:$S3_BUCKET" --max-depth 1 2>/dev/null | head -1 || true) ]]; then
-    log "photo bucket $S3_BUCKET already holds objects; keeping them (not copying from the backup)"
-  else
-    log "photo bucket is empty: copying objects back from the backup (this can take long)"
-    rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --checkers 4 --transfers 4
-  fi
+  log "copying objects missing from the photo bucket back from the backup (never deletes; can take long on a new bucket)"
+  rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
+  rm -f "$ENTE_DIR/.restore-incomplete"
   log "restore finished in $((SECONDS - t0))s"
   cat <<EOF
 
@@ -678,7 +715,9 @@ cmd_check() {
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
   res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
   if [[ -z $ts ]]; then warn "backup has not run yet"
-  elif [[ $res == success ]]; then ok "last backup finished $ts: $res"; else bad "last backup $ts: $res"; fi
+  elif [[ $res != success ]]; then bad "last backup $ts: $res"
+  elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
+  else ok "last backup finished $ts: $res"; fi
   if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   echo "== system"
@@ -695,6 +734,12 @@ cmd_check() {
 # ---------------------------------------------------------------- deploy / main
 # bootstrap + (install | restore) + backup-setup in one go, from the config and secrets given.
 cmd_deploy() {
+  need ADMIN_USER ADMIN_SSH_PUBKEY
+  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
+  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
+  secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
+  secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
+  secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "$([[ $RESTORE == yes ]] && echo once || echo confirm)"
   cmd_bootstrap
   if [[ $RESTORE == yes ]]; then cmd_restore; else cmd_install; fi
   cmd_backup_setup

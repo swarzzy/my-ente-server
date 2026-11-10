@@ -32,7 +32,9 @@ Both copies are git-ignored. Anything missing from the secrets file is asked at 
 4. **As root:** `./ente-setup.sh deploy` = `bootstrap` + `install` + `backup-setup`. About 5 minutes.
    - `bootstrap`: updates, `ADMIN_USER` (sudo, key only), sshd hardening (no passwords, no root login), UFW 22/80/443,
      unattended upgrades (reboot 02:00 only when needed), 2 GB swap, fail2ban.
+     The admin key is validated first (a placeholder or truncated key is refused, since it would lock you out).
      **Open a second terminal and log in as `ADMIN_USER` before closing the root session** (root login is now off).
+     `MaxAuthTries 3`: if your ssh-agent holds many keys use `ssh -o IdentitiesOnly=yes -i KEY`.
    - `install`: Docker, Caddy, Ente's quickstart; edits its files (each edit asserted; fails loudly if the quickstart changed),
      checks the photo bucket (read/write/delete), sets CORS, starts everything.
    - `backup-setup`: rclone remotes, systemd timer (03:00 daily, catches up if missed), first run started.
@@ -53,7 +55,9 @@ encrypted with `BACKUP_PASSPHRASE`), mirrors the photo bucket to `<backup bucket
 `deleted/<date>/` and are purged after 60 days; a run that would delete more than 500 objects stops with an error.
 `HC_URL` (optional) is pinged only after a fully successful run.
 
-`backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, or one the passphrase cannot read.
+`backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, one the passphrase cannot read, or one it cannot list.
+The server holds keys that can delete backups: turn on bucket versioning or Object Lock at the backup provider if it supports it, and use a key limited to that bucket.
+Two safety limits stop a run instead of deleting: more than 500 photo deletions, more than 20 dump deletions.
 
 ## Monthly: `sudo ./ente-setup.sh check`
 
@@ -62,15 +66,16 @@ result, `rclone check` photo bucket vs backup, disk, OOM kills, pending reboot. 
 
 ## Updates
 
-`sudo ./ente-setup.sh update` (pull images, recreate changed containers, prune). Ente images are untagged `latest`;
-read Ente's release notes first. OS updates install themselves.
+`sudo ./ente-setup.sh update`: runs a backup first (rollback point; aborts if it fails), pulls images, recreates changed containers, prunes.
+Ente images are untagged `latest`; read Ente's release notes first. OS updates install themselves.
 
 ## Moving to a new VPS / disaster recovery (`restore`)
 
 1. New VPS, point DNS later. Put the **same** `ente-setup.env` and secrets there (same `DOMAIN`, same buckets, same `BACKUP_PASSPHRASE`) and set `RESTORE=yes`.
 2. `./ente-setup.sh deploy` (bootstrap, then `restore`, then `backup-setup`). `restore` fetches the encrypted config backup,
    puts back `museum.yaml`, restores the newest DB dump, and uses the photos already in the photo bucket
-   (only if that bucket is empty does it copy them back from the backup). About 2 minutes for a small library.
+   and tops up any objects missing from the photo bucket from the backup (copy only, never deletes). About 2 minutes for a small library.
+   If a restore is interrupted, just run it again: it cleans up and starts over.
 3. Point DNS (`api.`, `web.`, `albums.`, TTL 300) at the new IP; certificates are issued once it resolves. Run `check`.
 
 Apps keep working because the hostnames do not change. To restore into a *new* photo bucket, set the new `S3_*` values:
@@ -79,5 +84,6 @@ objects are copied from the backup bucket.
 ## Notes and limits
 
 - Users in countries that throttle foreign hosts need to reach the photo bucket's endpoint directly; pick a provider that works for them.
+- The installers (get.docker.com, Caddy repo key, rclone, Ente quickstart from `main`) are fetched at install time and run as root without pinning; the quickstart's output is asserted.
 - The VPS downloads and re-uploads every photo for the backup (bucket → VPS → bucket). Fine for hundreds of GB, slow for the first run.
 - Museum logs some request metadata (never photo plaintext); Docker log rotation bounds it (10 MB x 3).
