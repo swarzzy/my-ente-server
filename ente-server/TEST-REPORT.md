@@ -29,8 +29,10 @@ Earlier tests of the full-featured version (local Silo, data disk, test mode, lo
 - [x] Existing photos kept in e2 (bucket not empty -> nothing copied). Browser: existing user logs in with the original password on the restored server, sees 12 memories, viewer opens and decrypts the original; no HTTP errors.
 - [x] `check` all OK on the restored host after `backup-setup`.
 
-## Pending
-- Fresh install of the *simplified* script on a clean state (needs empty backup bucket): see "Open issues".
+## Fresh install of the simplified script (second run, after emptying both dev buckets and removing the app)
+- [x] `deploy` on the already-bootstrapped VPS: 29 s (packages cached), `check` all OK, CORS set, fresh quickstart secrets.
+- [x] Browser: full batch of 12 photos + 65 MB video: 13/13 uploaded. The video's multipart upload finishes slowly when many files upload at once in headless Chromium (stuck at 12/13 for more than 4 minutes, done within 10); alone or with one photo it takes under 90 s. Server logs clean, every PUT to e2 returned 200.
+- [x] Backup run: photo bucket and `objects/` equal, 66 objects / 157.9 MiB; `check` all OK. DB: 5 users, 33 files.
 
 ## Deviations from the original brief
 1. Storage is an external S3 bucket (`STORAGE` Silo mode, data disk, Storage Box, Syncthing, test mode and zram were removed to keep the script small; see git tag `full-featured-v1`).
@@ -45,4 +47,4 @@ Earlier tests of the full-featured version (local Silo, data disk, test mode, lo
 - Museum accepts a single configured bucket; verified for uploads/downloads/multipart on e2. Replication to a second bucket is not configured (backup is the second copy).
 - e2/B2 endpoints must be reachable by every user (incl. those in Russia); not testable from here.
 - Backup traffic goes bucket -> VPS -> bucket; B2 keeps old file versions unless a lifecycle rule limits them.
-- First 13-file batch upload in headless Chromium stalled at 12/13 once (video queued behind processing); the same video alone uploaded fine. Not reproduced against the server logs; likely the browser test, not storage.
+- Multipart video upload in a large concurrent batch is slow in headless Chromium (see above); no error on the server or the bucket. Worth watching with the real apps.
