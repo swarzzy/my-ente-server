@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
-# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update>
+# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update|alert-test|vpn>
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
 # Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
 set -euo pipefail
@@ -19,24 +19,35 @@ export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 FAILS=0
 MUSEUM_CFG_CHANGED=0
 CMD=
-SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE'
+SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE YANDEX_TOKEN TG_BOT_TOKEN'
 
 # ---------------------------------------------------------------- helpers
+# log MSG / die MSG: timestamped line tagged with the command; die prints to stderr and exits 1.
 log()  { printf '%s [%s] %s\n' "$(date '+%F %T')" "$CMD" "$*"; }
 die()  { printf '%s [%s] ERROR: %s\n' "$(date '+%F %T')" "$CMD" "$*" >&2; exit 1; }
+# ok/bad/warn MSG: check result lines; bad also counts the failure in FAILS.
 ok()   { printf '  OK    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
 warn() { printf '  WARN  %s\n' "$*"; }
 
+# dc ARGS: docker compose in the Ente directory.
 dc() { (cd "$ENTE_DIR" && docker compose "$@"); }
+# apt_get ARGS: non-interactive apt-get.
 # fresh images run unattended-upgrades at first boot and hold the dpkg lock: wait for it
 apt_get() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -q "$@"; }
+# apt_install PKG...: install packages without recommends.
 apt_install() { apt_get install -y --no-install-recommends "$@"; }
+# ensure_line FILE LINE: append LINE to FILE unless already present verbatim.
 ensure_line() { grep -qxF -- "$2" "$1" 2>/dev/null || echo "$2" >>"$1"; }
+# version_ge VERSION MIN: true if VERSION (optional leading v) >= MIN.
 version_ge() { [[ $(printf '%s\n%s\n' "$2" "${1#v}" | sort -V | head -1) == "$2" ]]; }
+# host_ip: this server's outbound IPv4 address.
 host_ip() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'; }
+# need VAR...: die unless every named config variable is non-empty.
 need() { local v; for v in "$@"; do [[ -n ${!v} ]] || die "$v is not set in $ENV_FILE"; done; }
+# url_ok URL [TRIES]: poll URL every 3s until it answers 2xx; false after TRIES (default 20).
 url_ok() { local i; for i in $(seq 1 "${2:-20}"); do curl -fsS -m 5 "$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+# yaml_ok FILE: die unless FILE parses as YAML.
 yaml_ok() { python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$1" || die "$1 is not valid YAML"; }
 
 # write_file FILE [MODE] < content: replaces FILE only if content differs.
@@ -68,6 +79,7 @@ secret_var() {
   done
 }
 
+# Source the config and secrets files (environment wins over secrets file), apply defaults, validate.
 load_env() {
   [[ -f $ENV_FILE ]] || die "config $ENV_FILE not found (copy ente-setup.env.example)"
   # shellcheck source=/dev/null
@@ -81,21 +93,34 @@ load_env() {
     for v in $SECRET_VARS; do e=_env_$v; [[ -z ${!e} ]] || declare -g "$v=${!e}"; done # variables set in the environment win
   fi
   DOMAIN=${DOMAIN:-}; ADMIN_USER=${ADMIN_USER:-}; ADMIN_SSH_PUBKEY=${ADMIN_SSH_PUBKEY:-}; FAIL2BAN=${FAIL2BAN:-yes}
-  HC_URL=${HC_URL:-}; RESTORE=${RESTORE:-no}
+  SSH_PORT=${SSH_PORT:-22}; HC_URL=${HC_URL:-}; RESTORE=${RESTORE:-no}; CSP_REPORT_ONLY=${CSP_REPORT_ONLY:-no}
   S3_PROVIDER=${S3_PROVIDER:-Other}; S3_ENDPOINT=${S3_ENDPOINT:-}; S3_REGION=${S3_REGION:-}; S3_BUCKET=${S3_BUCKET:-}
   S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-https://web.$DOMAIN,https://albums.$DOMAIN}
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+  AWG_PORT=${AWG_PORT:-}; YANDEX_DIR=${YANDEX_DIR:-}; RESTORE_FROM=${RESTORE_FROM:-s3}; TG_CHAT_ID=${TG_CHAT_ID:-}
+  [[ ${1:-} != vpn ]] || return 0 # the VPN needs none of the Ente settings
   S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
+  YANDEX_TOKEN=${YANDEX_TOKEN:-}; TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
   need DOMAIN S3_ENDPOINT S3_REGION S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET
   [[ $DOMAIN =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z0-9-]+$ && $DOMAIN != *example.com ]] || die "DOMAIN missing, invalid or a placeholder"
-  [[ $S3_ENDPOINT != *://* && $BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
+  [[ $SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((SSH_PORT <= 65535)) && [[ ! $SSH_PORT =~ ^(80|443|3200|3201|5432)$ ]] ||
+    die "SSH_PORT must be 1-65535 and not 80, 443, 3200, 3201 or 5432"
+  [[ $S3_ENDPOINT != *://* &&$BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
   [[ $S3_ENDPOINT/$S3_BUCKET != "$BACKUP_S3_ENDPOINT/$BACKUP_S3_BUCKET" ]] || die "backup bucket must differ from the photo bucket"
   BACKUP_ROOT=backup:$BACKUP_S3_BUCKET/
+  YANDEX_ROOT=
+  if [[ -n $YANDEX_DIR ]]; then
+    [[ $YANDEX_DIR =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || die "YANDEX_DIR must be a relative folder path like ente-backup (letters, digits, . _ -)"
+    YANDEX_ROOT=yandex:$YANDEX_DIR/
+  fi
+  [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's ID starts with -)"
+  [[ $RESTORE_FROM == s3 || ($RESTORE_FROM == yandex && -n $YANDEX_DIR) ]] || die "RESTORE_FROM must be s3, or yandex with YANDEX_DIR set"
 }
 
 # ---------------------------------------------------------------- bootstrap
+# Create the passwordless-sudo admin user with its key, then harden sshd (key-only, no root) and verify it took effect.
 setup_ssh() {
   local home n
   id "$ADMIN_USER" >/dev/null 2>&1 || adduser --disabled-password --gecos '' "$ADMIN_USER"
@@ -114,6 +139,7 @@ EOF
   grep -qxF -- "$ADMIN_SSH_PUBKEY" "$home/.ssh/authorized_keys" || die "admin key not installed, refusing to harden sshd"
   [[ -d /etc/ssh/sshd_config.d ]] || die "/etc/ssh/sshd_config.d missing"
   write_file /etc/ssh/sshd_config.d/10-hardening.conf <<EOF
+Port $SSH_PORT
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin no
@@ -121,15 +147,27 @@ AllowUsers $ADMIN_USER
 MaxAuthTries 3
 EOF
   sshd -t || die "sshd config invalid"
-  n=$(sshd -T | grep -Ec '^(passwordauthentication no|kbdinteractiveauthentication no|permitrootlogin no|allowusers '"$ADMIN_USER"'|maxauthtries 3)$' || true)
-  if ((n != 5)); then
+  n=$(sshd -T | grep -Ec '^(port '"$SSH_PORT"'|passwordauthentication no|kbdinteractiveauthentication no|permitrootlogin no|allowusers '"$ADMIN_USER"'|maxauthtries 3)$' || true)
+  if ((n != 6)); then
     rm -f /etc/ssh/sshd_config.d/10-hardening.conf
     die "sshd -T does not show the hardening (no Include for sshd_config.d?); drop-in removed"
   fi
-  systemctl reload ssh
-  log "sshd hardened. TEST A SECOND LOGIN as $ADMIN_USER before closing this session!"
+  if systemctl is-active --quiet ssh.socket; then
+    # socket activation (Ubuntu 24.04+): a generator derives the listen port from sshd_config
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+  else
+    systemctl reload ssh
+  fi
+  for n in $(seq 1 10); do
+    [[ -z $(ss -Htln "sport = :$SSH_PORT") ]] || break
+    ((n < 10)) || die "sshd is not listening on port $SSH_PORT"
+    sleep 1
+  done
+  log "sshd hardened on port $SSH_PORT. TEST A SECOND LOGIN as $ADMIN_USER before closing this session!"
 }
 
+# bootstrap: upgrade packages, admin user + sshd hardening, ufw, unattended upgrades, swap, fail2ban.
 cmd_bootstrap() {
   load_env; need ADMIN_USER ADMIN_SSH_PUBKEY
   [[ $ADMIN_USER =~ ^[a-z_][a-z0-9_-]*$ && $ADMIN_USER != root ]] || die "ADMIN_USER invalid"
@@ -140,10 +178,12 @@ cmd_bootstrap() {
   apt_get update
   apt_get -y -o Dpkg::Options::=--force-confold upgrade
   apt_install sudo ufw curl ca-certificates gnupg unattended-upgrades python3-yaml unzip openssh-server
+  local oldport
+  oldport=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | head -1 || true)
+  # open the new port before sshd moves to it, so an active firewall never locks us out
+  ufw allow "$SSH_PORT/tcp" >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
   setup_ssh
-  local sshport
-  sshport=$(sshd -T | awk '$1 == "port" {print $2}' | head -1 || true)
-  ufw allow "${sshport:-22}/tcp" >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
+  if [[ -n $oldport && $oldport != "$SSH_PORT" ]]; then ufw delete allow "$oldport/tcp" >/dev/null || true; fi
   ufw --force enable >/dev/null
   write_file /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
@@ -160,18 +200,21 @@ EOF
   ensure_line /etc/fstab '/swapfile none swap sw 0 0'
   if [[ $FAIL2BAN == yes ]]; then
     apt_install fail2ban python3-systemd
-    write_file /etc/fail2ban/jail.d/sshd.local <<'EOF'
+    write_file /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
 backend = systemd
+port = $SSH_PORT
 EOF
     systemctl enable fail2ban >/dev/null 2>&1
     systemctl restart fail2ban
   fi
-  log "bootstrap done. Test a second login as $ADMIN_USER (ssh $ADMIN_USER@<ip>) before closing this session."
+  log "bootstrap done. Test a second login as $ADMIN_USER (ssh -p $SSH_PORT $ADMIN_USER@<ip>) before closing this session."
+  [[ $SSH_PORT == 22 ]] || log "if your provider has its own firewall (security group), allow TCP $SSH_PORT there too."
 }
 
 # ---------------------------------------------------------------- install helpers
+# Install Docker if missing, cap container log size, and require Compose >= 2.30.
 install_docker() {
   local v
   if ! command -v docker >/dev/null; then
@@ -189,6 +232,7 @@ EOF
   version_ge "$v" 2.30 || die "Docker Compose $v is older than 2.30"
 }
 
+# Install Caddy from its apt repository if missing.
 install_caddy() {
   command -v caddy >/dev/null && return 0
   log "installing Caddy from its apt repository"
@@ -199,12 +243,14 @@ install_caddy() {
   apt_install caddy
 }
 
+# Install rclone via its install script if missing.
 install_rclone() {
   command -v rclone >/dev/null && return 0
   apt_install unzip curl ca-certificates
   curl -fsSL https://rclone.org/install.sh | bash >/dev/null
 }
 
+# Run Ente's quickstart into $ENTE_DIR (declining its auto-start) unless it already produced compose.yaml + museum.yaml.
 run_quickstart() {
   if [[ -f $ENTE_DIR/compose.yaml && -f $ENTE_DIR/museum.yaml ]]; then log "$ENTE_DIR exists, skipping quickstart"; return 0; fi
   [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR exists but is incomplete (failed quickstart?); remove it and re-run"
@@ -325,6 +371,7 @@ except Exception as x:
 PY
 }
 
+# internal_admin: admin user_id from our internal block (empty if none). internal_locked: true if sign-ups are disabled.
 internal_admin() { sed -n 's/^  admins: \[\(.*\)\]$/\1/p' "$ENTE_DIR/museum.yaml"; }
 internal_locked() { grep -qx '  disable-registration: true' "$ENTE_DIR/museum.yaml"; }
 
@@ -349,20 +396,54 @@ sync_internal() {
   yaml_ok "$m"
 }
 
+# Shared by install and restore: patch the Ente config, verify the photo bucket, write the Caddyfile and compose override.
+# Sets MUSEUM_CFG_CHANGED=1 when museum.yaml changed.
 configure_host() {
   local h0; h0=$(sha256sum "$ENTE_DIR/museum.yaml")
   apply_edits
   s3_prepare
   sync_internal
   [[ $(sha256sum "$ENTE_DIR/museum.yaml") == "$h0" ]] || MUSEUM_CFG_CHANGED=1
+  # Security headers. deferred, so they replace any the upstream sends. CSP only as Report-Only (CSP_REPORT_ONLY=yes):
+  # violations show in the browser console, nothing is blocked. No CORS headers here: museum sets those itself.
+  local csp=''
+  if [[ $CSP_REPORT_ONLY == yes ]]; then
+    csp="Content-Security-Policy-Report-Only \"default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';"
+    csp+=" img-src 'self' blob: data:; media-src 'self' blob:; font-src 'self' data:; worker-src 'self' blob:;"
+    csp+=" connect-src 'self' https://api.$DOMAIN https://$S3_ENDPOINT https://$S3_BUCKET.$S3_ENDPOINT;"
+    csp+=" object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'\""
+  fi
   write_file /etc/caddy/Caddyfile <<EOF
+(sec) {
+	header {
+		defer
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+}
+(app) {
+	header {
+		defer
+		X-Frame-Options "DENY"
+		$csp
+	}
+}
+
 api.$DOMAIN {
+	import sec
 	reverse_proxy 127.0.0.1:8080
 }
 web.$DOMAIN {
+	import sec
+	import app
 	reverse_proxy 127.0.0.1:3000
 }
 albums.$DOMAIN {
+	import sec
+	import app
 	reverse_proxy 127.0.0.1:3002
 }
 EOF
@@ -388,7 +469,8 @@ EOF
   dc config -q >/dev/null || die "docker compose config failed"
 }
 
-wait_healthy() { # service [timeout]
+# wait_healthy SERVICE [TIMEOUT]: wait until the container is healthy (or running, without a healthcheck); die after TIMEOUT s (default 360).
+wait_healthy() {
   local cid st t=${2:-360} i
   for ((i = 0; i < t; i += 3)); do
     cid=$(dc ps -q "$1" 2>/dev/null || true)
@@ -401,6 +483,7 @@ wait_healthy() { # service [timeout]
   die "$1 not healthy after ${t}s (docker compose logs $1)"
 }
 
+# install: Docker, Caddy, Ente quickstart, host config, start containers and check /ping locally and via the domain.
 cmd_install() {
   load_env
   local pre
@@ -427,11 +510,13 @@ EOF
 }
 
 # ---------------------------------------------------------------- codes / lockdown / update
+# codes: show sign-up verification codes from the last 24 h of museum logs (no mail server is configured).
 cmd_codes() {
   load_env
   dc logs --no-log-prefix --since 24h museum 2>&1 | grep -ai 'verification code' | tail -n 20 || echo "no codes in the last 24h"
 }
 
+# lockdown: after confirmation, make the oldest user the admin, disable registration and restart museum.
 cmd_lockdown() {
   load_env
   local rows first id a
@@ -450,6 +535,7 @@ cmd_lockdown() {
   log "lockdown done: admin=$id, registration disabled"
 }
 
+# update: back up first (if configured), then pull and restart newer images and prune old ones.
 cmd_update() {
   load_env
   if systemctl cat ente-backup.service >/dev/null 2>&1; then
@@ -530,30 +616,64 @@ no_check_bucket=true
 EOF
 }
 
-# Refuse to sync over a backup that belongs to another Ente instance (a fresh install pointed at an old backup would wipe it).
+# yandex (Yandex Disk, native API: its WebDAV is throttled) and yandex-crypt (encrypted config/ folder in YANDEX_DIR).
+# The token is the JSON printed by `rclone authorize "yandex"` on a PC with a browser; rclone refreshes it in rclone.conf,
+# so an existing remote is never rewritten. yandex-crypt reuses backup-crypt's passphrase (same BACKUP_PASSPHRASE).
+# Deletes go to the Yandex trash (rclone default, no hard_delete): some protection if the token is abused; it uses quota.
+make_yandex_remotes() {
+  [[ -n $YANDEX_DIR ]] || return 0
+  if ! rclone listremotes | grep -qx 'yandex:'; then
+    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\")"
+    [[ $YANDEX_TOKEN == *access_token* ]] || die "YANDEX_TOKEN does not look like the JSON from rclone authorize \"yandex\""
+    rclone_set yandex <<EOF
+type=yandex
+token=$YANDEX_TOKEN
+EOF
+    if ! rclone mkdir "yandex:$YANDEX_DIR" 2>/dev/null; then
+      rclone config delete yandex; die "Yandex Disk login failed (token expired or wrong?); remote removed, re-run with a fresh token"
+    fi
+    log "yandex remote created"
+  fi
+  local pw
+  pw=$(python3 -c '
+import configparser, sys
+cp = configparser.RawConfigParser(); cp.read(sys.argv[1]); print(cp.get("backup-crypt", "password"))
+' "$(rclone config file | tail -1)") && [[ -n $pw ]] || die "backup-crypt remote has no passphrase; run make_backup_remotes first"
+  rclone_set yandex-crypt <<EOF
+type=crypt
+remote=${YANDEX_ROOT}config
+password=$pw
+EOF
+}
+
+# check_backup_owner [ROOT CRYPT NAME]: refuse to sync over a backup that belongs to another Ente instance
+# (a fresh install pointed at an old backup would wipe it). Default: the S3 backup bucket.
 check_backup_owner() {
-  local theirs rc=0 listing
-  listing=$(rclone lsf "${BACKUP_ROOT}config" 2>/dev/null) || rc=$?
-  ((rc == 0 || rc == 3)) || die "cannot list the backup bucket (rclone exit $rc); not touching it"
+  local root=${1:-$BACKUP_ROOT} crypt=${2:-backup-crypt} name=${3:-the backup bucket} theirs rc=0 listing
+  listing=$(rclone lsf "${root}config" 2>/dev/null) || rc=$?
+  ((rc == 0 || rc == 3)) || die "cannot list $name (rclone exit $rc); not touching it"
   [[ -n $listing ]] || return 0
   theirs=$(mktemp); chmod 600 "$theirs"
-  if ! rclone cat backup-crypt:museum.yaml >"$theirs" 2>/dev/null || [[ ! -s $theirs ]]; then
-    rm -f "$theirs"; die "the backup bucket already holds a backup that this passphrase cannot read; refusing to overwrite it"
+  if ! rclone cat "$crypt:museum.yaml" >"$theirs" 2>/dev/null || [[ ! -s $theirs ]]; then
+    rm -f "$theirs"; die "$name already holds a backup that this passphrase cannot read; refusing to overwrite it"
   fi
   if ! python3 - "$ENTE_DIR/museum.yaml" "$theirs" <<'PY'
 import sys, yaml
 a, b = (yaml.safe_load(open(f))["key"]["encryption"] for f in sys.argv[1:])
 sys.exit(a != b)
 PY
-  then rm -f "$theirs"; die "the backup bucket holds the backup of a DIFFERENT Ente instance; refusing to overwrite it (use 'restore' on a fresh server, or an empty bucket)"; fi
+  then rm -f "$theirs"; die "$name holds the backup of a DIFFERENT Ente instance; refusing to overwrite it (use 'restore' on a fresh server, or an empty bucket)"; fi
   rm -f "$theirs"
 }
 
+# Write the backup script (DB dump + config to backup-crypt, photo objects to the bucket, 60-day deleted retention)
+# and its systemd service + daily 03:00 timer.
 install_backup_units() {
   write_file /etc/ente-backup.env 600 <<EOF
 HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
 PHOTO_BUCKET="$S3_BUCKET"
+YANDEX_ROOT="$YANDEX_ROOT"
 EOF
   write_file /usr/local/bin/ente-backup.sh 755 <<'EOF'
 #!/usr/bin/env bash
@@ -570,20 +690,34 @@ docker compose exec -T postgres pg_restore -l < "$dump.tmp" > /dev/null || { ech
 mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
-rclone sync "$DUMPS" backup-crypt: --checkers 4 --max-delete 20
-rclone sync "ente-s3:$PHOTO_BUCKET" "${BACKUP_ROOT}objects" --size-only "${OPTS[@]}" \
-  --max-delete 500 --backup-dir "${BACKUP_ROOT}deleted/$(date +%F)"
-cutoff=$(date -d '60 days ago' +%F)
-for d in $(rclone lsf --dirs-only "${BACKUP_ROOT}deleted" 2>/dev/null || true); do
-  if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ && "${d%/}" < "$cutoff" ]]; then rclone purge "${BACKUP_ROOT}deleted/${d%/}"; fi
-done
+# target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects, 60-day deleted/ retention.
+# A failed target does not stop the next one; the run fails at the end. Success leaves a per-target stamp for `check`.
+target() {
+  local name=$1 crypt=$2 root=$3 cutoff d
+  echo "== $name"
+  rclone sync "$DUMPS" "$crypt:" --checkers 4 --max-delete 20 || return 1
+  rclone sync "ente-s3:$PHOTO_BUCKET" "${root}objects" --size-only "${OPTS[@]}" \
+    --max-delete 500 --backup-dir "${root}deleted/$(date +%F)" || return 1
+  cutoff=$(date -d '60 days ago' +%F)
+  for d in $(rclone lsf --dirs-only "${root}deleted" 2>/dev/null || true); do
+    if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ && "${d%/}" < "$cutoff" ]]; then rclone purge "${root}deleted/${d%/}" || return 1; fi
+  done
+  mkdir -p /var/lib/ente-backup; date -Is > "/var/lib/ente-backup/last-ok-$name"
+}
+rc=0
+target s3 backup-crypt "$BACKUP_ROOT" || { echo "ERROR: backup to the S3 bucket failed" >&2; rc=1; }
+if [[ -n "${YANDEX_ROOT:-}" ]]; then
+  target yandex yandex-crypt "$YANDEX_ROOT" || { echo "ERROR: backup to Yandex Disk failed" >&2; rc=1; }
+fi
+((rc == 0)) || exit 1
 if [[ -n "${HC_URL:-}" ]]; then curl -fsS -m 10 --retry 3 "$HC_URL" > /dev/null; fi
 EOF
-  write_file /etc/systemd/system/ente-backup.service <<'EOF'
+  write_file /etc/systemd/system/ente-backup.service <<EOF
 [Unit]
-Description=Ente backup (database dump + photo objects to the backup bucket)
+Description=Ente backup (database dump + photo objects to the backup bucket, and Yandex Disk if set)
 After=docker.service network-online.target
 Wants=network-online.target
+$ALERT_ONFAIL
 
 [Service]
 Type=oneshot
@@ -608,6 +742,108 @@ EOF
   systemctl enable --now ente-backup.timer >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------- telegram alerts
+# setup_alerts: with TG_CHAT_ID set, install /usr/local/bin/ente-alert (send a message), ente-alert@.service (sends the log of a
+# failed unit), and ente-check.timer (daily `check` at 09:00; a FAIL triggers an alert). Sets ALERT_ONFAIL for ente-backup.service.
+# The bot token lives only in /etc/ente-alert.env (600) and is passed to curl on stdin, never on a command line.
+# Without TG_CHAT_ID the alert units are removed.
+ALERT_ONFAIL=
+tg_api() { # tg_api METHOD [curl args...]: call the Bot API with TG_BOT_TOKEN
+  local m=$1; shift
+  curl -fsS -m 20 --retry 3 -o /dev/null -K - "$@" <<<"url = \"https://api.telegram.org/bot$TG_BOT_TOKEN/$m\""
+}
+setup_alerts() {
+  if [[ -z $TG_CHAT_ID ]]; then
+    ALERT_ONFAIL=
+    if [[ -e /etc/systemd/system/ente-check.timer ]]; then
+      systemctl disable --now ente-check.timer >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/ente-check.{timer,service} /etc/systemd/system/ente-alert@.service /etc/ente-alert.env
+      systemctl daemon-reload; log "telegram alerts removed (TG_CHAT_ID empty)"
+    fi
+    return 0
+  fi
+  if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
+  secret_var TG_BOT_TOKEN "Telegram bot token (from @BotFather)"
+  [[ $TG_BOT_TOKEN =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "TG_BOT_TOKEN does not look like a bot token (123456:ABC...)"
+  tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
+  write_file /etc/ente-alert.env 600 <<EOF
+TG_BOT_TOKEN='$TG_BOT_TOKEN'
+TG_CHAT_ID='$TG_CHAT_ID'
+EOF
+  write_file /usr/local/bin/ente-alert 755 <<'EOF'
+#!/usr/bin/env bash
+# Managed by ente-setup.sh. ente-alert TITLE < BODY: send TITLE and the end of BODY (Telegram allows 4096 chars) as one message.
+set -euo pipefail
+. /etc/ente-alert.env
+body=$(tail -c 3500 | iconv -c -f utf-8 -t utf-8 || true)
+text="$1"
+[[ -z $body ]] || text+=$'\n\n'"$body"
+curl -fsS -m 20 --retry 3 -o /dev/null -K - --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$text" \
+  <<<"url = \"https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage\""
+EOF
+  write_file /usr/local/bin/ente-alert-unit 755 <<'EOF'
+#!/usr/bin/env bash
+# Managed by ente-setup.sh. ente-alert-unit UNIT: send the output of UNIT's last run (FAIL lines for the check) to Telegram.
+set -euo pipefail
+u=$1 h=$(hostname)
+id=$(systemctl show -p InvocationID --value "$u" 2>/dev/null || true)
+if [[ -n $id ]]; then out=$(journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$id" || true)
+else out=$(journalctl -q -o cat --no-pager -u "$u" -n 40 || true); fi
+if [[ $u == ente-check.service ]]; then
+  title="⚠️ Ente check found problems on $h"
+  out=$(grep -E 'FAIL|ERROR' <<<"$out" || tail -n 30 <<<"$out")
+else
+  title="❌ $u failed on $h"
+  out=$(tail -n 30 <<<"$out")
+fi
+printf '%s\n' "$out" | /usr/local/bin/ente-alert "$title"
+EOF
+  write_file /etc/systemd/system/ente-alert@.service <<'EOF'
+[Unit]
+Description=Telegram alert for a failed %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ente-alert-unit %i
+EOF
+  write_file /etc/systemd/system/ente-check.service <<EOF
+[Unit]
+Description=Daily Ente health check (ente-setup.sh check), alerts on FAIL
+After=docker.service network-online.target
+Wants=network-online.target
+OnFailure=ente-alert@%n.service
+
+[Service]
+Type=oneshot
+ExecStart="$SCRIPT_DIR/ente-setup.sh" check
+EOF
+  write_file /etc/systemd/system/ente-check.timer <<'EOF'
+[Unit]
+Description=Daily Ente health check
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ente-check.timer >/dev/null 2>&1
+  ALERT_ONFAIL='OnFailure=ente-alert@%n.service'
+  log "telegram alerts on (failed backup, daily check at 09:00); test: $0 alert-test. The check runs $SCRIPT_DIR/ente-setup.sh: keep it there"
+}
+
+# alert-test: send a test message through the installed alert path.
+cmd_alert_test() {
+  load_env
+  [[ -n $TG_CHAT_ID && -x /usr/local/bin/ente-alert ]] || die "alerts not set up: set TG_CHAT_ID, then run backup-setup"
+  echo "Test from ente-setup on $(hostname) ($DOMAIN). Alerts arrive here when a backup or the daily check fails." |
+    /usr/local/bin/ente-alert "🔔 Ente alert test" || die "sending failed: wrong TG_CHAT_ID, or nobody pressed Start in the bot / the bot is not in the group"
+  log "test message sent"
+}
+
+# backup-setup: rclone remotes, refuse a foreign backup, install the timer and start a first backup.
 cmd_backup_setup() {
   load_env
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
@@ -615,17 +851,22 @@ cmd_backup_setup() {
   make_backup_remotes
   make_photo_remote
   check_backup_owner
+  if [[ -n $YANDEX_DIR ]]; then
+    make_yandex_remotes
+    check_backup_owner "$YANDEX_ROOT" yandex-crypt "Yandex Disk folder $YANDEX_DIR"
+  fi
+  setup_alerts
   install_backup_units
   systemctl start --no-block ente-backup.service
   log "backup configured; first run started: journalctl -fu ente-backup.service"
 }
 
 # ---------------------------------------------------------------- restore
-# Fresh server (after bootstrap), same DOMAIN: config + database come from the backup bucket,
-# photos stay in the photo bucket (copied back from the backup only if that bucket is empty).
+# Fresh server (after bootstrap), same DOMAIN: config + database come from the backup bucket (RESTORE_FROM=s3, default)
+# or Yandex Disk (RESTORE_FROM=yandex); photos stay in the photo bucket, objects missing there are copied back from the backup.
 cmd_restore() {
   load_env
-  local tmp dump t0=$SECONDS
+  local tmp dump t0=$SECONDS src_crypt=backup-crypt src_root
   if [[ -e $ENTE_DIR/.restore-incomplete ]]; then
     log "previous restore did not finish; cleaning up and starting over"
     dc down -v >/dev/null 2>&1 || true
@@ -636,11 +877,15 @@ cmd_restore() {
   install_docker; install_caddy; install_rclone
   rclone listremotes | grep -qx 'backup-crypt:' && rclone config delete backup-crypt
   make_backup_remotes once
+  make_yandex_remotes
+  src_root=$BACKUP_ROOT
+  if [[ $RESTORE_FROM == yandex ]]; then src_crypt=yandex-crypt; src_root=$YANDEX_ROOT; fi
+  log "restoring from $RESTORE_FROM ($src_root)"
   tmp=$(mktemp -d /root/ente-restore.XXXXXX)
   # shellcheck disable=SC2064 # expand now: $tmp is local to this function
   trap "rm -rf '$tmp'" EXIT
   log "fetching config backup"
-  rclone copy backup-crypt: "$tmp" --checkers 4
+  rclone copy "$src_crypt:" "$tmp" --checkers 4
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
   install -d -m 700 "$ENTE_DIR"; touch "$ENTE_DIR/.restore-incomplete"
@@ -655,7 +900,7 @@ cmd_restore() {
   dc exec -T postgres pg_restore -U pguser -d ente_db --clean --if-exists /tmp/restore.dump || die "pg_restore failed"
   dc exec -T postgres rm -f /tmp/restore.dump
   log "copying objects missing from the photo bucket back from the backup (never deletes; can take long on a new bucket)"
-  rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
+  rclone copy "${src_root}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
@@ -671,6 +916,7 @@ EOF
 }
 
 # ---------------------------------------------------------------- check
+# check: read-only health report (containers, ports, ssh/firewall/TLS, bucket + CORS, backup freshness, system); exit 1 on any FAIL.
 cmd_check() {
   load_env
   local s cid st pol p addrs ts res out
@@ -702,9 +948,15 @@ cmd_check() {
     if grep -qx "$s" <<<"$out"; then ok "sshd $s"; else bad "sshd expected: $s"; fi
   done
   if [[ -n $ADMIN_USER ]] && grep -qx "allowusers $ADMIN_USER" <<<"$out"; then ok "sshd allowusers $ADMIN_USER"; else bad "sshd allowusers not set"; fi
+  if [[ -n $(ss -Htln "sport = :$SSH_PORT") ]]; then ok "sshd listening on $SSH_PORT"; else bad "sshd not listening on $SSH_PORT"; fi
   if ufw status | grep -q '^Status: active'; then ok "ufw active"; else bad "ufw inactive"; fi
+  if ufw status | grep -Eq "^$SSH_PORT/tcp +ALLOW"; then ok "ufw allows $SSH_PORT/tcp"; else bad "ufw does not allow $SSH_PORT/tcp"; fi
   if systemctl is-active --quiet caddy; then ok "caddy active"; else bad "caddy not active"; fi
   if curl -fsS -m 10 "https://api.$DOMAIN/ping" >/dev/null 2>&1; then ok "https://api.$DOMAIN/ping"; else bad "https://api.$DOMAIN/ping"; fi
+  out=$(curl -sS -m 10 -o /dev/null -D - "https://web.$DOMAIN/" 2>&1 || true)
+  for s in strict-transport-security x-content-type-options x-frame-options; do
+    if grep -qi "^$s:" <<<"$out"; then ok "web.$DOMAIN sends $s"; else bad "web.$DOMAIN missing header $s (re-run install)"; fi
+  done
   echo "== photo bucket"
   if out=$(rclone lsf "ente-s3:$S3_BUCKET" --max-depth 1 2>&1 >/dev/null); then ok "bucket $S3_BUCKET reachable"; else bad "bucket $S3_BUCKET: $out"; fi
   out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT" \
@@ -715,11 +967,30 @@ cmd_check() {
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
   res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
   if [[ -z $ts ]]; then warn "backup has not run yet"
-  elif [[ $res != success ]]; then bad "last backup $ts: $res"
+  elif [[ $res != success ]]; then bad "last backup run $ts: $res (journalctl -u ente-backup.service)"
+    s=$(cat /var/lib/ente-backup/last-ok-s3 2>/dev/null || true)
+    if [[ -n $s ]] && (($(date +%s) - $(date -d "$s" +%s) <= 36 * 3600)); then ok "S3 part of the backup succeeded $s"; fi
   elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
   else ok "last backup finished $ts: $res"; fi
   if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
+  if [[ -n $TG_CHAT_ID ]]; then
+    if grep -qx 'OnFailure=ente-alert@%n.service' /etc/systemd/system/ente-backup.service 2>/dev/null &&
+      systemctl is-enabled --quiet ente-check.timer 2>/dev/null; then ok "telegram alerts on (backup failure, daily check)"
+    else bad "telegram alerts not installed (run backup-setup)"; fi
+  elif [[ -z $HC_URL ]]; then warn "no failure alerts (set TG_CHAT_ID or HC_URL)"; fi
+  if [[ -n $YANDEX_DIR ]]; then
+    echo "== yandex disk"
+    if out=$(rclone lsf "$YANDEX_ROOT" --max-depth 1 2>&1 >/dev/null); then ok "Yandex Disk folder $YANDEX_DIR reachable"; else bad "Yandex Disk: $out"; fi
+    ts=$(cat /var/lib/ente-backup/last-ok-yandex 2>/dev/null || true)
+    if [[ -z $ts ]]; then bad "no successful backup to Yandex Disk yet"
+    elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last good Yandex Disk backup is older than 36 h ($ts)"
+    else ok "last good Yandex Disk backup $ts"; fi
+    if out=$(rclone check "ente-s3:$S3_BUCKET" "${YANDEX_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: photo bucket is on Yandex Disk"
+    else bad "rclone check (Yandex) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
+    out=$(rclone about yandex: 2>/dev/null | tr -s ' ' | tr '\n' ' ' || true)
+    [[ -z $out ]] || warn "Yandex Disk quota: $out(the trash counts too; empty it now and then)"
+  fi
   echo "== system"
   df -h / | sed 's/^/        /'
   warn "check storage usage of both buckets in the providers' consoles"
@@ -732,6 +1003,272 @@ cmd_check() {
 }
 
 # ---------------------------------------------------------------- deploy / main
+# ---------------------------------------------------------------- vpn (AmneziaWG 3.1, independent of Ente)
+AWG_CONF=/etc/amnezia/amneziawg/awg0.conf
+AWG_NAT=/etc/amnezia/amneziawg/awg0-nat.nft
+AWG_CLIENT=/root/awg-client.conf
+AWG_SUBNET=10.89.37.0/24
+
+# Amnezia's Launchpad PPA (suite focal: the project's own instructions for Debian), signing key pinned by fingerprint,
+# then kernel headers, the DKMS module and the tools.
+awg_install() {
+  local fl pkgs
+  [[ $(dpkg --print-architecture) == amd64 ]] || die "the Amnezia packages are amd64 only"
+  if [[ $(uname -r) == *-cloud-amd64 ]]; then fl=cloud-amd64; else fl=amd64; fi
+  install -d -m 755 /etc/apt/keyrings
+  write_file /etc/apt/keyrings/amnezia.asc <<'EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: Hockeypuck 2.2
+Comment: Hostname: 
+
+xsFNBGV0UhsBEAC33rMndHSN/k+u7gcZbh9/FjgYfGltQAtVe2QDxzn7UV+k/ChX
+OrYRw6Izw/DrhaapkNCThK2jwJE64e0NjboLH7UrrmSJLXMfOlDFbyGJVRA+1sTB
+lo7kKHY0xiZ1CHDzjKNV3czbesu80A9nuTZYyWHEn9ax6wsqKG3N8SvzQkUrIOVD
+2wZjh0p273CCEGkBnax1ghAV3MF8OrsPU6FRJ+ZakzKbu54g68xoV+2813YECme0
+JKsWfUUe/1uEJOXCvuACURSxnYr0sihJd8QI/jHSGlfeq72e5MflFEOrnu5xaDSJ
+r2W5lvUetG7EGSxtNKd7Jm/KhUV04g7arA0qydRjRToW3QqyzG7VB2nXKz3AOBYN
+earWAuBcTkfPvRVchxbjiYonKZA5tIlVrpawMZsdxKvYwl6LVnpBcccFWPhpudfy
+4TpCqCxRoAanOCvSirI3/y7TcZMBw643SaxXi1ifGeg6eyMzrLtP3CeonKBHGzrt
+1eeKGtEw/PFN4RmwpBePxi+uj0CoTD6zjCQa3c8EeB4Qz7tt6PnpibxdtZE8sBdd
+51wSA/fPGi2tFph8IVAsws7oxcQxZYl8CyncKDLcoR4dxVHYdFEDDf1GjRjoQ3Ai
+nD7fxD5qYzExe50DBVpuUbWcAiGICNxfvzQtUSRRtMoSHDcvzsy03KC6VwARAQAB
+zR5MYXVuY2hwYWQgUFBBIGZvciBJdXJpaSBFZ29yb3bCwY4EEwEKADgWIQR1yd1y
+x5mHDjEFQuJBZvLCVykIKAUCZXRSGwIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIX
+gAAKCRBBZvLCVykIKBu5D/9akmHCHlUqm2RTTBeTMbLNGc0l6YugpPaCM6vz0O9k
+BFP5PfRaNSRzyF7wHFHNY3JUHcor28my1fD8AE4+C3PwXz8tVYLh57UUsp4wjqHY
++MTl/1ngDViPGD3PRjB8ZlO+19yerfplZv1Jaw7FZZv2BZOAXb+ddqUG4EmlzOnC
+EhcSDdFrzEBB3RGthjIb3QkKWKGbELDiMfogmsO9BE139Raiw23blagDrbnWsG4j
+ReZeu3atjG6AW8eL7m+i7bKKshD2CYVMznI5cYGLMKo9w7sb33uylPj1Vx9O7joP
+2GFf2rTpCY8wgzk7i1RqsipJ80u1/DY91Xdizv3f2BBe6UY7qHKoK00O11J0y8yU
+is2Asycy33Wy51pf6rCFUBLQu+c1fEypHF6jqANmQwaH7pPBliy4gGWvrVggzV4m
+xv7SnRiMi4PFyVwjKWm8dmuMxi/B9s++VG/ed+5aYgJYL58MohG3MUI/L58eitSC
+DDcQ1iAnBmawnGMKPqzMgRFB3OU3wDwfh7LNVvQqWpQ4q7pr4Cq1CvZvGoggXWDo
+1/vylPsRmiiuNetfsoVYmrkgtj1om07m5Xp1v4SyXJH11c3dc/xfMmn/4RlMWIpq
+86IsOjpr3avsw3FVUNCgD5Wf5+rHG+7gNmM6Cm/F8MDfAnnRmsw4h6hgvcJNQT5D
+ig==
+=OY2W
+-----END PGP PUBLIC KEY BLOCK-----
+EOF
+  [[ $(gpg --show-keys --with-colons /etc/apt/keyrings/amnezia.asc 2>/dev/null | awk -F: '/^fpr/ {print $10; exit}') == 75C9DD72C799870E310542E24166F2C257290828 ]] ||
+    die "Amnezia signing key fingerprint mismatch"
+  write_file /etc/apt/sources.list.d/amnezia.sources <<'EOF'
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
+Suites: focal
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/amnezia.asc
+EOF
+  apt_get update
+  apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 || die "no headers for the running kernel $(uname -r); reboot into the newest kernel first"
+  pkgs="linux-headers-$(uname -r) linux-headers-$fl dkms amneziawg amneziawg-tools nftables"
+  # shellcheck disable=SC2086
+  ! apt_get -s install --no-install-recommends $pkgs | grep -q '^Remv' || die "installing AmneziaWG would remove packages; refusing"
+  # shellcheck disable=SC2086
+  apt_install $pkgs
+}
+
+# awg_genconf IP: keys, random obfuscation parameters (tried on a throwaway interface first), the server config and ONE
+# shared client config. Prints no secret.
+awg_genconf() {
+  python3 - "$1" "$AWG_PORT" "$AWG_CONF" "$AWG_CLIENT" "$AWG_NAT" <<'PY'
+import os, random, subprocess, sys, tempfile
+
+R = random.SystemRandom()
+SERVER_IP, PORT, CONF, CLIENT, NAT = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+SERVER_ADDR, PEER_ADDR, MTU = "10.89.37.1/24", "10.89.37.2/32", 1280
+
+
+def run(*a, inp=None):
+    return subprocess.run(a, input=inp, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def pick_params():
+    jc = R.randint(4, 8)
+    jmin = R.randint(64, 128)
+    jmax = R.randint(jmin + 200, 900)
+    while True:  # message sizes: init 148+S1, response 92+S2, cookie 64+S3 must all differ; S1 + 56 != S2
+        s1, s2, s3, s4 = R.randint(16, 150), R.randint(16, 150), R.randint(12, 60), R.randint(12, 32)
+        if s1 + 56 != s2 and len({148 + s1, 92 + s2, 64 + s3}) == 3:
+            break
+    while True:  # four disjoint ranges above WireGuard's own type values 1-4
+        v = sorted(R.sample(range(5, 2**32 - 1), 8))
+        rs = [(v[0], v[1]), (v[2], v[3]), (v[4], v[5]), (v[6], v[7])]
+        if all(b - a >= 2**16 for a, b in rs):
+            break
+    R.shuffle(rs)
+    p = [("Jc", jc), ("Jmin", jmin), ("Jmax", jmax), ("S1", s1), ("S2", s2), ("S3", s3), ("S4", s4)]
+    p += [(f"H{i + 1}", f"{a}-{b}") for i, (a, b) in enumerate(rs)]
+    # no RandomTrailers: it loses 22-48 % of the packets; HeaderProtectionKey alone is clean
+    p += [("HeaderProtectionKey", run("awg", "genpsk"))]
+    return p
+
+
+def gate(params):
+    """Apply the parameters to a throwaway interface and read them back. Returns (ok, message without values)."""
+    name = "awgtst0"
+    text = "[Interface]\nPrivateKey = %s\n%s\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.255.255.2/32\n" % (
+        run("awg", "genkey"), "\n".join(f"{k} = {v}" for k, v in params),
+        run("awg", "pubkey", inp=run("awg", "genkey")), run("awg", "genpsk"))
+    with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+        f.write(text)
+    run("ip", "link", "add", "dev", name, "type", "amneziawg")
+    try:
+        r = subprocess.run(["awg", "setconf", name, f.name], capture_output=True, text=True)
+        if r.returncode:
+            return False, "awg setconf rejected the parameters: " + (r.stderr.strip().splitlines() or ["?"])[0][:80]
+        have = {l.split("=")[0].strip().lower() for l in run("awg", "showconf", name).splitlines() if "=" in l}
+        missing = [k for k, _ in params if k.lower() not in have]
+        return (False, "read back without: " + ", ".join(missing)) if missing else (True, "parameters accepted")
+    finally:
+        subprocess.run(["ip", "link", "del", "dev", name], capture_output=True)
+        os.unlink(f.name)
+
+
+for attempt in range(1, 6):
+    params = pick_params()
+    ok, msg = gate(params)
+    print(f"gate attempt {attempt}: {msg}")
+    if ok:
+        break
+else:
+    sys.exit("no parameter set was accepted; nothing written")
+
+if any(l.split()[3].rsplit(":", 1)[1] == str(PORT) for l in run("ss", "-ulnH").splitlines()):
+    sys.exit(f"something already listens on UDP/{PORT}; nothing written")
+skey, ckey = run("awg", "genkey"), run("awg", "genkey")
+spub, cpub, psk = run("awg", "pubkey", inp=skey), run("awg", "pubkey", inp=ckey), run("awg", "genpsk")
+obf = "\n".join(f"{k} = {v}" for k, v in params)
+
+server = f"""[Interface]
+Address = {SERVER_ADDR}
+ListenPort = {PORT}
+PrivateKey = {skey}
+MTU = {MTU}
+PostUp = nft -f {NAT}
+PostDown = nft delete table ip awg_nat
+{obf}
+
+[Peer]
+PublicKey = {cpub}
+PresharedKey = {psk}
+AllowedIPs = {PEER_ADDR}
+"""
+client = f"""[Interface]
+PrivateKey = {ckey}
+Address = {PEER_ADDR}
+DNS = 1.1.1.1, 9.9.9.9
+MTU = {MTU}
+{obf}
+
+[Peer]
+PublicKey = {spub}
+PresharedKey = {psk}
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = {SERVER_IP}:{PORT}
+PersistentKeepalive = 25
+"""
+for path, text in ((CONF, server), (CLIENT, client)):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+subprocess.run(["awg-quick", "strip", CONF], capture_output=True, check=True)  # the server file parses
+PY
+}
+
+# awg_selftest IP: a temporary second peer in a network namespace on this server connects through the live tunnel and checks
+# the handshake, DNS, the exit address, that IPv6 stays in, and a 20 MB download. Exercises forwarding, NAT and the ufw route
+# rule, not the real network path to your device. Everything temporary is removed afterwards.
+awg_selftest() {
+  local ip=$1 ns=awgtest tmp ckey pub hs out
+  ip netns del $ns 2>/dev/null || true; ip link del awgv0 2>/dev/null || true # leftovers of an interrupted run
+  tmp=$(mktemp -d)
+  ckey=$(awg genkey); pub=$(awg pubkey <<<"$ckey"); awg genpsk >"$tmp/psk"
+  # shellcheck disable=SC2064
+  trap "awg set awg0 peer '$pub' remove 2>/dev/null; ip netns del $ns 2>/dev/null; ip link del awgv0 2>/dev/null; rm -rf '$tmp' /etc/netns/$ns" EXIT
+  awg set awg0 peer "$pub" preshared-key "$tmp/psk" allowed-ips 10.89.37.9/32
+  {
+    echo "[Interface]"; echo "PrivateKey = $ckey"
+    grep -E '^(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey) *=' "$AWG_CONF"
+    echo; echo "[Peer]"; echo "PublicKey = $(awg show awg0 public-key)"; echo "PresharedKey = $(cat "$tmp/psk")"
+    echo "AllowedIPs = 0.0.0.0/0, ::/0"; echo "Endpoint = $ip:$AWG_PORT"; echo "PersistentKeepalive = 5"
+  } >"$tmp/client.conf"
+  install -d "/etc/netns/$ns"; echo 'nameserver 1.1.1.1' >"/etc/netns/$ns/resolv.conf" # ip netns exec mounts it
+  ip netns add $ns
+  ip link add awgv0 type veth peer name awgv1; ip link set awgv1 netns $ns
+  ip addr add 10.99.0.1/24 dev awgv0; ip link set awgv0 up
+  ip -n $ns addr add 10.99.0.2/24 dev awgv1; ip -n $ns link set awgv1 up; ip -n $ns link set lo up
+  ip -n $ns route add "$ip/32" via 10.99.0.1
+  ip -n $ns link add awgc type amneziawg
+  ip netns exec $ns awg setconf awgc "$tmp/client.conf"
+  ip -n $ns addr add 10.89.37.9/32 dev awgc; ip -n $ns link set awgc mtu 1280 up
+  ip -n $ns route add default dev awgc
+  ip -n $ns -6 addr add fd00:89:37::9/128 dev awgc; ip -n $ns -6 route add default dev awgc
+
+  echo "== vpn self-test"
+  out=$(ip netns exec $ns curl -sS -m 12 https://one.one.one.one/cdn-cgi/trace 2>&1 | grep -E '^(ip|loc)=' | tr '\n' ' ' || true)
+  hs=$(awg show awg0 latest-handshakes | awk -v k="$pub" '$1 == k {print $2}')
+  if [[ ${hs:-0} -gt 0 ]]; then ok "handshake"; else bad "no handshake"; fi
+  if [[ $out == *"ip=$ip "* ]]; then ok "DNS and exit address $ip through the tunnel ($out)"; else bad "unexpected exit: ${out:-no answer}"; fi
+  if ip netns exec $ns curl -6 -sS -m 6 -o /dev/null "https://[2606:4700:4700::1111]/" 2>/dev/null; then bad "IPv6 left the tunnel"; else ok "IPv6 does not get out"; fi
+  out=$(ip netns exec $ns curl -sS -m 25 -o /dev/null -w '%{size_download} %{speed_download}' "https://speed.cloudflare.com/__down?bytes=20000000" 2>/dev/null || true)
+  if [[ ${out%% *} == 20000000 ]]; then ok "20 MB download through the tunnel ($(awk -v s="${out##* }" 'BEGIN {printf "%.1f", s / 1e6}') MB/s)"; else bad "20 MB download did not complete"; fi
+  awg set awg0 peer "$pub" remove; ip netns del $ns; ip link del awgv0 2>/dev/null || true; rm -rf "$tmp" "/etc/netns/$ns"
+  trap - EXIT
+  ((FAILS == 0)) || die "vpn self-test: $FAILS check(s) failed"
+}
+
+# vpn: AmneziaWG on UDP AWG_PORT with one shared client (one device at a time). Re-runnable; keeps the keys, follows a changed AWG_PORT.
+cmd_vpn() {
+  load_env vpn; need AWG_PORT
+  [[ $AWG_PORT =~ ^[1-9][0-9]{3,4}$ ]] && ((AWG_PORT >= 1024 && AWG_PORT <= 65535)) || die "AWG_PORT must be a UDP port 1024-65535"
+  ufw status | grep -q '^Status: active' || die "ufw is not active; run bootstrap first"
+  local ip wan old
+  ip=$(host_ip)
+  wan=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+  [[ -n $ip && -n $wan ]] || die "no default IPv4 route"
+  dpkg -s amneziawg-tools >/dev/null 2>&1 || awg_install
+  modprobe amneziawg || die "the amneziawg kernel module does not load (see: dkms status)"
+  install -d -m 700 /etc/amnezia/amneziawg
+  write_file "$AWG_NAT" 600 <<EOF
+table ip awg_nat
+delete table ip awg_nat
+table ip awg_nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr $AWG_SUBNET oifname "$wan" masquerade
+	}
+}
+EOF
+  if [[ ! -f $AWG_CONF ]]; then
+    log "generating keys and the server and client configs"
+    awg_genconf "$ip"
+  fi
+  old=$(awk -F' *= *' '$1 == "ListenPort" {print $2}' "$AWG_CONF")
+  if [[ $old != "$AWG_PORT" ]]; then
+    sed -i "s/^ListenPort = .*/ListenPort = $AWG_PORT/" "$AWG_CONF"
+    [[ ! -f $AWG_CLIENT ]] || sed -i "s/^Endpoint = .*/Endpoint = $ip:$AWG_PORT/" "$AWG_CLIENT"
+    ufw delete allow "$old/udp" >/dev/null || true
+    log "port changed from $old to $AWG_PORT: set Endpoint = $ip:$AWG_PORT in the client"
+  fi
+  write_file /etc/sysctl.d/92-awg.conf <<'EOF'
+net.ipv4.ip_forward = 1
+EOF
+  sysctl -q -p /etc/sysctl.d/92-awg.conf
+  ufw allow "$AWG_PORT/udp" comment amneziawg >/dev/null
+  # limited to the tunnel's IPv4 subnet: without `from`, ufw also adds an IPv6 forward rule
+  ufw route allow in on awg0 out on "$wan" from "$AWG_SUBNET" comment amneziawg >/dev/null
+  systemctl enable awg-quick@awg0 >/dev/null 2>&1
+  systemctl restart awg-quick@awg0 || die "awg-quick@awg0 did not start (journalctl -u awg-quick@awg0)"
+  [[ $(awg show awg0 listen-port) == "$AWG_PORT" ]] || die "awg0 does not listen on UDP $AWG_PORT"
+  awg_selftest "$ip"
+  if [[ -f $AWG_CLIENT ]]; then
+    log "client config: $AWG_CLIENT (holds the client's private key). Import it in the AmneziaVPN app, e.g. fetch it with"
+    log "  ssh -p <ssh port> <admin>@$ip sudo cat $AWG_CLIENT > awg.conf   then on the server: sudo shred -u $AWG_CLIENT"
+  fi
+  log "vpn ready on UDP $AWG_PORT. Allow it in your provider's firewall too, if it has one."
+}
+
 # bootstrap + (install | restore) + backup-setup in one go, from the config and secrets given.
 cmd_deploy() {
   need ADMIN_USER ADMIN_SSH_PUBKEY
@@ -740,13 +1277,18 @@ cmd_deploy() {
   secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
   secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
   secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "$([[ $RESTORE == yes ]] && echo once || echo confirm)"
+  if [[ -n $YANDEX_DIR ]] && ! { command -v rclone >/dev/null && rclone listremotes | grep -qx 'yandex:'; }; then
+    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\")"
+  fi
+  if [[ -n $TG_CHAT_ID && ! -f /etc/ente-alert.env ]]; then secret_var TG_BOT_TOKEN "Telegram bot token (from @BotFather)"; fi
   cmd_bootstrap
   if [[ $RESTORE == yes ]]; then cmd_restore; else cmd_install; fi
   cmd_backup_setup
   log "deploy finished. Next: sign up the owner, then '$0 lockdown'."
 }
 
-usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update}" >&2; exit 2; }
+# usage: print the command list and exit 2. main CMD: dispatch to the cmd_* function.
+usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update|alert-test|vpn}" >&2; exit 2; }
 
 main() {
   CMD=$1
@@ -760,6 +1302,8 @@ main() {
     restore) cmd_restore ;;
     check) cmd_check ;;
     update) cmd_update ;;
+    alert-test) cmd_alert_test ;;
+    vpn) cmd_vpn ;;
     *) usage ;;
   esac
 }
