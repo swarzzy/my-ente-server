@@ -19,7 +19,7 @@ export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 FAILS=0
 MUSEUM_CFG_CHANGED=0
 CMD=
-SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE YANDEX_TOKEN TG_BOT_TOKEN'
+SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE YANDEX_TOKEN YANDEX_CLIENT_SECRET TG_BOT_TOKEN'
 
 # ---------------------------------------------------------------- helpers
 # log MSG / die MSG: timestamped line tagged with the command; die prints to stderr and exits 1.
@@ -37,6 +37,8 @@ dc() { (cd "$ENTE_DIR" && docker compose "$@"); }
 apt_get() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -q "$@"; }
 # apt_install PKG...: install packages without recommends.
 apt_install() { apt_get install -y --no-install-recommends "$@"; }
+# Never `cmd | grep -q` under pipefail: grep exits at the first match, cmd may die of SIGPIPE and the test fails
+# at random (seen with rclone listremotes). Use `grep ... >/dev/null`, which reads all input.
 # ensure_line FILE LINE: append LINE to FILE unless already present verbatim.
 ensure_line() { grep -qxF -- "$2" "$1" 2>/dev/null || echo "$2" >>"$1"; }
 # version_ge VERSION MIN: true if VERSION (optional leading v) >= MIN.
@@ -98,11 +100,11 @@ load_env() {
   S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-https://web.$DOMAIN,https://albums.$DOMAIN}
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
-  AWG_PORT=${AWG_PORT:-}; YANDEX_DIR=${YANDEX_DIR:-}; RESTORE_FROM=${RESTORE_FROM:-s3}; TG_CHAT_ID=${TG_CHAT_ID:-}
+  AWG_PORT=${AWG_PORT:-}; YANDEX_DIR=${YANDEX_DIR:-}; YANDEX_CLIENT_ID=${YANDEX_CLIENT_ID:-}; RESTORE_FROM=${RESTORE_FROM:-s3}; TG_CHAT_ID=${TG_CHAT_ID:-}
   [[ ${1:-} != vpn ]] || return 0 # the VPN needs none of the Ente settings
   S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
-  YANDEX_TOKEN=${YANDEX_TOKEN:-}; TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
+  YANDEX_TOKEN=${YANDEX_TOKEN:-}; YANDEX_CLIENT_SECRET=${YANDEX_CLIENT_SECRET:-}; TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
   need DOMAIN S3_ENDPOINT S3_REGION S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET
   [[ $DOMAIN =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z0-9-]+$ && $DOMAIN != *example.com ]] || die "DOMAIN missing, invalid or a placeholder"
   [[ $SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((SSH_PORT <= 65535)) && [[ ! $SSH_PORT =~ ^(80|443|3200|3201|5432)$ ]] ||
@@ -174,6 +176,8 @@ cmd_bootstrap() {
   local kf; kf=$(mktemp); printf '%s\n' "$ADMIN_SSH_PUBKEY" >"$kf"
   ssh-keygen -l -f "$kf" >/dev/null 2>&1 || { rm -f "$kf"; die "ADMIN_SSH_PUBKEY is not a valid public key (placeholder or truncated?); refusing, it would lock you out"; }
   rm -f "$kf"
+  # some images leave the hostname unresolvable: sudo then warns on every call and some tools wait for DNS
+  getent hosts "$(hostname)" >/dev/null || { echo "127.0.1.1 $(hostname)" >>/etc/hosts; log "added $(hostname) to /etc/hosts"; }
   log "updating packages"
   apt_get update
   apt_get -y -o Dpkg::Options::=--force-confold upgrade
@@ -193,7 +197,7 @@ EOF
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "02:00";
 EOF
-  if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
+  if ! swapon --show=NAME --noheadings | grep -x /swapfile >/dev/null; then
     if [[ ! -f /swapfile ]]; then fallocate -l 2G /swapfile; chmod 600 /swapfile; mkswap /swapfile >/dev/null; fi
     swapon /swapfile
   fi
@@ -522,7 +526,8 @@ cmd_lockdown() {
   local rows first id a
   if [[ -n $(internal_admin) ]] && internal_locked; then log "already locked down (admin $(internal_admin))"; return 0; fi
   wait_healthy museum 60
-  rows=$(dc exec -T postgres psql -U pguser -d ente_db -At -F '|' -c "SELECT user_id, to_timestamp(creation_time/1000000) FROM users ORDER BY creation_time;" </dev/null)
+  # deleted accounts keep their row with the email wiped: skip them
+  rows=$(dc exec -T postgres psql -U pguser -d ente_db -At -F '|' -c "SELECT user_id, to_timestamp(creation_time/1000000) FROM users WHERE encrypted_email IS NOT NULL ORDER BY creation_time;" </dev/null)
   [[ -n $rows ]] || die "no users yet; sign up the owner first"
   echo "Users (oldest first):"; echo "user_id|created"; echo "$rows"
   first=${rows%%$'\n'*}; id=${first%%|*}
@@ -573,7 +578,7 @@ with open(conf, "w") as f: cp.write(f)
 # confirm = ask the passphrase twice, once = once (restore). Existing remotes keep their keys and passphrase.
 make_backup_remotes() {
   local obs
-  if ! rclone listremotes | grep -qx 'backup:'; then
+  if ! rclone listremotes | grep -x 'backup:' >/dev/null; then
     secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
     secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
     rclone_set backup <<EOF
@@ -588,7 +593,7 @@ endpoint=$BACKUP_S3_ENDPOINT
 region=$BACKUP_S3_REGION
 no_check_bucket=true
 EOF
-  if rclone listremotes | grep -qx 'backup-crypt:'; then
+  if rclone listremotes | grep -x 'backup-crypt:' >/dev/null; then
     rclone_set backup-crypt <<<"remote=${BACKUP_ROOT}config"
     log "backup-crypt remote exists, keeping passphrase"; return 0
   fi
@@ -622,17 +627,35 @@ EOF
 # Deletes go to the Yandex trash (rclone default, no hard_delete): some protection if the token is abused; it uses quota.
 make_yandex_remotes() {
   [[ -n $YANDEX_DIR ]] || return 0
-  if ! rclone listremotes | grep -qx 'yandex:'; then
-    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\")"
-    [[ $YANDEX_TOKEN == *access_token* ]] || die "YANDEX_TOKEN does not look like the JSON from rclone authorize \"yandex\""
+  if ! rclone listremotes | grep -x 'yandex:' >/dev/null; then
+    [[ -z $YANDEX_CLIENT_ID ]] || secret_var YANDEX_CLIENT_SECRET "Yandex OAuth app client secret"
+    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\" CLIENT_ID CLIENT_SECRET)"
+    if [[ $YANDEX_TOKEN =~ ^y[0-9]_[A-Za-z0-9_-]+$ ]]; then
+      # a bare OAuth token (no refresh token): rclone needs the JSON form and a refresh_token field, which it never uses
+      # before the expiry. Yandex tokens last a year: renew it before then (a failed backup alerts you).
+      YANDEX_TOKEN="{\"access_token\":\"$YANDEX_TOKEN\",\"token_type\":\"OAuth\",\"refresh_token\":\"none\",\"expiry\":\"$(date -u -d '+360 days' +%FT%TZ)\"}"
+      warn "bare Yandex token: valid about a year, not renewed automatically (expires around $(date -d '+360 days' +%F))"
+    fi
+    [[ $YANDEX_TOKEN == *access_token* ]] || die "YANDEX_TOKEN does not look like the JSON from rclone authorize \"yandex\" (or a bare y0_... token)"
     rclone_set yandex <<EOF
 type=yandex
 token=$YANDEX_TOKEN
 EOF
-    if ! rclone mkdir "yandex:$YANDEX_DIR" 2>/dev/null; then
-      rclone config delete yandex; die "Yandex Disk login failed (token expired or wrong?); remote removed, re-run with a fresh token"
+    # the token only refreshes through the app that issued it
+    [[ -z $YANDEX_CLIENT_ID ]] || rclone_set yandex <<EOF
+client_id=$YANDEX_CLIENT_ID
+client_secret=$YANDEX_CLIENT_SECRET
+EOF
+    # mkdir and quota work even where file access is refused (rclone's built-in app gets 410 Gone since October 2026):
+    # prove listing and upload. The probe goes to the Yandex trash.
+    local err
+    if ! err=$(rclone mkdir "yandex:$YANDEX_DIR" 2>&1 && rclone lsf "yandex:$YANDEX_DIR" 2>&1 >/dev/null &&
+      echo probe | rclone rcat "yandex:$YANDEX_DIR/.ente-setup-probe" 2>&1 && rclone deletefile "yandex:$YANDEX_DIR/.ente-setup-probe" 2>&1); then
+      rclone config delete yandex
+      [[ $err != *410* ]] || err="410 Gone: Yandex refuses file access to this OAuth app; create your own app (README) and set YANDEX_CLIENT_ID"
+      die "Yandex Disk test failed: $(tail -1 <<<"$err" | cut -c1-200); remote removed, re-run with a working token"
     fi
-    log "yandex remote created"
+    log "yandex remote created (list and upload work)"
   fi
   local pw
   pw=$(python3 -c '
@@ -815,7 +838,7 @@ OnFailure=ente-alert@%n.service
 
 [Service]
 Type=oneshot
-ExecStart="$SCRIPT_DIR/ente-setup.sh" check
+ExecStart=/bin/bash "$SCRIPT_DIR/ente-setup.sh" check
 EOF
   write_file /etc/systemd/system/ente-check.timer <<'EOF'
 [Unit]
@@ -875,7 +898,7 @@ cmd_restore() {
   [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR already exists; restore is for a fresh server"
   apt_get update; apt_install curl ca-certificates python3-yaml gnupg
   install_docker; install_caddy; install_rclone
-  rclone listremotes | grep -qx 'backup-crypt:' && rclone config delete backup-crypt
+  rclone listremotes | grep -x 'backup-crypt:' >/dev/null && rclone config delete backup-crypt
   make_backup_remotes once
   make_yandex_remotes
   src_root=$BACKUP_ROOT
@@ -949,8 +972,8 @@ cmd_check() {
   done
   if [[ -n $ADMIN_USER ]] && grep -qx "allowusers $ADMIN_USER" <<<"$out"; then ok "sshd allowusers $ADMIN_USER"; else bad "sshd allowusers not set"; fi
   if [[ -n $(ss -Htln "sport = :$SSH_PORT") ]]; then ok "sshd listening on $SSH_PORT"; else bad "sshd not listening on $SSH_PORT"; fi
-  if ufw status | grep -q '^Status: active'; then ok "ufw active"; else bad "ufw inactive"; fi
-  if ufw status | grep -Eq "^$SSH_PORT/tcp +ALLOW"; then ok "ufw allows $SSH_PORT/tcp"; else bad "ufw does not allow $SSH_PORT/tcp"; fi
+  if ufw status | grep '^Status: active' >/dev/null; then ok "ufw active"; else bad "ufw inactive"; fi
+  if ufw status | grep -E "^$SSH_PORT/tcp +ALLOW" >/dev/null; then ok "ufw allows $SSH_PORT/tcp"; else bad "ufw does not allow $SSH_PORT/tcp"; fi
   if systemctl is-active --quiet caddy; then ok "caddy active"; else bad "caddy not active"; fi
   if curl -fsS -m 10 "https://api.$DOMAIN/ping" >/dev/null 2>&1; then ok "https://api.$DOMAIN/ping"; else bad "https://api.$DOMAIN/ping"; fi
   out=$(curl -sS -m 10 -o /dev/null -D - "https://web.$DOMAIN/" 2>&1 || true)
@@ -966,7 +989,11 @@ cmd_check() {
   if systemctl is-enabled --quiet ente-backup.timer 2>/dev/null; then ok "timer enabled, next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value)"; else bad "ente-backup.timer not enabled"; fi
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
   res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
-  if [[ -z $ts ]]; then warn "backup has not run yet"
+  if [[ -z $ts ]]; then # systemd forgets the result at a reboot: fall back to the stamp the last good run left
+    s=$(cat /var/lib/ente-backup/last-ok-s3 2>/dev/null || true)
+    if [[ -z $s ]]; then warn "backup has not run yet"
+    elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "last good backup is older than 36 h ($s)"
+    else ok "last good backup $s (no run since boot)"; fi
   elif [[ $res != success ]]; then bad "last backup run $ts: $res (journalctl -u ente-backup.service)"
     s=$(cat /var/lib/ente-backup/last-ok-s3 2>/dev/null || true)
     if [[ -n $s ]] && (($(date +%s) - $(date -d "$s" +%s) <= 36 * 3600)); then ok "S3 part of the backup succeeded $s"; fi
@@ -1063,7 +1090,7 @@ EOF
   apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 || die "no headers for the running kernel $(uname -r); reboot into the newest kernel first"
   pkgs="linux-headers-$(uname -r) linux-headers-$fl dkms amneziawg amneziawg-tools nftables"
   # shellcheck disable=SC2086
-  ! apt_get -s install --no-install-recommends $pkgs | grep -q '^Remv' || die "installing AmneziaWG would remove packages; refusing"
+  ! apt_get -s install --no-install-recommends $pkgs | grep '^Remv' >/dev/null || die "installing AmneziaWG would remove packages; refusing"
   # shellcheck disable=SC2086
   apt_install $pkgs
 }
@@ -1183,7 +1210,7 @@ awg_selftest() {
   local ip=$1 ns=awgtest tmp ckey pub hs out
   ip netns del $ns 2>/dev/null || true; ip link del awgv0 2>/dev/null || true # leftovers of an interrupted run
   tmp=$(mktemp -d)
-  ckey=$(awg genkey); pub=$(awg pubkey <<<"$ckey"); awg genpsk >"$tmp/psk"
+  ckey=$(awg genkey); pub=$(awg pubkey <<<"$ckey"); (umask 077; awg genpsk >"$tmp/psk")
   # shellcheck disable=SC2064
   trap "awg set awg0 peer '$pub' remove 2>/dev/null; ip netns del $ns 2>/dev/null; ip link del awgv0 2>/dev/null; rm -rf '$tmp' /etc/netns/$ns" EXIT
   awg set awg0 peer "$pub" preshared-key "$tmp/psk" allowed-ips 10.89.37.9/32
@@ -1192,7 +1219,7 @@ awg_selftest() {
     grep -E '^(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey) *=' "$AWG_CONF"
     echo; echo "[Peer]"; echo "PublicKey = $(awg show awg0 public-key)"; echo "PresharedKey = $(cat "$tmp/psk")"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"; echo "Endpoint = $ip:$AWG_PORT"; echo "PersistentKeepalive = 5"
-  } >"$tmp/client.conf"
+  } >"$tmp/client.conf"; chmod 600 "$tmp/client.conf"
   install -d "/etc/netns/$ns"; echo 'nameserver 1.1.1.1' >"/etc/netns/$ns/resolv.conf" # ip netns exec mounts it
   ip netns add $ns
   ip link add awgv0 type veth peer name awgv1; ip link set awgv1 netns $ns
@@ -1222,7 +1249,7 @@ awg_selftest() {
 cmd_vpn() {
   load_env vpn; need AWG_PORT
   [[ $AWG_PORT =~ ^[1-9][0-9]{3,4}$ ]] && ((AWG_PORT >= 1024 && AWG_PORT <= 65535)) || die "AWG_PORT must be a UDP port 1024-65535"
-  ufw status | grep -q '^Status: active' || die "ufw is not active; run bootstrap first"
+  ufw status | grep '^Status: active' >/dev/null || die "ufw is not active; run bootstrap first"
   local ip wan old
   ip=$(host_ip)
   wan=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
@@ -1277,8 +1304,9 @@ cmd_deploy() {
   secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
   secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
   secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "$([[ $RESTORE == yes ]] && echo once || echo confirm)"
-  if [[ -n $YANDEX_DIR ]] && ! { command -v rclone >/dev/null && rclone listremotes | grep -qx 'yandex:'; }; then
-    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\")"
+  if [[ -n $YANDEX_DIR ]] && ! { command -v rclone >/dev/null && rclone listremotes | grep -x 'yandex:' >/dev/null; }; then
+    [[ -z $YANDEX_CLIENT_ID ]] || secret_var YANDEX_CLIENT_SECRET "Yandex OAuth app client secret"
+    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\" CLIENT_ID CLIENT_SECRET)"
   fi
   if [[ -n $TG_CHAT_ID && ! -f /etc/ente-alert.env ]]; then secret_var TG_BOT_TOKEN "Telegram bot token (from @BotFather)"; fi
   cmd_bootstrap

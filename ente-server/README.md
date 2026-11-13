@@ -74,10 +74,15 @@ with the same `BACKUP_PASSPHRASE`, `objects/`, `deleted/`) to Yandex Disk throug
 is throttled). The S3 backup always runs first; if Yandex fails the S3 backup is still done, the run fails and `HC_URL` is not pinged.
 
 1. Use a separate Yandex account for this: the token can access the whole Disk.
-2. On a PC with a browser: `rclone authorize "yandex"`, log in, copy the JSON it prints into `ente-setup.secrets` as
+2. Since October 2026 Yandex answers `410 Gone` to file requests made through rclone's built-in OAuth app (quota still works), so
+   register your own: log in to that account, open <https://oauth.yandex.ru/client/new>, platform "Web services", redirect URI
+   `http://127.0.0.1:53682/`, and under Yandex.Disk REST API allow reading all of Disk, writing anywhere on Disk and Disk info.
+   Put its ID in `ente-setup.env` as `YANDEX_CLIENT_ID` and its secret in `ente-setup.secrets` as `YANDEX_CLIENT_SECRET`.
+3. On a PC with a browser: `rclone authorize "yandex" CLIENT_ID CLIENT_SECRET`, log in, copy the JSON it prints into `ente-setup.secrets` as
    `YANDEX_TOKEN='{"access_token":...}'` (or paste it at the prompt). rclone refreshes it afterwards; it is never rewritten by the script.
    If the refresh token ever expires, `rclone config delete yandex` and re-run `backup-setup` with a fresh one.
-3. `backup-setup` creates the folder, refuses a folder holding another instance's backup, and starts a run. The first mirror is slow.
+4. `backup-setup` checks that it can list and upload (a token Yandex refuses stops it with the reason), creates the folder, refuses a
+   folder holding another instance's backup, and starts a run. The first mirror is slow.
 
 Deleted files go to the Yandex trash (some protection if the token is abused) and count against the quota, so empty it now and
 then; `check` shows the quota. Files larger than your plan's per-file upload limit fail (the run fails and `check` reports it).
