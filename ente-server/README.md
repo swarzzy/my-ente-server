@@ -61,7 +61,8 @@ A run (`systemctl start --no-block ente-backup.service`, logs `journalctl -u ent
 dumps Postgres (verified, atomic), copies `museum.yaml`/`compose*.yaml`, syncs them to `<backup bucket>/config` (names and contents
 encrypted with `BACKUP_PASSPHRASE`), mirrors the photo bucket to `<backup bucket>/objects`. Objects deleted from the photo bucket move to
 `deleted/<date>/` and are purged after 60 days; a run that would delete more than 500 objects stops with an error.
-`HC_URL` (optional) is pinged only after a fully successful run.
+`HC_URL` (optional; any heartbeat URL: healthchecks.io, Better Stack, Cronitor, ...) is pinged only after a fully successful run, so the
+service alerts you when a run fails, does not happen, or the server is down. A failed ping does not fail the backup; `check` reports it.
 
 `backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, one the passphrase cannot read, or one it cannot list.
 The server holds keys that can delete backups: turn on bucket versioning or Object Lock at the backup provider if it supports it, and use a key limited to that bucket.

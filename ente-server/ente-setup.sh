@@ -117,6 +117,7 @@ load_env() {
     [[ $YANDEX_DIR =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || die "YANDEX_DIR must be a relative folder path like ente-backup (letters, digits, . _ -)"
     YANDEX_ROOT=yandex:$YANDEX_DIR/
   fi
+  [[ -z $HC_URL || $HC_URL =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/?\&=%:+-]*)?$ ]] || die "HC_URL must be an https:// ping URL without spaces or quotes"
   [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's ID starts with -)"
   [[ $RESTORE_FROM == s3 || ($RESTORE_FROM == yandex && -n $YANDEX_DIR) ]] || die "RESTORE_FROM must be s3, or yandex with YANDEX_DIR set"
 }
@@ -733,7 +734,12 @@ if [[ -n "${YANDEX_ROOT:-}" ]]; then
   target yandex yandex-crypt "$YANDEX_ROOT" || { echo "ERROR: backup to Yandex Disk failed" >&2; rc=1; }
 fi
 ((rc == 0)) || exit 1
-if [[ -n "${HC_URL:-}" ]]; then curl -fsS -m 10 --retry 3 "$HC_URL" > /dev/null; fi
+# heartbeat (healthchecks.io, Better Stack, ...): only after a fully good run. A failed ping does not fail the backup
+# (that would send a false "backup failed"); `check` reports it instead.
+if [[ -n "${HC_URL:-}" ]]; then
+  if curl -fsS -m 15 --retry 3 --retry-all-errors -o /dev/null "$HC_URL"; then date -Is > /var/lib/ente-backup/hc-ok; rm -f /var/lib/ente-backup/hc-fail
+  else echo "WARNING: heartbeat ping to HC_URL failed; the backup itself succeeded" >&2; date -Is > /var/lib/ente-backup/hc-fail; fi
+fi
 EOF
   write_file /etc/systemd/system/ente-backup.service <<EOF
 [Unit]
@@ -1006,6 +1012,12 @@ cmd_check() {
       systemctl is-enabled --quiet ente-check.timer 2>/dev/null; then ok "telegram alerts on (backup failure, daily check)"
     else bad "telegram alerts not installed (run backup-setup)"; fi
   elif [[ -z $HC_URL ]]; then warn "no failure alerts (set TG_CHAT_ID or HC_URL)"; fi
+  if [[ -n $HC_URL ]]; then
+    s=$(cat /var/lib/ente-backup/hc-fail 2>/dev/null || true)
+    if [[ -n $s ]]; then bad "heartbeat ping (HC_URL) failed after the backup of $s"
+    elif s=$(cat /var/lib/ente-backup/hc-ok 2>/dev/null); then ok "heartbeat pinged $s (outside monitor)"
+    else warn "heartbeat (HC_URL) not pinged yet: it is pinged after the next good backup"; fi
+  fi
   if [[ -n $YANDEX_DIR ]]; then
     echo "== yandex disk"
     if out=$(rclone lsf "$YANDEX_ROOT" --max-depth 1 2>&1 >/dev/null); then ok "Yandex Disk folder $YANDEX_DIR reachable"; else bad "Yandex Disk: $out"; fi
