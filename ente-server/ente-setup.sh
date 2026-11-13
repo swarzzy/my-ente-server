@@ -11,6 +11,7 @@ ENV_FILE=${ENV_FILE:-$SCRIPT_DIR/ente-setup.env}
 SECRETS_FILE=${SECRETS_FILE:-$SCRIPT_DIR/ente-setup.secrets}
 LOG=/var/log/ente-setup.log
 ENTE_DIR=/opt/my-ente
+PINS=$ENTE_DIR/image-pins
 QUICKSTART_URL=https://raw.githubusercontent.com/ente/ente/main/server/quickstart.sh
 INT_BEGIN='# BEGIN ente-setup internal'
 INT_END='# END ente-setup internal'
@@ -376,6 +377,71 @@ except Exception as x:
 PY
 }
 
+# ---------------------------------------------------------------- image pins
+# The quickstart's compose.yaml names the Ente images without a version (= latest). $PINS names the exact builds in use
+# (one line per service: "museum ghcr.io/ente/server@sha256:..."); compose.override.yaml is written from it and the backup
+# carries it, so a restore runs the builds that made the dump. Only `update` moves the pins. postgres stays on postgres:15.
+repo_of() { case $1 in museum) echo ghcr.io/ente/server ;; web) echo ghcr.io/ente/web ;; esac; }
+# pin_of SERVICE: the pinned image reference from $PINS, empty if none.
+pin_of() { awk -v s="$1" '$1 == s {r = $2} END {print r}' "$PINS" 2>/dev/null || true; }
+# image_digest IMAGE REPO: the REPO@sha256:... name of a local image (given by ID, tag or digest), empty if it has none.
+image_digest() {
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null |
+    awk -v r="$2@sha256:" 'index($0, r) == 1 && !f {print; f = 1}' || true
+}
+
+# ensure_pins: make $PINS name an available build of each Ente image. A pin is kept while its image is local or can be pulled.
+# Without one (first install, a backup from before pinning) the running container's image is pinned, else the local latest,
+# else a freshly pulled latest.
+ensure_pins() {
+  local svc repo ref cid new=''
+  for svc in museum web; do
+    repo=$(repo_of $svc); ref=$(pin_of $svc)
+    if [[ -n $ref ]]; then
+      [[ $ref =~ ^$repo@sha256:[0-9a-f]{64}$ ]] || die "$PINS: bad entry for $svc"
+      if ! docker image inspect "$ref" >/dev/null 2>&1 && ! docker pull -q "$ref" >/dev/null 2>&1; then
+        warn "the pinned $svc image ${ref##*@} can no longer be pulled; pinning the running or latest build instead"; ref=
+      fi
+    fi
+    if [[ -z $ref ]]; then
+      cid=$(dc ps -q $svc 2>/dev/null || true)
+      [[ -z $cid ]] || ref=$(image_digest "$(docker inspect -f '{{.Image}}' "$cid")" "$repo")
+      [[ -n $ref ]] || ref=$(image_digest "$repo:latest" "$repo")
+      if [[ -z $ref ]]; then
+        docker pull -q "$repo:latest" >/dev/null || die "cannot pull $repo:latest"
+        ref=$(image_digest "$repo:latest" "$repo")
+      fi
+      [[ -n $ref ]] || die "cannot determine the digest of $repo"
+      log "pinned $svc to $ref"
+    fi
+    new+="$svc $ref"$'\n'
+  done
+  printf '%s' "$new" | write_file "$PINS" 600
+}
+
+# write_override: compose.override.yaml with the pinned images, restart policies and OOM priorities.
+# minio and socat only serve the quickstart's local storage; the photos are in the external bucket.
+write_override() {
+  write_file "$ENTE_DIR/compose.override.yaml" 600 <<EOF
+services:
+  museum:
+    image: $(pin_of museum)
+    restart: unless-stopped
+    oom_score_adj: -300
+  web:
+    image: $(pin_of web)
+    restart: unless-stopped
+  postgres:
+    restart: unless-stopped
+    oom_score_adj: -500
+  minio:
+    profiles: ["off"]
+  socat:
+    profiles: ["off"]
+EOF
+  dc config -q >/dev/null || die "docker compose config failed"
+}
+
 # internal_admin: admin user_id from our internal block (empty if none). internal_locked: true if sign-ups are disabled.
 internal_admin() { sed -n 's/^  admins: \[\(.*\)\]$/\1/p' "$ENTE_DIR/museum.yaml"; }
 internal_locked() { grep -qx '  disable-registration: true' "$ENTE_DIR/museum.yaml"; }
@@ -455,23 +521,8 @@ EOF
   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile invalid"
   systemctl enable caddy >/dev/null 2>&1
   systemctl reload-or-restart caddy # graceful and cheap when nothing changed
-  # minio and socat only serve the quickstart's local storage; the photos are in the external bucket
-  write_file "$ENTE_DIR/compose.override.yaml" 600 <<'EOF'
-services:
-  museum:
-    restart: unless-stopped
-    oom_score_adj: -300
-  web:
-    restart: unless-stopped
-  postgres:
-    restart: unless-stopped
-    oom_score_adj: -500
-  minio:
-    profiles: ["off"]
-  socat:
-    profiles: ["off"]
-EOF
-  dc config -q >/dev/null || die "docker compose config failed"
+  ensure_pins
+  write_override
 }
 
 # wait_healthy SERVICE [TIMEOUT]: wait until the container is healthy (or running, without a healthcheck); die after TIMEOUT s (default 360).
@@ -541,19 +592,34 @@ cmd_lockdown() {
   log "lockdown done: admin=$id, registration disabled"
 }
 
-# update: back up first (if configured), then pull and restart newer images and prune old ones.
+# update: back up first (if configured), move the pins to the current latest Ente images, restart what changed, prune.
+# The previous pins stay in $PINS.prev.
 cmd_update() {
   load_env
+  local svc repo ref old new='' changed=0
   if systemctl cat ente-backup.service >/dev/null 2>&1; then
     log "running a backup first (rollback point)"
     systemctl start ente-backup.service || die "backup failed; not updating"
   else
     warn "no backup configured yet; updating without a rollback point"
   fi
-  dc pull
+  ensure_pins
+  cp -p "$PINS" "$PINS.prev"
+  for svc in museum web; do
+    repo=$(repo_of $svc); old=$(pin_of $svc)
+    docker pull -q "$repo:latest" >/dev/null || die "cannot pull $repo:latest"
+    ref=$(image_digest "$repo:latest" "$repo"); [[ -n $ref ]] || die "cannot determine the digest of $repo:latest"
+    if [[ $ref != "$old" ]]; then changed=1; log "$svc: ${old##*@sha256:} -> ${ref##*@sha256:}"; fi
+    new+="$svc $ref"$'\n'
+  done
+  printf '%s' "$new" | write_file "$PINS" 600
+  write_override
+  dc pull -q postgres
   dc up -d
+  wait_healthy museum
+  url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping fails after the update; the previous versions are in $PINS.prev (README: Updates)"
   docker image prune -f >/dev/null
-  log "updated"
+  if ((changed)); then log "updated; the previous versions are in $PINS.prev (README: Updates)"; else log "Ente images were already current"; fi
 }
 
 # ---------------------------------------------------------------- backup
@@ -715,6 +781,7 @@ docker compose exec -T postgres pg_restore -l < "$dump.tmp" > /dev/null || { ech
 mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
+[[ ! -f image-pins ]] || cp image-pins "$DUMPS/"
 # target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects, 60-day deleted/ retention.
 # A failed target does not stop the next one; the run fails at the end. Success leaves a per-target stamp for `check`:
 # the time the run STARTED, so that objects uploaded after it are not expected in the backup.
@@ -945,6 +1012,7 @@ cmd_restore() {
   install -d -m 700 "$ENTE_DIR"; touch "$ENTE_DIR/.restore-incomplete"
   install -m 600 "$tmp/compose.yaml" "$ENTE_DIR/compose.yaml"
   install -m 644 "$tmp/museum.yaml" "$ENTE_DIR/museum.yaml"
+  [[ ! -f $tmp/image-pins ]] || install -m 600 "$tmp/image-pins" "$PINS" # the builds that made the dump
   configure_host
   make_photo_remote
   log "starting postgres"
@@ -996,6 +1064,11 @@ cmd_check() {
     pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid")
     if [[ $st == healthy || $st == running ]]; then ok "$s $st"; else bad "$s $st"; fi
     if [[ $pol == unless-stopped ]]; then ok "$s restart=$pol"; else bad "$s restart=$pol"; fi
+    [[ $s != postgres ]] || continue
+    p=$(pin_of "$s")
+    if [[ -n $p && $(docker inspect -f '{{.Config.Image}}' "$cid") == "$p" ]]; then
+      ok "$s pinned to ${p:0:$((${#p} - 52))} (built $(docker image inspect -f '{{.Created}}' "$p" 2>/dev/null | cut -c1-10))"
+    else bad "$s image is not pinned (re-run install)"; fi
   done
   for s in minio socat; do
     if [[ -z $(dc ps -q "$s" 2>/dev/null || true) ]]; then ok "$s not running"; else bad "$s is running"; fi

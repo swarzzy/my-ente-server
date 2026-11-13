@@ -130,8 +130,18 @@ A full disaster-recovery drill (restore on a fresh server) is still worth doing 
 
 ## Updates
 
-`sudo ./ente-setup.sh update`: runs a backup first (rollback point; aborts if it fails), pulls images, recreates changed containers, prunes.
-Ente images are untagged `latest`; read Ente's release notes first. OS updates install themselves.
+The Ente images (`ghcr.io/ente/server`, `ghcr.io/ente/web`) have no version tags, so the script pins the exact builds by digest in
+`/opt/my-ente/image-pins` (written into `compose.override.yaml`, carried by the backup). Nothing changes version by itself; `install`
+re-runs keep the pins, `restore` runs the builds that made the dump, and `check` shows them with their build dates.
+`postgres:15` is not pinned, so its minor fixes arrive with `update`.
+
+`sudo ./ente-setup.sh update`: runs a backup first (rollback point; aborts if it fails), moves the pins to the current `latest`,
+recreates the changed containers, prunes. Read Ente's release notes first. OS updates install themselves.
+
+Going back after a bad update: the previous pins are in `/opt/my-ente/image-pins.prev`. Copy that file over `image-pins` and run
+`install`. If the new server version already migrated the database, the old one may not start: then also restore the dump that
+`update` made (`restore` on a fresh server, or `pg_restore` of `/var/backups/ente/ente_db-<date>.dump`).
+If a pinned build is ever deleted from the registry, `install`/`restore` warn and pin the running or latest build instead.
 
 ## Moving to a new VPS / disaster recovery (`restore`)
 
