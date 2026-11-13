@@ -111,7 +111,22 @@ and re-run `backup-setup`.
 ## Monthly: `sudo ./ente-setup.sh check`
 
 OK/FAIL report: containers, restart policy, localhost-only ports, sshd, UFW, Caddy, HTTPS, photo bucket + CORS, backup timer and last
-result, `rclone check` photo bucket vs backup (and Yandex Disk: reachable, last good run, `rclone check`, quota), disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
+result, `rclone check` photo bucket vs backup (and Yandex Disk: reachable, last good run, `rclone check`, quota), the last good `verify`, disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
+
+## Monthly, automatic: `verify`
+
+`check` proves that backups ran and that object sizes match; `verify` proves the S3 backup can be restored. `backup-setup` installs
+`ente-verify.timer` (the 1st of each month, 04:30; a FAIL sends a Telegram alert if alerts are on). By hand: `sudo ./ente-setup.sh verify`.
+
+- photo bucket against the backup by checksum (objects without a common checksum, e.g. multipart uploads, are compared by size and counted in a WARN);
+- the encrypted config backup, downloaded, decrypted with the stored passphrase and compared byte for byte with the local copies;
+- the newest dump from the backup restored into a scratch database (dropped afterwards) and compared with the live one: same number of
+  tables, and users/files not empty when the live ones are not;
+- the keys in the backed-up `museum.yaml` equal the live ones.
+
+It changes neither the backup nor the live database, and waits for a running backup. Photos uploaded since the last backup started are
+not expected in the backup (same in `check`). The Yandex Disk copy is not verified here; `check` compares it by size daily.
+A full disaster-recovery drill (restore on a fresh server) is still worth doing once by hand.
 
 ## Updates
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
-# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update|alert-test|vpn>
+# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|vpn>
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
 # Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
 set -euo pipefail
@@ -704,6 +704,7 @@ EOF
 # Managed by ente-setup.sh. Config comes from /etc/ente-backup.env via systemd.
 set -euo pipefail
 umask 077
+START=$(date -Is)
 OPTS=(--checkers 4 --transfers 4)
 cd /opt/my-ente
 DUMPS=/var/backups/ente; mkdir -p "$DUMPS"; chmod 700 "$DUMPS"
@@ -715,7 +716,8 @@ mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
 # target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects, 60-day deleted/ retention.
-# A failed target does not stop the next one; the run fails at the end. Success leaves a per-target stamp for `check`.
+# A failed target does not stop the next one; the run fails at the end. Success leaves a per-target stamp for `check`:
+# the time the run STARTED, so that objects uploaded after it are not expected in the backup.
 target() {
   local name=$1 crypt=$2 root=$3 cutoff d
   echo "== $name"
@@ -726,7 +728,7 @@ target() {
   for d in $(rclone lsf --dirs-only "${root}deleted" 2>/dev/null || true); do
     if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ && "${d%/}" < "$cutoff" ]]; then rclone purge "${root}deleted/${d%/}" || return 1; fi
   done
-  mkdir -p /var/lib/ente-backup; date -Is > "/var/lib/ente-backup/last-ok-$name"
+  mkdir -p /var/lib/ente-backup; echo "$START" > "/var/lib/ente-backup/last-ok-$name"
 }
 rc=0
 target s3 backup-crypt "$BACKUP_ROOT" || { echo "ERROR: backup to the S3 bucket failed" >&2; rc=1; }
@@ -767,8 +769,31 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  write_file /etc/systemd/system/ente-verify.service <<EOF
+[Unit]
+Description=Monthly deep check of the Ente backup (ente-setup.sh verify)
+After=docker.service network-online.target
+Wants=network-online.target
+$ALERT_ONFAIL
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/bin/bash "$SCRIPT_DIR/ente-setup.sh" verify
+EOF
+  write_file /etc/systemd/system/ente-verify.timer <<'EOF'
+[Unit]
+Description=Monthly deep check of the Ente backup
+
+[Timer]
+OnCalendar=*-*-01 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   systemctl daemon-reload
-  systemctl enable --now ente-backup.timer >/dev/null 2>&1
+  systemctl enable --now ente-backup.timer ente-verify.timer >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- telegram alerts
@@ -818,8 +843,8 @@ u=$1 h=$(hostname)
 id=$(systemctl show -p InvocationID --value "$u" 2>/dev/null || true)
 if [[ -n $id ]]; then out=$(journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$id" || true)
 else out=$(journalctl -q -o cat --no-pager -u "$u" -n 40 || true); fi
-if [[ $u == ente-check.service ]]; then
-  title="⚠️ Ente check found problems on $h"
+if [[ $u == ente-check.service || $u == ente-verify.service ]]; then
+  n=${u#ente-}; title="⚠️ Ente ${n%.service} found problems on $h"
   out=$(grep -E 'FAIL|ERROR' <<<"$out" || tail -n 30 <<<"$out")
 else
   title="❌ $u failed on $h"
@@ -944,11 +969,25 @@ Restored. Next:
 EOF
 }
 
+# new_uploads NAME: prints a temp file of rclone exclude rules naming the photo objects uploaded since the last good backup to
+# NAME (s3|yandex) started. They are not in that backup yet, and that is not an error. The caller passes it as --exclude-from
+# and removes it. One listing, no request per object. (An age filter instead would also hide freshly copied backup objects.)
+new_uploads() {
+  local s f; f=$(mktemp)
+  if s=$(cat "/var/lib/ente-backup/last-ok-$1" 2>/dev/null); then
+    rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$S3_BUCKET" 2>/dev/null |
+      sed 's/[][*?{}\\]/\\&/g; s|^|/|' >"$f" || true
+  fi
+  echo "$f"
+}
+# rc_err OUTPUT: the error lines of an rclone run, without timestamps, on one line.
+rc_err() { grep -E 'ERROR|Failed to' <<<"$1" | sed -E 's|^[0-9/]+ [0-9:]+ ||' | head -3 | tr '\n' ' ' || true; }
+
 # ---------------------------------------------------------------- check
 # check: read-only health report (containers, ports, ssh/firewall/TLS, bucket + CORS, backup freshness, system); exit 1 on any FAIL.
 cmd_check() {
   load_env
-  local s cid st pol p addrs ts res out
+  local s cid st pol p addrs ts res out ex
   echo "== containers"
   for s in museum web postgres; do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
@@ -1005,8 +1044,15 @@ cmd_check() {
     if [[ -n $s ]] && (($(date +%s) - $(date -d "$s" +%s) <= 36 * 3600)); then ok "S3 part of the backup succeeded $s"; fi
   elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
   else ok "last backup finished $ts: $res"; fi
-  if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: photo bucket is in the backup"
+  ex=$(new_uploads s3)
+  if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
+  rm -f "$ex"
+  s=$(cat /var/lib/ente-backup/verify-ok 2>/dev/null || true)
+  if ! systemctl is-enabled --quiet ente-verify.timer 2>/dev/null; then bad "ente-verify.timer not enabled (run backup-setup)"
+  elif [[ -z $s ]]; then warn "monthly verify has not passed yet (run: $0 verify)"
+  elif (($(date +%s) - $(date -d "$s" +%s) > 45 * 86400)); then bad "last good verify is older than 45 days ($s)"
+  else ok "monthly verify: last passed $s"; fi
   if [[ -n $TG_CHAT_ID ]]; then
     if grep -qx 'OnFailure=ente-alert@%n.service' /etc/systemd/system/ente-backup.service 2>/dev/null &&
       systemctl is-enabled --quiet ente-check.timer 2>/dev/null; then ok "telegram alerts on (backup failure, daily check)"
@@ -1025,8 +1071,10 @@ cmd_check() {
     if [[ -z $ts ]]; then bad "no successful backup to Yandex Disk yet"
     elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last good Yandex Disk backup is older than 36 h ($ts)"
     else ok "last good Yandex Disk backup $ts"; fi
-    if out=$(rclone check "ente-s3:$S3_BUCKET" "${YANDEX_ROOT}objects" --one-way --size-only --checkers 4 2>&1); then ok "rclone check: photo bucket is on Yandex Disk"
+    ex=$(new_uploads yandex)
+    if out=$(rclone check "ente-s3:$S3_BUCKET" "${YANDEX_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is on Yandex Disk"
     else bad "rclone check (Yandex) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
+    rm -f "$ex"
     out=$(rclone about yandex: 2>/dev/null | tr -s ' ' | tr '\n' ' ' || true)
     [[ -z $out ]] || warn "Yandex Disk quota: $out(the trash counts too; empty it now and then)"
   fi
@@ -1039,6 +1087,83 @@ cmd_check() {
   echo
   if ((FAILS)); then echo "$FAILS check(s) FAILED"; return 1; fi
   echo "all checks passed"
+}
+
+# ---------------------------------------------------------------- verify
+# verify: deep test of the S3 backup, monthly by ente-verify.timer (a FAIL alerts like the daily check). It proves the backup
+# can be restored, which `check` does not: photo objects by checksum, the encrypted config byte for byte, a test restore of the
+# newest dump into a scratch database, and the keys in the backed-up museum.yaml. It changes neither the backup nor the live
+# database. The Yandex Disk copy is not verified here (the daily check compares it by size).
+VERIFY_TMP=
+verify_cleanup() {
+  [[ -z $VERIFY_TMP ]] || rm -rf "$VERIFY_TMP"
+  dc exec -T postgres rm -f /tmp/ente-verify.dump </dev/null >/dev/null 2>&1 || true
+  dc exec -T postgres psql -U pguser -d postgres -qc 'DROP DATABASE IF EXISTS ente_verify' </dev/null >/dev/null 2>&1 || true
+}
+# vq ARGS: psql in the postgres container, unaligned output with space-separated columns.
+vq() { dc exec -T postgres psql -U pguser -At -F ' ' "$@" </dev/null; }
+cmd_verify() {
+  load_env
+  local out dump n i live rest lt lu lf rt ru rf ex
+  rclone listremotes | grep -x 'backup-crypt:' >/dev/null || die "run backup-setup first"
+  for ((i = 0; i < 720; i++)); do # a backup that is still running would show false differences: wait for it, up to 6 h
+    [[ $(systemctl show ente-backup.service -p ActiveState --value) == activating ]] || break
+    ((i)) || log "a backup is running, waiting for it"
+    sleep 30
+  done
+  ((i < 720)) || die "the backup is still running after 6 h"
+  VERIFY_TMP=$(mktemp -d /root/ente-verify.XXXXXX)
+  trap verify_cleanup EXIT
+
+  echo "== photo objects (checksums)"
+  ex=$(new_uploads s3)
+  if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --checkers 4 --exclude-from "$ex" 2>&1); then
+    ok "photo bucket is in the backup with the same checksums ($(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1))"
+    n=$(grep -oE '[0-9]+ hashes could not be checked' <<<"$out" | tail -1 || true)
+    [[ -z $n ]] || warn "$n (no common checksum; compared by size)"
+  else bad "photo objects differ from the backup: $(rc_err "$out")"; fi
+  rm -f "$ex"
+
+  echo "== config backup (decrypted, byte for byte)"
+  if out=$(rclone check /var/backups/ente backup-crypt: --download --checkers 4 2>&1); then
+    ok "config backup decrypts with the stored passphrase and equals the local copies ($(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1))"
+  else bad "config backup differs or cannot be decrypted: $(rc_err "$out")"; fi
+
+  echo "== database dump (test restore into a scratch database)"
+  dump=$(rclone lsf backup-crypt: --include 'ente_db-*.dump' 2>/dev/null | sort | tail -1 || true)
+  if [[ -z $dump ]]; then bad "no database dump in the backup"
+  elif ! rclone copy backup-crypt: "$VERIFY_TMP" --include "$dump" --include museum.yaml 2>/dev/null; then bad "cannot download $dump from the backup"
+  else
+    if [[ ${dump:8:10} < $(date -d yesterday +%F) ]]; then bad "newest dump in the backup is old: $dump"; else ok "newest dump in the backup: $dump"; fi
+    n="SELECT (SELECT count(*) FROM pg_tables WHERE schemaname = 'public'), (SELECT count(*) FROM users), (SELECT count(*) FROM files)"
+    if ! vq -d postgres -qc 'DROP DATABASE IF EXISTS ente_verify' -c 'CREATE DATABASE ente_verify' >/dev/null 2>&1 ||
+      ! dc cp "$VERIFY_TMP/$dump" postgres:/tmp/ente-verify.dump </dev/null >/dev/null 2>&1; then bad "cannot prepare the scratch database"
+    elif ! out=$(dc exec -T postgres pg_restore -U pguser -d ente_verify --no-owner --exit-on-error /tmp/ente-verify.dump </dev/null 2>&1); then
+      bad "$dump does not restore: $(tail -2 <<<"$out" | tr '\n' ' ')"
+    elif ! live=$(vq -d ente_db -c "$n") || ! rest=$(vq -d ente_verify -c "$n"); then bad "cannot count rows after the test restore"
+    else
+      ok "$dump restores without errors"
+      read -r lt lu lf <<<"$live"; read -r rt ru rf <<<"$rest"
+      # the dump is older than the live data, so row counts may differ; an empty table that is not empty live is damage
+      if [[ $rt == "$lt" ]] && { ((ru > 0)) || ((lu == 0)); } && { ((rf > 0)) || ((lf == 0)); }; then
+        ok "restored: $rt tables, $ru users, $rf files (live now: $lt tables, $lu users, $lf files)"
+      else bad "restored dump looks incomplete: $rt tables, $ru users, $rf files (live: $lt tables, $lu users, $lf files)"; fi
+    fi
+    echo "== keys"
+    if python3 - "$ENTE_DIR/museum.yaml" "$VERIFY_TMP/museum.yaml" <<'PY' 2>/dev/null
+import sys, yaml
+a, b = (yaml.safe_load(open(f)) for f in sys.argv[1:])
+sys.exit(not (a["key"] == b["key"] and a["jwt"] == b["jwt"]))
+PY
+    then ok "museum.yaml in the backup holds the live encryption keys"
+    else bad "museum.yaml in the backup is missing or its keys differ from the live ones"; fi
+  fi
+  verify_cleanup; trap - EXIT
+  [[ -z $YANDEX_DIR ]] || warn "the Yandex Disk copy is not verified here (check compares it by size)"
+  echo
+  if ((FAILS)); then echo "$FAILS verify check(s) FAILED"; return 1; fi
+  mkdir -p /var/lib/ente-backup; date -Is >/var/lib/ente-backup/verify-ok
+  echo "backup verified"
 }
 
 # ---------------------------------------------------------------- deploy / main
@@ -1328,7 +1453,7 @@ cmd_deploy() {
 }
 
 # usage: print the command list and exit 2. main CMD: dispatch to the cmd_* function.
-usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|update|alert-test|vpn}" >&2; exit 2; }
+usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|vpn}" >&2; exit 2; }
 
 main() {
   CMD=$1
@@ -1341,6 +1466,7 @@ main() {
     backup-setup) cmd_backup_setup ;;
     restore) cmd_restore ;;
     check) cmd_check ;;
+    verify) cmd_verify ;;
     update) cmd_update ;;
     alert-test) cmd_alert_test ;;
     vpn) cmd_vpn ;;
