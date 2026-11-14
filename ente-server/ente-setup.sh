@@ -5,6 +5,9 @@
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
 # Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
 set -euo pipefail
+# apt keyrings, source lists and unit files must be world-readable even when root's shell has a strict umask (apt verifies
+# signatures as the unprivileged _apt user). Everything secret is created with an explicit mode.
+umask 022
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${ENV_FILE:-$SCRIPT_DIR/ente-setup.env}
@@ -243,8 +246,11 @@ install_caddy() {
   command -v caddy >/dev/null && return 0
   log "installing Caddy from its apt repository"
   apt_install debian-keyring debian-archive-keyring apt-transport-https curl gpg
-  curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  local k; k=$(mktemp)
+  curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o "$k"
+  install -m 644 "$k" /usr/share/keyrings/caddy-stable-archive-keyring.gpg; rm -f "$k" # apt reads it as the _apt user
   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt >/etc/apt/sources.list.d/caddy-stable.list
+  chmod 644 /etc/apt/sources.list.d/caddy-stable.list
   apt_get update
   apt_install caddy
 }
@@ -1191,7 +1197,8 @@ cmd_verify() {
   echo "== photo objects (checksums)"
   ex=$(new_uploads s3)
   if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --checkers 4 --exclude-from "$ex" 2>&1); then
-    ok "photo bucket is in the backup with the same checksums ($(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1))"
+    n=$(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1 || true)
+    ok "photo bucket is in the backup with the same checksums (${n:-0 matching files}; $(wc -l <"$ex") uploaded around or after the last backup, not compared)"
     n=$(grep -oE '[0-9]+ hashes could not be checked' <<<"$out" | tail -1 || true)
     [[ -z $n ]] || warn "$n (no common checksum; compared by size)"
   else bad "photo objects differ from the backup: $(rc_err "$out")"; fi
