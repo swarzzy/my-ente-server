@@ -28,7 +28,7 @@ in_setup() {
   ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test
     # shellcheck source=/dev/null
     . "$HERE/../ente-setup.sh"
-    ENTE_DIR=$T/ente RCLONE_CONFIG=$T/rclone.conf # ente-setup.sh pins root's rclone config
+    ENTE_DIR=$T/ente RCLONE_CONFIG=$T/rclone.conf BACKUP_STATE=$T/state # never the host's real config or stamps
     set +e
     load_env
     eval "$1" )
@@ -55,6 +55,7 @@ conf_get() { python3 -I -c 'import configparser,sys; c=configparser.RawConfigPar
 
 mkdir -p "$T/s3/photo/1580559962386439" "$T/b2/bk" "$T/ente" "$T/bin"
 echo photo-a >"$T/s3/photo/1580559962386439/aaa"; echo photo-b >"$T/s3/photo/1580559962386439/bbb"
+touch -d '2 hours ago' "$T/s3/photo/1580559962386439/"* # uploaded well before any backup: not "new uploads"
 printf 'key:\n  encryption: KEY-ONE\njwt:\n  secret: J\n' >"$T/ente/museum.yaml"
 echo 'services: {}' >"$T/ente/compose.yaml"; echo 'services: {}' >"$T/ente/compose.override.yaml"
 
@@ -115,6 +116,11 @@ fi
 echo "== check / verify: the copy is not a missing photo"
 in_setup 'f=$(new_uploads s3); cat "$f"; rm -f "$f"' >"$T/ex" 2>/dev/null
 check "new_uploads always excludes /ente-backup-config/**" 'grep -qxF "/ente-backup-config/**" "$T/ex"'
+check "new_uploads reads the test's stamps, so old photos are not excluded" '[[ $(wc -l <"$T/ex") -eq 1 ]]' "$(cat "$T/ex")"
+echo photo-c >"$T/s3/photo/1580559962386439/ccc"
+in_setup 'f=$(new_uploads s3); cat "$f"; rm -f "$f"' >"$T/ex2" 2>/dev/null
+check "a photo uploaded after the last backup is excluded (not yet backed up)" 'grep -qxF "/1580559962386439/ccc" "$T/ex2"' "$(cat "$T/ex2")"
+rm "$T/s3/photo/1580559962386439/ccc"
 check "rclone check photo bucket vs backup passes with that exclusion" \
   'rclone check ente-s3:photo backup:bk/objects --one-way --size-only --exclude-from "$T/ex" >/dev/null 2>&1'
 check "... and would fail without it (so the test is not vacuous)" '! rclone check ente-s3:photo backup:bk/objects --one-way --size-only >/dev/null 2>&1'

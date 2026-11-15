@@ -23,7 +23,8 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 | `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
 | `tests/` | tests (see "Tests") |
 
-Both copies are git-ignored. Anything missing from the secrets file is asked at a prompt (never echoed, logged or stored in the env file).
+Both copies are git-ignored. The script reads secrets only from the secrets file (or the environment, if the file does not set
+them) and stops naming any that a command needs but is missing; it never logs them or stores them in the env file.
 
 ## Fresh install
 
@@ -96,7 +97,7 @@ Nothing is sent while all is well. Not covered: the VPS itself being down (only 
 1. In Telegram: @BotFather → `/newbot` → copy the token. Open your bot and press **Start** (for a group: add the bot to it).
 2. Chat ID: open `https://api.telegram.org/bot<TOKEN>/getUpdates` after writing to the bot and read `"chat":{"id":...}`
    (groups start with `-`), or ask @userinfobot.
-3. `TG_CHAT_ID=...` in `ente-setup.env`, `TG_BOT_TOKEN=...` in `ente-setup.secrets` (or paste it at the prompt), then
+3. `TG_CHAT_ID=...` in `ente-setup.env`, `TG_BOT_TOKEN=...` in `ente-setup.secrets`, then
    `sudo ./ente-setup.sh backup-setup` and `sudo ./ente-setup.sh alert-test`.
 
 The daily check runs the script from where `backup-setup` was run: keep the folder there (or re-run `backup-setup` after moving it).

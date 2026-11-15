@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
-# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest>
+# Usage: ente-setup.sh <command> (see COMMANDS below)
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
-# Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
+# Secrets: ente-setup.secrets next to it (or SECRETS_FILE=/path, or the environment). See ente-setup.secrets.example.
 set -euo pipefail
 # apt keyrings, source lists and unit files must be world-readable even when root's shell has a strict umask (apt verifies
 # signatures as the unprivileged _apt user). Everything secret is created with an explicit mode.
@@ -15,6 +15,7 @@ SECRETS_FILE=${SECRETS_FILE:-$SCRIPT_DIR/ente-setup.secrets}
 LOG=/var/log/ente-setup.log
 ENTE_DIR=/opt/my-ente
 PINS=$ENTE_DIR/image-pins
+BACKUP_STATE=/var/lib/ente-backup # stamps the backup script leaves; check/verify read them (tests point this elsewhere)
 PHOTO_CFG_DIR=ente-backup-config # inside the photo bucket: the encrypted config copy (see make_photo_crypt)
 CADDY_DIR=${CADDY_DIR:-/etc/caddy}
 CADDYFILE=$CADDY_DIR/Caddyfile
@@ -31,7 +32,6 @@ export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 FAILS=0
 MUSEUM_CFG_CHANGED=0
 CMD=
-SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE TG_BOT_TOKEN'
 
 # ---------------------------------------------------------------- helpers
 # log MSG / die MSG: timestamped line tagged with the command; die prints to stderr and exits 1.
@@ -75,36 +75,18 @@ write_file() {
   log "wrote $f"
 }
 
-# secret_var VAR PROMPT [confirm]: keep VAR if already set (environment / secrets file), else ask silently on a terminal.
-# Secrets are never logged or written to the config file.
-secret_var() {
-  local -n _v=$1
-  local a b
-  [[ -z $_v ]] || return 0
-  [[ -t 0 ]] || die "$1 is not set and there is no terminal to ask on (set it in the environment or $SECRETS_FILE)"
-  while :; do
-    read -rsp "$2: " a; echo >&2
-    [[ -n $a ]] || { echo "must not be empty" >&2; continue; }
-    if [[ ${3:-} == confirm ]]; then
-      read -rsp "$2 (again): " b; echo >&2
-      [[ $a == "$b" ]] || { echo "did not match, retry" >&2; continue; }
-    fi
-    _v=$a; return 0
-  done
-}
+# need_secret VAR...: die unless every named secret is set (secrets file or environment). Secrets are never logged.
+need_secret() { local v; for v in "$@"; do [[ -n ${!v:-} ]] || die "$v is not set: put it in $SECRETS_FILE"; done; }
 
-# Source the config and secrets files (environment wins over secrets file), apply defaults, validate.
+# Source the config and secrets files, apply defaults, validate.
 load_env() {
   [[ -f $ENV_FILE ]] || die "config $ENV_FILE not found (copy ente-setup.env.example)"
   # shellcheck source=/dev/null
   . "$ENV_FILE"
   if [[ -f $SECRETS_FILE ]]; then
-    local v e
-    [[ $(stat -c %a "$SECRETS_FILE") =~ ^[46]00$ ]] || die "$SECRETS_FILE must be mode 600"
-    for v in $SECRET_VARS; do declare -g "_env_$v=${!v:-}"; done
+    chmod 600 "$SECRETS_FILE" 2>/dev/null || true
     # shellcheck source=/dev/null
     . "$SECRETS_FILE"
-    for v in $SECRET_VARS; do e=_env_$v; [[ -z ${!e} ]] || declare -g "$v=${!e}"; done # variables set in the environment win
   fi
   DOMAIN=${DOMAIN:-}; ADMIN_USER=${ADMIN_USER:-}; ADMIN_SSH_PUBKEY=${ADMIN_SSH_PUBKEY:-}; FAIL2BAN=${FAIL2BAN:-yes}
   SSH_PORT=${SSH_PORT:-22}; HC_URL=${HC_URL:-}; RESTORE=${RESTORE:-no}; CSP_REPORT_ONLY=${CSP_REPORT_ONLY:-no}
@@ -304,8 +286,7 @@ PY
     local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
     eval "$(museum_s3)"; S3_ACCESS_KEY=$M_KEY; S3_SECRET_KEY=$M_SECRET # keep the keys already in museum.yaml
   fi
-  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
-  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
+  need_secret S3_ACCESS_KEY S3_SECRET_KEY
   edit_museum_s3 "$m"
   yaml_ok "$c"; yaml_ok "$m"
 }
@@ -687,13 +668,12 @@ with open(conf, "w") as f: cp.write(f)
 ' "$conf" "$1")
 }
 
-# make_backup_remotes [confirm|once]: backup (S3 bucket) and backup-crypt (encrypted config/ folder in it).
-# confirm = ask the passphrase twice, once = once (restore). Existing remotes keep their keys and passphrase.
+# make_backup_remotes: backup (S3 bucket) and backup-crypt (encrypted config/ folder in it).
+# Existing remotes keep their keys and passphrase.
 make_backup_remotes() {
   local obs
   if ! rclone listremotes | grep -x 'backup:' >/dev/null; then
-    secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
-    secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
+    need_secret BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY
     rclone_set backup <<EOF
 type=s3
 access_key_id=$BACKUP_S3_ACCESS_KEY
@@ -710,7 +690,7 @@ EOF
     rclone_set backup-crypt <<<"remote=${BACKUP_ROOT}config"
     log "backup-crypt remote exists, keeping passphrase"; return 0
   fi
-  secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "${1:-confirm}"
+  need_secret BACKUP_PASSPHRASE
   obs=$(rclone obscure - <<<"$BACKUP_PASSPHRASE")
   rclone_set backup-crypt <<EOF
 type=crypt
@@ -736,8 +716,7 @@ EOF
 
 # make_photo_remote_env: the ente-s3 remote from S3_* and the keys (restore: museum.yaml does not exist yet).
 make_photo_remote_env() {
-  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
-  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
+  need_secret S3_ACCESS_KEY S3_SECRET_KEY
   rclone_set ente-s3 <<EOF
 type=s3
 provider=$S3_PROVIDER
@@ -915,7 +894,7 @@ setup_alerts() {
     return 0
   fi
   if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
-  secret_var TG_BOT_TOKEN "Telegram bot token (from @BotFather)"
+  need_secret TG_BOT_TOKEN
   [[ $TG_BOT_TOKEN =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "TG_BOT_TOKEN does not look like a bot token (123456:ABC...)"
   tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
   write_file /etc/ente-alert.env 600 <<EOF
@@ -1036,7 +1015,7 @@ cmd_restore() {
   apt_get update; apt_install curl ca-certificates python3-yaml gnupg
   install_docker; install_caddy; install_rclone
   rclone listremotes | grep -x 'backup-crypt:' >/dev/null && rclone config delete backup-crypt
-  make_backup_remotes once
+  make_backup_remotes
   make_photo_remote_env
   make_photo_crypt
   src=$(restore_source) || die "no readable backup in either bucket (wrong passphrase, wrong buckets or keys?)"
@@ -1087,7 +1066,7 @@ EOF
 new_uploads() {
   local s f; f=$(mktemp)
   echo "/$PHOTO_CFG_DIR/**" >"$f" # the config copy, not a photo
-  if s=$(cat "/var/lib/ente-backup/last-ok-$1" 2>/dev/null); then
+  if s=$(cat "$BACKUP_STATE/last-ok-$1" 2>/dev/null); then
     rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$S3_BUCKET" \
       --exclude "/$PHOTO_CFG_DIR/**" 2>/dev/null |
       sed 's/[][*?{}\\]/\\&/g; s|^|/|' >>"$f" || true
@@ -1175,12 +1154,12 @@ cmd_check() {
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
   res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
   if [[ -z $ts ]]; then # systemd forgets the result at a reboot: fall back to the stamp the last good run left
-    s=$(cat /var/lib/ente-backup/last-ok-s3 2>/dev/null || true)
+    s=$(cat "$BACKUP_STATE"/last-ok-s3 2>/dev/null || true)
     if [[ -z $s ]]; then warn "backup has not run yet"
     elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "last good backup is older than 36 h ($s)"
     else ok "last good backup $s (no run since boot)"; fi
   elif [[ $res != success ]]; then bad "last backup run $ts: $res (journalctl -u ente-backup.service)"
-    s=$(cat /var/lib/ente-backup/last-ok-s3 2>/dev/null || true)
+    s=$(cat "$BACKUP_STATE"/last-ok-s3 2>/dev/null || true)
     if [[ -n $s ]] && (($(date +%s) - $(date -d "$s" +%s) <= 36 * 3600)); then ok "S3 part of the backup succeeded $s"; fi
   elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
   else ok "last backup finished $ts: $res"; fi
@@ -1189,11 +1168,11 @@ cmd_check() {
   elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   rm -f "$ex"
-  s=$(cat /var/lib/ente-backup/last-ok-photo-config 2>/dev/null || true)
+  s=$(cat "$BACKUP_STATE"/last-ok-photo-config 2>/dev/null || true)
   if [[ -z $s ]]; then bad "no config copy in the photo bucket yet (the next backup makes it)"
   elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "config copy in the photo bucket is older than 36 h ($s)"
   else ok "config copy in the photo bucket $s"; fi
-  s=$(cat /var/lib/ente-backup/verify-ok 2>/dev/null || true)
+  s=$(cat "$BACKUP_STATE"/verify-ok 2>/dev/null || true)
   if ! systemctl is-enabled --quiet ente-verify.timer 2>/dev/null; then bad "ente-verify.timer not enabled (run backup-setup)"
   elif [[ -z $s ]]; then warn "monthly verify has not passed yet (run: $0 verify)"
   elif (($(date +%s) - $(date -d "$s" +%s) > 45 * 86400)); then bad "last good verify is older than 45 days ($s)"
@@ -1204,9 +1183,9 @@ cmd_check() {
     else bad "telegram alerts not installed (run backup-setup)"; fi
   elif [[ -z $HC_URL ]]; then warn "no failure alerts (set TG_CHAT_ID or HC_URL)"; fi
   if [[ -n $HC_URL ]]; then
-    s=$(cat /var/lib/ente-backup/hc-fail 2>/dev/null || true)
+    s=$(cat "$BACKUP_STATE"/hc-fail 2>/dev/null || true)
     if [[ -n $s ]]; then bad "heartbeat ping (HC_URL) failed after the backup of $s"
-    elif s=$(cat /var/lib/ente-backup/hc-ok 2>/dev/null); then ok "heartbeat pinged $s (outside monitor)"
+    elif s=$(cat "$BACKUP_STATE"/hc-ok 2>/dev/null); then ok "heartbeat pinged $s (outside monitor)"
     else warn "heartbeat (HC_URL) not pinged yet: it is pinged after the next good backup"; fi
   fi
   echo "== system"
@@ -1297,7 +1276,7 @@ PY
   verify_cleanup; trap - EXIT
   echo
   if ((FAILS)); then echo "$FAILS verify check(s) FAILED"; return 1; fi
-  mkdir -p /var/lib/ente-backup; date -Is >/var/lib/ente-backup/verify-ok
+  mkdir -p "$BACKUP_STATE"; date -Is >"$BACKUP_STATE/verify-ok"
   echo "backup verified"
 }
 
@@ -1366,41 +1345,21 @@ EOF
 # ---------------------------------------------------------------- deploy / main
 # bootstrap + (install | restore) + backup-setup in one go, from the config and secrets given.
 cmd_deploy() {
+  load_env
+  # fail now, not after a 10-minute bootstrap
   need ADMIN_USER ADMIN_SSH_PUBKEY
-  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
-  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
-  secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
-  secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
-  secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "$([[ $RESTORE == yes ]] && echo once || echo confirm)"
-  if [[ -n $TG_CHAT_ID && ! -f /etc/ente-alert.env ]]; then secret_var TG_BOT_TOKEN "Telegram bot token (from @BotFather)"; fi
+  need_secret S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE
+  [[ -z $TG_CHAT_ID || -f /etc/ente-alert.env ]] || need_secret TG_BOT_TOKEN
   cmd_bootstrap
   if [[ $RESTORE == yes ]]; then cmd_restore; else cmd_install; fi
   cmd_backup_setup
   log "deploy finished. Next: sign up the owner, then '$0 lockdown'."
 }
 
+# The commands: each runs cmd_<name> (dashes as underscores).
 COMMANDS="deploy bootstrap install codes lockdown backup-setup restore check verify update alert-test speedtest"
-# usage: print the command list and exit 2. main CMD: dispatch to the cmd_* function.
-usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest}" >&2; exit 2; }
-
-main() {
-  CMD=$1
-  case $CMD in
-    deploy) load_env; cmd_deploy ;;
-    bootstrap) cmd_bootstrap ;;
-    install) cmd_install ;;
-    codes) cmd_codes ;;
-    lockdown) cmd_lockdown ;;
-    backup-setup) cmd_backup_setup ;;
-    restore) cmd_restore ;;
-    check) cmd_check ;;
-    verify) cmd_verify ;;
-    update) cmd_update ;;
-    alert-test) cmd_alert_test ;;
-    speedtest) cmd_speedtest ;;
-    *) usage ;;
-  esac
-}
+usage() { echo "usage: $0 {${COMMANDS// /|}}" >&2; exit 2; }
+main() { CMD=$1; "cmd_${CMD//-/_}"; }
 
 # sourced (tests): define the functions only
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
