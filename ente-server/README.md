@@ -20,6 +20,7 @@ The full-featured previous version (local Silo storage, data disk, Storage Box, 
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `s3-speedtest.sh`, `vps-speedtest.ps1` | optional speed tests from a PC (see "Measuring connection speed") |
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
+| `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
 | `tests/` | tests (see "Tests") |
 
 Both copies are git-ignored. Anything missing from the secrets file is asked at a prompt (never echoed, logged or stored in the env file).
@@ -110,6 +111,29 @@ Nothing is sent while all is well. Not covered: the VPS itself being down (only 
 The daily check runs the script from where `backup-setup` was run: keep the folder there (or re-run `backup-setup` after moving it).
 The token is stored only in `/etc/ente-alert.env` (mode 600) and passed to curl on stdin. To turn alerts off, empty `TG_CHAT_ID`
 and re-run `backup-setup`.
+
+### Telegram bot (optional add-on): commands from your phone
+
+`ente-tg-bot.sh` adds a bot that takes commands from **one** Telegram account and from nobody else:
+
+| Command | Does |
+| --- | --- |
+| `/status` | short summary: containers, last backup per location, last check and verify, proxy, disk, uptime |
+| `/check` | runs `ente-setup.sh check`, replies with the FAIL/WARN lines and the verdict |
+| `/backup` | runs a backup now; replies at once, then with the result |
+| `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |
+
+1. `TG_BOT_USER_ID=<your Telegram user id>` in `ente-setup.env` (for a private chat it is the same number as `TG_CHAT_ID`).
+   The bot uses the alert bot's token (`TG_BOT_TOKEN` in the secrets file, or the one `backup-setup` stored).
+2. `sudo ./ente-tg-bot.sh install`, then send `/status` to the bot. `status`, `check` and `uninstall` as usual.
+
+Security: the bot long-polls Telegram (no open port) as its own unprivileged user `ente-tg-bot`, acts only on private messages
+from `TG_BOT_USER_ID` (others are ignored, and you get a notice at most once an hour per sender), does not run commands older
+than a minute, and maps each command to a fixed action name: no text from Telegram reaches a shell. As root it may run exactly
+`/usr/local/sbin/ente-tg-action <one of six names>` (`/etc/sudoers.d/ente-tg-bot`); that helper runs `ente-tg-bot.sh action <name>`,
+so the script folder must be root's alone (`chown -R root: ente-server; chmod -R go-w ente-server`; `install` refuses otherwise).
+The token reaches the bot as a systemd credential, never on a command line. Anyone who controls your Telegram account can use the
+bot: turn on Telegram's two-step verification. `ente-setup.sh check` includes the bot's checks while it is installed.
 
 ## Monthly: `sudo ./ente-setup.sh check`
 
@@ -218,9 +242,11 @@ Run each a few times: results vary a lot between runs.
 
 | Command | Where | What |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum |
+| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum, the bot against a fake Telegram |
+| `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, command lines |
 | `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
+| `sudo bash tests/tg_bot_e2e.sh` | the server, `TG_BOT_USER_ID` set | the real bot as its real user with the real sudo rule and actions, against a fake Telegram (`tests/fake_telegram.py`): every command, strangers, groups, old messages, privileges, uninstall; runs a real backup |
 | `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |
 
 The two server tests leave the add-on as they found it (installed or not, on or off). The browser test opens registration for a throwaway account, deletes it

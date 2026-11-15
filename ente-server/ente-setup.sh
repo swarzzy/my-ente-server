@@ -1142,14 +1142,18 @@ cmd_check() {
   out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT" \
     "https://$S3_ENDPOINT/$S3_BUCKET/ente-check" 2>&1 || true)
   if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight from https://web.$DOMAIN allowed"; else bad "CORS preflight from https://web.$DOMAIN not allowed (web uploads will fail)"; fi
-  if [[ -e $CADDY_SITES/s3-proxy.caddy ]]; then # installed by ente-s3-proxy.sh
-    echo "== s3 proxy"
-    if [[ -f $SCRIPT_DIR/ente-s3-proxy.sh ]]; then
-      out=$(bash "$SCRIPT_DIR/ente-s3-proxy.sh" check 2>&1 || true)
+  # add-ons, while installed (name, script, the file that marks it installed): their own checks
+  local addon name script marker
+  for addon in "s3 proxy|ente-s3-proxy.sh|$CADDY_SITES/s3-proxy.caddy" "telegram bot|ente-tg-bot.sh|/etc/systemd/system/ente-tg-bot.service"; do
+    IFS='|' read -r name script marker <<<"$addon"
+    [[ -e $marker ]] || continue
+    echo "== $name"
+    if [[ -f $SCRIPT_DIR/$script ]]; then
+      out=$(bash "$SCRIPT_DIR/$script" check 2>&1 || true)
       printf '%s\n' "$out"
       FAILS=$((FAILS + $(grep -c '^  FAIL' <<<"$out" || true)))
-    else bad "the S3 proxy is installed but ente-s3-proxy.sh is not next to $0"; fi
-  fi
+    else bad "the $name is installed but $script is not next to $0"; fi
+  done
   echo "== backup"
   if systemctl is-enabled --quiet ente-backup.timer 2>/dev/null; then ok "timer enabled, next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value)"; else bad "ente-backup.timer not enabled"; fi
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
