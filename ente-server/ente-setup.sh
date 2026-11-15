@@ -1320,7 +1320,7 @@ PY
 # speedtest: for 30 minutes serve a download/upload test under https://api.$DOMAIN/speedtest-<random token>/ to measure the
 # connection between a device and this server (the photos themselves travel device <-> bucket, not through here).
 # A small local server streams random data and swallows uploads; Caddy gets the route through its admin API, so the
-# Caddyfile is untouched and the route is gone when the test ends (or at the next Caddy reload). Client: s3-speedtest docs.
+# Caddyfile is untouched and the route is gone when the test ends (or at the next Caddy reload).
 cmd_speedtest() {
   load_env
   local tok url port=8099
@@ -1373,7 +1373,6 @@ EOF
 Speed test endpoint is up for 30 minutes (stop earlier: systemctl stop ente-speedtest):
   $url
 
-Windows:      .\\vps-speedtest.ps1 -Url $url
 Linux/macOS:  curl -o /dev/null -w 'download: %{speed_download} bytes/s\\n' $url/down/100
               head -c 100000000 /dev/urandom > /tmp/up.bin && curl -o /dev/null -T /tmp/up.bin -w 'upload: %{speed_upload} bytes/s\\n' $url/up
 EOF

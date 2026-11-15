@@ -18,7 +18,6 @@ The full-featured previous version (local Silo storage, data disk, Storage Box, 
 | `ente-setup.sh` | the script |
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
-| `s3-speedtest.sh`, `vps-speedtest.ps1` | optional speed tests from a PC (see "Measuring connection speed") |
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
 | `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
 | `tests/` | tests (see "Tests") |
@@ -203,7 +202,8 @@ Remove: `systemctl disable --now awg-quick@awg0`, `ufw delete allow <AWG_PORT>/u
 
 The apps upload and download photos directly to the photo bucket with links museum signs. Where devices reach the bucket's
 endpoint badly (slow or blocked) but reach this server well, the add-on `ente-s3-proxy.sh` routes that traffic through the
-server instead, uploads included, and back again on demand. Measure first (next section): it only helps if the server is clearly faster.
+server instead, uploads included, and back again on demand. Measure first: it only helps if the server is clearly faster.
+`sudo ./ente-setup.sh speedtest` opens a test endpoint on the server for 30 minutes and prints `curl` lines for download and upload.
 
 1. DNS: an A (and AAAA) record for the proxy host, e.g. `s3.<domain>`, pointing at the server.
 2. `S3_PROXY_HOST=s3.<domain>` in `ente-setup.env`, then `sudo ./ente-s3-proxy.sh install`: the link rewriter service and the
@@ -237,7 +237,7 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 | `sudo bash tests/tg_bot_e2e.sh` | the server, `TG_BOT_USER_ID` set | the real bot as its real user with the real sudo rule and actions, against a fake Telegram (`tests/fake_telegram.py`): every command, strangers, groups, old messages, privileges, uninstall; runs a real backup |
 | `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |
 
-The two server tests leave the add-on as they found it (installed or not, on or off). The browser test opens registration for a throwaway account, deletes it
+`proxy_e2e.sh` and `tg_bot_e2e.sh` leave their add-on as they found it (installed or not, on or off). The browser test opens registration for a throwaway account, deletes it
 afterwards, closes registration again and removes the Playwright image.
 
 ## Notes and limits
