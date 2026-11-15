@@ -97,6 +97,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+MemoryMax=256M
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 Restart=always
 RestartSec=2
@@ -144,7 +145,7 @@ apply_caddy() {
 proxy_probe_url() {
   local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
   eval "$(museum_s3)"
-  M_KEY=$M_KEY M_SECRET=$M_SECRET M_ENDPOINT=$M_ENDPOINT M_REGION=$M_REGION M_BUCKET=$M_BUCKET P=$S3_PROXY_HOST python3 - <<'PY'
+  M_KEY=$M_KEY M_SECRET=$M_SECRET M_ENDPOINT=$M_ENDPOINT M_REGION=$M_REGION M_BUCKET=$M_BUCKET P=$S3_PROXY_HOST python3 -I - <<'PY'
 import os, boto3
 from botocore.config import Config
 e = os.environ
@@ -155,8 +156,11 @@ print(u.replace("https://%s/" % e["M_ENDPOINT"], "https://%s/" % e["P"], 1))
 PY
 }
 
-# proxy_checks [TRIES]: OK/FAIL lines (counted in FAILS). TRIES x 3 s to wait for a freshly added host's certificate.
-proxy_checks() {
+# proxy_checks [TRIES]: OK/FAIL lines (counted in FAILS): the parts that work in both states, then the state itself.
+proxy_checks() { proxy_checks_base "${1:-1}"; proxy_check_state; }
+
+# proxy_checks_base [TRIES]: rewriter, signed link through the proxy host, CORS, 404. TRIES x 3 s to wait for a new certificate.
+proxy_checks_base() {
   local out st i
   if systemctl is-active --quiet ente-s3-rewrite.service; then ok "link rewriter running"; else bad "link rewriter not running (journalctl -u ente-s3-rewrite)"; fi
   out=$(curl -sS -m 5 -D - "http://127.0.0.1:$REWRITE_PORT/ping" 2>&1 || true)
@@ -175,6 +179,11 @@ proxy_checks() {
   else bad "CORS preflight through the proxy not allowed (web uploads through the proxy will fail)"; fi
   st=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$S3_PROXY_HOST/" 2>&1 || true)
   if [[ $st == 404 ]]; then ok "proxy site refuses paths outside the bucket"; else bad "proxy site answers $st outside the bucket (expected 404)"; fi
+}
+
+# proxy_check_state: the API goes through the rewriter exactly when the proxy is on.
+proxy_check_state() {
+  local out
   out=$(curl -sS -m 10 -o /dev/null -D - "https://api.$DOMAIN/ping" 2>&1 || true)
   if [[ $(proxy_state) == on ]]; then
     if grep -qi '^x-ente-link-rewrite: on' <<<"$out"; then ok "proxy ON: bucket links point at https://$S3_PROXY_HOST"
@@ -197,17 +206,43 @@ cmd_install() {
   log "S3 proxy installed for https://$S3_PROXY_HOST ($(proxy_state))"
 }
 
-# switch on|off: install if needed, switch; `on` self-tests and goes back to the previous state if that fails.
-cmd_switch() {
-  local want=$1 was f0
+# The add-on's files, for rolling back a failed switch (snapshot_proxy DIR / restore_proxy DIR).
+proxy_files() { echo "$REWRITE_UNIT" "$REWRITE_PY" "$PROXY_SITE" "$CADDY_API_UPSTREAM" "$PROXY_STATE"; }
+snapshot_proxy() { local f i=0; for f in $(proxy_files); do i=$((i + 1)); [[ ! -e $f ]] || cp -p "$f" "$1/$i"; done; }
+restore_proxy() {
+  local f i=0
+  for f in $(proxy_files); do i=$((i + 1)); if [[ -e $1/$i ]]; then cp -p "$1/$i" "$f"; else rm -f "$f"; fi; done
+  [[ -e $CADDY_API_UPSTREAM ]] || render_api_upstream off >"$CADDY_API_UPSTREAM"
+  systemctl daemon-reload
+  if [[ -e $REWRITE_UNIT ]]; then systemctl restart ente-s3-rewrite.service || true; else systemctl stop ente-s3-rewrite.service 2>/dev/null || true; fi
+  systemctl reload-or-restart caddy || true
+}
+
+# do_switch on|off: install if needed; before `on` goes live, test everything that works in both states; then switch.
+do_switch() {
+  local want=$1 f0
   cmd_install
-  was=$(proxy_state)
+  if [[ $want == on ]]; then
+    f0=$FAILS; proxy_checks_base 20
+    ((FAILS == f0)) || die "proxy self-test failed before switching"
+  fi
   set_proxy_state "$want"
   apply_caddy
-  if [[ $want == on ]]; then
-    f0=$FAILS; proxy_checks 20
-    if ((FAILS > f0)); then set_proxy_state "$was"; apply_caddy; die "proxy self-test failed; left it $was"; fi
+  f0=$FAILS; proxy_check_state
+  ((FAILS == f0)) || die "proxy self-test failed: the API does not follow the switch"
+}
+
+# switch on|off: do_switch; any failure puts the add-on's files and state back as they were.
+cmd_switch() {
+  local want=$1 was snap
+  proxy_load_env
+  was=$(proxy_state)
+  snap=$(mktemp -d); snapshot_proxy "$snap"
+  if ! (do_switch "$want"); then
+    restore_proxy "$snap"; rm -rf "$snap"
+    die "S3 proxy not switched $want; everything is back as it was ($was)"
   fi
+  rm -rf "$snap"
   log "S3 proxy $want (was $was)"
 }
 

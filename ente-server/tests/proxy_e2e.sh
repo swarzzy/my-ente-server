@@ -89,8 +89,14 @@ prx off
 sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=no-dns-e2e.$DOMAIN/" ente-setup.env >"$T/bad.env"
 ENV_FILE=$T/bad.env "$PROXYSH" on </dev/null >"$T/out" 2>&1; RC=$?
 check "proxy on fails when the proxy host does not work" '[[ $RC -ne 0 ]] && grep -q "self-test failed" "$T/out"' "$(tail -5 "$T/out")"
+check "and puts the add-on's files back (no trace of the bad host)" '! grep -rq no-dns-e2e /etc/caddy /etc/systemd/system/ente-s3-rewrite.service'
 check "and leaves the proxy off" '[[ $(cat $STATE) == off ]] && ! api_rewrites'
 prx off; check "the real config is back" '[[ $RC -eq 0 ]] && caddy_has_s3 && ! grep -rq no-dns-e2e /etc/caddy' "$(cat "$T/out")"
+
+echo "== a broken add-on setting fails the main check"
+sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=/" ente-setup.env >"$T/none.env"
+ENV_FILE=$T/none.env "$SETUP" check </dev/null >"$T/out" 2>&1; RC=$?
+check "ente-setup.sh check fails when the add-on's check cannot run" '[[ $RC -ne 0 ]] && grep -q "FAIL  the s3 proxy check did not run" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
 
 echo "== links handed out while on keep working after off"
 prx on

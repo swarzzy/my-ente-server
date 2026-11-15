@@ -78,7 +78,12 @@ fi
 
 echo "== root helper"
 printf '#!/bin/bash\necho "forwarded: $*"\n' >"$T/fake-bot.sh"
-in_bot "$U" "" "BOT_SCRIPT=$T/fake-bot.sh bot_helper" >"$T/helper"; chmod 755 "$T/helper"
+in_bot "$U" "" "bot_helper" >"$T/helper.real"
+check "the real helper starts actions as a transient unit, from /, with a time limit" 'grep -q "^cd / " "$T/helper.real" && grep -q "^exec systemd-run .*--wait --pipe.*RuntimeMaxSec=" "$T/helper.real"' "$(cat "$T/helper.real")"
+( cd "$T" && BOT_RUN="env -i" in_bot "$U" "" "BOT_SCRIPT=$T/fake-bot.sh bot_helper" ) >"$T/helper"; chmod 755 "$T/helper"
+printf '#!/bin/bash\necho "forwarded: $* cwd=$PWD leak=${LEAK:-none}"\n' >"$T/fake-bot.sh"
+out=$(cd "$T" && LEAK=secret "$T/helper" status 2>&1); check "helper passes on neither the working directory nor the environment" '[[ $out == "forwarded: action status cwd=/ leak=none" ]]' "$out"
+printf '#!/bin/bash\necho "forwarded: $*"\n' >"$T/fake-bot.sh"
 for a in status check backup proxy-on proxy-off proxy-status; do
   out=$("$T/helper" "$a" 2>&1); check "helper forwards '$a'" '[[ $out == "forwarded: action $a" ]]' "$out"
 done
@@ -87,6 +92,14 @@ for a in "rm" "status;id" "" "../x" "--help" "STATUS"; do
 done
 out=$("$T/helper" status check 2>&1); rc=$?; check "helper refuses two arguments" '[[ $rc -eq 2 && $out != *forwarded* ]]' "$out"
 check "helper does not pass the environment through (absolute paths only)" '! grep -qE "\\\$[A-Z_]+[^0-9]" <(grep -v "^#" "$T/helper" | grep -v "\\\$1\|\\\$#")' "$(cat "$T/helper")"
+
+echo "== failing actions still report"
+if [[ $EUID -ne 0 ]]; then # here ente-setup.sh check fails with "run as root": the reply must carry that, not be empty
+  out=$(in_bot "$U" "" 'bot_load_env; act_check; echo "rc=$?"' 2>&1)
+  check "a failing check returns its output and exit code" '[[ $out == *"run as root"* && $out == *"rc=1"* ]]' "$out"
+fi
+out=$(in_bot "$U" "" 'bot_load_env; bot_root_files' 2>&1)
+check "the root-only check covers the scripts, the env file and the secrets file" '[[ $out == *"ente-tg-bot.sh"* && $out == *"ente-setup.sh"* && $out == *"ente-s3-proxy.sh"* && $out == *"$T/env"* && $out == *"$T/secrets"* ]]' "$out"
 
 echo "== the scripts the helper runs as root must be root's alone"
 mkdir -p "$T/own"; touch "$T/own/a"; chmod 755 "$T/own"; chmod 644 "$T/own/a"

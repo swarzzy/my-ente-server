@@ -58,6 +58,15 @@ as_bot touch /etc/ente-e2e-probe; RC=$?; check "cannot write system files itself
 as_bot cat /etc/ente-tg-bot/token; RC=$?; check "cannot read the token file itself (only via its systemd credential)" '[[ $RC -ne 0 ]]'
 run "$HELPER" nonsense; check "the helper refuses unknown actions even for root" '[[ $RC -eq 2 ]]'
 
+echo "== nothing of the bot user's reaches root"
+rm -f /tmp/ente-e2e-pwned
+runuser -u ente-tg-bot -- sh -c 'cd /var/lib/ente-tg-bot && printf "open(\"/tmp/ente-e2e-pwned\", \"w\").write(\"x\")\n" > yaml.py && cp yaml.py shlex.py && cp yaml.py boto3.py && sudo -n /usr/local/sbin/ente-tg-action proxy-status; sudo -n /usr/local/sbin/ente-tg-action check' </dev/null >"$T/out" 2>&1
+check "python modules planted in the bot's directory are not loaded by root" '[[ ! -e /tmp/ente-e2e-pwned ]]' "$(tail -3 "$T/out")"
+check "and the action still ran" 'grep -q "OK" "$T/out"' "$(tail -3 "$T/out")"
+rm -f /var/lib/ente-tg-bot/yaml.py /var/lib/ente-tg-bot/shlex.py /var/lib/ente-tg-bot/boto3.py /tmp/ente-e2e-pwned
+check "Caddy's admin API is closed to the bot user" '! runuser -u ente-tg-bot -- curl -s -m 5 -o /dev/null --unix-socket /run/caddy/admin.sock http://localhost/config/ && ! runuser -u ente-tg-bot -- curl -s -m 5 -o /dev/null http://localhost:2019/config/'
+check "and open to root" 'curl -fsS -m 5 -o /dev/null --unix-socket /run/caddy/admin.sock http://localhost/config/'
+
 echo "== the bot against a fake Telegram"
 python3 tests/fake_telegram.py "$T/port" & FAKE=$!
 for i in $(seq 1 50); do [[ -s $T/port ]] && break; sleep 0.1; done
@@ -96,6 +105,22 @@ else
   ask "/proxy" 2 60; check "/proxy without the add-on says it is not installed" '[[ $(reply) == *"not installed"* ]]' "$(reply)"
 fi
 
+if [[ $PROXY_INSTALLED == yes ]]; then
+  systemctl stop ente-s3-rewrite.service
+  ask "/check" 2 180; check "a failing /check says what failed" '[[ $(reply) == "❌"* && $(reply) == *"FAIL  link rewriter not running"* ]]' "$(reply)"
+  systemctl start ente-s3-rewrite.service; sleep 3
+fi
+pid=$(systemctl show -p MainPID --value ente-tg-bot-e2e.service); n0=$(nsent)
+say "{\"text\": \"/check\", \"from\": $OWNER}"
+for ((i = 0; i < 50; i++)); do pgrep -f "ente-tg-bot.sh action check" >/dev/null && break; sleep 0.2; done
+systemctl kill -s KILL ente-tg-bot-e2e.service; sleep 2
+check "an action keeps running when the bot is killed (it is a unit of its own)" '! systemctl is-active --quiet ente-tg-bot-e2e.service && pgrep -f "ente-tg-bot.sh action check" >/dev/null'
+for ((i = 0; i < 120; i++)); do pgrep -f "ente-tg-bot.sh action check" >/dev/null || break; sleep 1; done
+systemctl reset-failed ente-tg-bot-e2e.service 2>/dev/null
+systemd-run --quiet --unit ente-tg-bot-e2e -p User=ente-tg-bot -p Group=ente-tg-bot -p LoadCredential=token:/etc/ente-tg-bot/token \
+  -p StateDirectory=ente-tg-bot-e2e /usr/bin/python3 /usr/local/lib/ente-setup/ente_tg_bot.py --user-id "$OWNER" \
+  --state-dir /var/lib/ente-tg-bot-e2e --action-cmd "sudo -n $HELPER" --api-base "$API" --poll-timeout 2
+sleep 3
 t0=$(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service)
 ask "/backup" 1 30; check "/backup: acknowledged at once" '[[ $(reply) == *"Backup started"* ]]' "$(reply)"
 ask "/status" 1 30; check "the bot answers while the backup runs" '[[ $(reply) == *"Containers:"* ]]' "$(reply)"

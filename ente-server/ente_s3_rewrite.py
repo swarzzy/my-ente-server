@@ -20,6 +20,7 @@ HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HOP = {"connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
        "proxy-authorization", "proxy-authenticate"}
+MAX_BODY = 16 << 20     # API request bodies are small JSON; photo data never comes through here
 MAX_REWRITE = 64 << 20  # JSON responses larger than this are passed through unchanged
 CHUNK = 64 << 10
 
@@ -73,6 +74,7 @@ def make_handler(cfg):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = 120  # socket timeout: a stalled client cannot hold a thread (and its buffered body) for ever
         server_version = "ente-s3-rewrite"
         sys_version = ""
 
@@ -85,7 +87,7 @@ def make_handler(cfg):
 
         def _request_body(self):
             if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
-                out = []
+                out, total = [], 0
                 while True:
                     line = self.rfile.readline(1024)
                     size = int(line.split(b";")[0].strip() or b"0", 16)
@@ -93,9 +95,14 @@ def make_handler(cfg):
                         while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
                             pass  # trailers
                         return b"".join(out)
+                    total += size
+                    if total > MAX_BODY:
+                        raise OverflowError
                     out.append(self.rfile.read(size))
                     self.rfile.readline(1024)
             n = int(self.headers.get("Content-Length") or 0)
+            if n > MAX_BODY:
+                raise OverflowError
             return self.rfile.read(n) if n > 0 else None
 
         def _drop(self, headers):
@@ -103,7 +110,18 @@ def make_handler(cfg):
             return HOP | listed
 
         def _proxy(self):
-            body = self._request_body()
+            try:
+                body = self._request_body()
+            except OverflowError:  # not read: answer and drop the connection
+                msg = b'{"code":"TOO_LARGE","message":"request body too large"}'
+                self.close_connection = True
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(msg)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(msg)
+                return
             drop = self._drop(self.headers)
             fwd = {k: v for k, v in self.headers.items() if k.lower() not in drop and k.lower() not in ("accept-encoding", "content-length")}
             fwd["Accept-Encoding"] = "identity"

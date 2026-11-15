@@ -14,6 +14,7 @@ Usage: ente-tg-bot --user-id ID --state-dir DIR --action-cmd "sudo -n /usr/local
        [--token-file FILE (default: $CREDENTIALS_DIRECTORY/token)] [--api-base https://api.telegram.org]
 """
 import argparse
+import http.client
 import json
 import os
 import shlex
@@ -54,7 +55,7 @@ class TelegramAPI:
             except ValueError:
                 desc = ""
             raise ApiError("%s: HTTP %d %s" % (method, e.code, desc)) from None
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:  # incl. a cut-off response
             raise ApiError("%s: %s" % (method, getattr(e, "reason", None) or type(e).__name__)) from None
         if not doc.get("ok"):
             raise ApiError("%s: %s" % (method, doc.get("description", "not ok")))
@@ -136,6 +137,10 @@ class Bot:
                 delay = 1
             except ApiError as e:
                 self.log("Telegram API: %s (retrying in %d s)" % (e, delay))
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+            except Exception as e:  # noqa: BLE001 - never exit: a restart would lose replies of running actions
+                self.log("unexpected %s (retrying in %d s)" % (type(e).__name__, delay))
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
 
@@ -234,13 +239,15 @@ def main(argv=None):
     token = open(a.token_file).read().strip()
     bot = Bot(TelegramAPI(a.api_base, token, a.poll_timeout), a.user_id, CommandRunner(shlex.split(a.action_cmd)), a.state_dir)
     bot.log("ente-tg-bot started for user %d" % a.user_id)
-    for i in range(10):
-        try:
-            bot.register_commands()
-            break
-        except ApiError as e:
-            bot.log("could not register the command menu: %s" % e)
-            time.sleep(min(2 ** i, 60))
+    def register():  # in the background: the bot must answer at once, whatever setMyCommands does
+        for i in range(10):
+            try:
+                bot.register_commands()
+                return
+            except ApiError as e:
+                bot.log("could not register the command menu: %s" % e)
+                time.sleep(min(2 ** i, 60))
+    threading.Thread(target=register, daemon=True).start()
     bot.serve_forever()
 
 

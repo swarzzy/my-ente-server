@@ -20,6 +20,8 @@ CADDYFILE=$CADDY_DIR/Caddyfile
 # hooks for add-ons such as ente-s3-proxy.sh: the API's upstream (one reverse_proxy directive) and extra site blocks
 CADDY_API_UPSTREAM=$CADDY_DIR/ente.d/api-upstream.caddy
 CADDY_SITES=$CADDY_DIR/ente.d/sites
+# Caddy's admin API on a socket only caddy and root can use (the default, localhost:2019, is open to every local user)
+CADDY_ADMIN_SOCK=/run/caddy/admin.sock
 QUICKSTART_URL=https://raw.githubusercontent.com/ente/ente/main/server/quickstart.sh
 INT_BEGIN='# BEGIN ente-setup internal'
 INT_END='# END ente-setup internal'
@@ -59,7 +61,7 @@ need() { local v; for v in "$@"; do [[ -n ${!v} ]] || die "$v is not set in $ENV
 # url_ok URL [TRIES]: poll URL every 3s until it answers 2xx; false after TRIES (default 20).
 url_ok() { local i; for i in $(seq 1 "${2:-20}"); do curl -fsS -m 5 "$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
 # yaml_ok FILE: die unless FILE parses as YAML.
-yaml_ok() { python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$1" || die "$1 is not valid YAML"; }
+yaml_ok() { python3 -I -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$1" || die "$1 is not valid YAML"; }
 
 # write_file FILE [MODE] < content: replaces FILE only if content differs.
 write_file() {
@@ -280,7 +282,7 @@ run_quickstart() {
 apply_edits() {
   local c=$ENTE_DIR/compose.yaml m=$ENTE_DIR/museum.yaml p
   chmod 700 "$ENTE_DIR"
-  python3 - "$c" "$m" <<'PY' || die "quickstart output no longer matches the expected layout; not patching blindly"
+  python3 -I - "$c" "$m" <<'PY' || die "quickstart output no longer matches the expected layout; not patching blindly"
 import sys, yaml
 c = yaml.safe_load(open(sys.argv[1])); m = yaml.safe_load(open(sys.argv[2]))
 s = c["services"]
@@ -315,7 +317,7 @@ PY
 # Point the b2-eu-cen bucket at the external photo bucket and drop the two unused buckets.
 edit_museum_s3() {
   S3_ENDPOINT=$S3_ENDPOINT S3_REGION=$S3_REGION S3_BUCKET=$S3_BUCKET S3_ACCESS_KEY=$S3_ACCESS_KEY S3_SECRET_KEY=$S3_SECRET_KEY \
-    python3 - "$1" <<'PY' || die "museum.yaml: S3 edit failed (quickstart layout changed?)"
+    python3 -I - "$1" <<'PY' || die "museum.yaml: S3 edit failed (quickstart layout changed?)"
 import json, os, re, sys, yaml
 path = sys.argv[1]; e = os.environ
 vals = {"key": e["S3_ACCESS_KEY"], "secret": e["S3_SECRET_KEY"], "endpoint": e["S3_ENDPOINT"],
@@ -344,7 +346,7 @@ PY
 
 # museum_s3: eval "$(museum_s3)" sets M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET from museum.yaml (the source of truth after install).
 museum_s3() {
-  python3 - "$ENTE_DIR/museum.yaml" <<'PY'
+  python3 -I - "$ENTE_DIR/museum.yaml" <<'PY'
 import shlex, sys, yaml
 b = yaml.safe_load(open(sys.argv[1]))["s3"]["b2-eu-cen"]
 for k in ("key", "secret", "endpoint", "region", "bucket"): print("M_%s=%s" % (k.upper(), shlex.quote(str(b[k]))))
@@ -353,7 +355,7 @@ PY
 
 # true when museum.yaml already points at the configured photo bucket (and is not the quickstart's local MinIO)
 museum_s3_configured() {
-  python3 - "$ENTE_DIR/museum.yaml" "$S3_ENDPOINT" "$S3_BUCKET" <<'PY'
+  python3 -I - "$ENTE_DIR/museum.yaml" "$S3_ENDPOINT" "$S3_BUCKET" <<'PY'
 import sys, yaml
 b = yaml.safe_load(open(sys.argv[1]))["s3"]["b2-eu-cen"]
 sys.exit(not (b["endpoint"] == sys.argv[2] and b["bucket"] == sys.argv[3] and not str(b["key"]).startswith("minio-user-")))
@@ -366,7 +368,7 @@ s3_prepare() {
   eval "$(museum_s3)"
   dpkg -s python3-boto3 >/dev/null 2>&1 || apt_install python3-boto3
   S3_ENDPOINT=$M_ENDPOINT S3_REGION=$M_REGION S3_BUCKET=$M_BUCKET S3_ACCESS_KEY=$M_KEY S3_SECRET_KEY=$M_SECRET S3_CORS_ORIGINS=$S3_CORS_ORIGINS \
-    python3 - <<'PY' || die "photo bucket check failed"
+    python3 -I - <<'PY' || die "photo bucket check failed"
 import os, boto3
 from botocore.config import Config
 e = os.environ
@@ -491,6 +493,10 @@ render_caddyfile() {
     csp+=" object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'\""
   fi
   cat <<EOF
+{
+	admin unix/$CADDY_ADMIN_SOCK|0220
+}
+
 (sec) {
 	header {
 		defer
@@ -539,11 +545,21 @@ ensure_caddy_hooks() {
 
 # write_caddyfile: write $CADDYFILE from render_caddyfile, validate it and reload Caddy (graceful, cheap when unchanged).
 write_caddyfile() {
+  local tmp h0
   ensure_caddy_hooks
-  render_caddyfile | write_file "$CADDYFILE"
-  caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile invalid (caddy validate --config $CADDYFILE)"
+  tmp=$(mktemp); render_caddyfile >"$tmp"
+  if ! caddy validate --config "$tmp" --adapter caddyfile >/dev/null 2>&1; then
+    cp "$tmp" /root/Caddyfile.rejected; rm -f "$tmp"
+    die "generated Caddyfile is invalid; the old one stays (see: caddy validate --config /root/Caddyfile.rejected --adapter caddyfile)"
+  fi
+  write_file "$CADDYFILE" <"$tmp"; rm -f "$tmp"
+  h0=$(cat /etc/systemd/system/caddy.service.d/ente.conf 2>/dev/null || true)
+  install -d -m 755 /etc/systemd/system/caddy.service.d
+  printf '[Service]\nRuntimeDirectory=caddy\nRuntimeDirectoryMode=0755\n' | write_file /etc/systemd/system/caddy.service.d/ente.conf
+  [[ $h0 == "$(cat /etc/systemd/system/caddy.service.d/ente.conf)" ]] || systemctl daemon-reload
   systemctl enable caddy >/dev/null 2>&1
-  systemctl reload-or-restart caddy
+  # reload talks to the admin API named in the new file: restart once when the running Caddy is not on the socket yet
+  if [[ -S $CADDY_ADMIN_SOCK ]]; then systemctl reload-or-restart caddy; else systemctl restart caddy; fi
 }
 
 # Shared by install and restore: patch the Ente config, verify the photo bucket, write the Caddyfile and compose override.
@@ -638,7 +654,6 @@ cmd_update() {
     warn "no backup configured yet; updating without a rollback point"
   fi
   ensure_pins
-  cp -p "$PINS" "$PINS.prev"
   for svc in museum web; do
     repo=$(repo_of $svc); old=$(pin_of $svc)
     docker pull -q "$repo:latest" >/dev/null || die "cannot pull $repo:latest"
@@ -646,6 +661,7 @@ cmd_update() {
     if [[ $ref != "$old" ]]; then changed=1; log "$svc: ${old##*@sha256:} -> ${ref##*@sha256:}"; fi
     new+="$svc $ref"$'\n'
   done
+  if ((changed)); then cp -p "$PINS" "$PINS.prev"; fi # the rollback point: only replaced when a build really changes
   printf '%s' "$new" | write_file "$PINS" 600
   write_override
   dc pull -q postgres
@@ -663,7 +679,7 @@ rclone_set() {
   local conf
   conf=$(rclone config file | tail -1)
   mkdir -p "$(dirname "$conf")"
-  (umask 077; python3 -c '
+  (umask 077; python3 -I -c '
 import configparser, sys
 conf, remote = sys.argv[1:]
 cp = configparser.RawConfigParser(); cp.optionxform = str; cp.read(conf)
@@ -759,7 +775,7 @@ EOF
     log "yandex remote created (list and upload work)"
   fi
   local pw
-  pw=$(python3 -c '
+  pw=$(python3 -I -c '
 import configparser, sys
 cp = configparser.RawConfigParser(); cp.read(sys.argv[1]); print(cp.get("backup-crypt", "password"))
 ' "$(rclone config file | tail -1)") && [[ -n $pw ]] || die "backup-crypt remote has no passphrase; run make_backup_remotes first"
@@ -781,7 +797,7 @@ check_backup_owner() {
   if ! rclone cat "$crypt:museum.yaml" >"$theirs" 2>/dev/null || [[ ! -s $theirs ]]; then
     rm -f "$theirs"; die "$name already holds a backup that this passphrase cannot read; refusing to overwrite it"
   fi
-  if ! python3 - "$ENTE_DIR/museum.yaml" "$theirs" <<'PY'
+  if ! python3 -I - "$ENTE_DIR/museum.yaml" "$theirs" <<'PY'
 import sys, yaml
 a, b = (yaml.safe_load(open(f))["key"]["encryption"] for f in sys.argv[1:])
 sys.exit(a != b)
@@ -1043,6 +1059,9 @@ cmd_restore() {
   rclone copy "$src_crypt:" "$tmp" --checkers 4
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
+  # keep the dumps: the next backup syncs /var/backups/ente to the backup and would delete every dump missing here
+  install -d -m 700 /var/backups/ente
+  cp -p "$tmp"/ente_db-*.dump /var/backups/ente/
   install -d -m 700 "$ENTE_DIR"; touch "$ENTE_DIR/.restore-incomplete"
   install -m 600 "$tmp/compose.yaml" "$ENTE_DIR/compose.yaml"
   install -m 644 "$tmp/museum.yaml" "$ENTE_DIR/museum.yaml"
@@ -1112,6 +1131,9 @@ cmd_check() {
   for s in minio socat; do
     if [[ -z $(dc ps -q "$s" 2>/dev/null || true) ]]; then ok "$s not running"; else bad "$s is running"; fi
   done
+  if internal_locked; then ok "sign-ups closed"
+  elif [[ -n $(internal_admin) ]]; then bad "sign-ups are OPEN although lockdown was done (re-run lockdown)"
+  else warn "sign-ups are open: run lockdown once the family has signed up"; fi
   echo "== ports"
   for p in 8080 3000 3002; do
     addrs=$(ss -Htln "sport = :$p" | awk '{print $4}')
@@ -1149,9 +1171,10 @@ cmd_check() {
     [[ -e $marker ]] || continue
     echo "== $name"
     if [[ -f $SCRIPT_DIR/$script ]]; then
-      out=$(bash "$SCRIPT_DIR/$script" check 2>&1 || true)
+      out=$(bash "$SCRIPT_DIR/$script" check 2>&1) && i=0 || i=$?
       printf '%s\n' "$out"
       FAILS=$((FAILS + $(grep -c '^  FAIL' <<<"$out" || true)))
+      if ((i != 0)) && ! grep -q '^  FAIL' <<<"$out"; then bad "the $name check did not run (exit $i): $(tail -1 <<<"$out" | cut -c1-160)"; fi
     else bad "the $name is installed but $script is not next to $0"; fi
   done
   echo "== backup"
@@ -1169,7 +1192,8 @@ cmd_check() {
   elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
   else ok "last backup finished $ts: $res"; fi
   ex=$(new_uploads s3)
-  if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
+  if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then warn "a backup is running: comparison with the backup skipped"
+  elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   rm -f "$ex"
   s=$(cat /var/lib/ente-backup/verify-ok 2>/dev/null || true)
@@ -1196,7 +1220,8 @@ cmd_check() {
     elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last good Yandex Disk backup is older than 36 h ($ts)"
     else ok "last good Yandex Disk backup $ts"; fi
     ex=$(new_uploads yandex)
-    if out=$(rclone check "ente-s3:$S3_BUCKET" "${YANDEX_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is on Yandex Disk"
+    if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then warn "a backup is running: comparison with the backup skipped"
+  elif out=$(rclone check "ente-s3:$S3_BUCKET" "${YANDEX_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is on Yandex Disk"
     else bad "rclone check (Yandex) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
     rm -f "$ex"
     out=$(rclone about yandex: 2>/dev/null | tr -s ' ' | tr '\n' ' ' || true)
@@ -1275,7 +1300,7 @@ cmd_verify() {
       else bad "restored dump looks incomplete: $rt tables, $ru users, $rf files (live: $lt tables, $lu users, $lf files)"; fi
     fi
     echo "== keys"
-    if python3 - "$ENTE_DIR/museum.yaml" "$VERIFY_TMP/museum.yaml" <<'PY' 2>/dev/null
+    if python3 -I - "$ENTE_DIR/museum.yaml" "$VERIFY_TMP/museum.yaml" <<'PY' 2>/dev/null
 import sys, yaml
 a, b = (yaml.safe_load(open(f)) for f in sys.argv[1:])
 sys.exit(not (a["key"] == b["key"] and a["jwt"] == b["jwt"]))
@@ -1328,19 +1353,19 @@ ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 EOF
   systemctl stop ente-speedtest.service >/dev/null 2>&1 || true
   systemctl reset-failed ente-speedtest.service >/dev/null 2>&1 || true
-  curl -fsS -m 5 -o /dev/null -X DELETE http://localhost:2019/id/ente-speedtest 2>/dev/null || true
+  curl -fsS -m 5 -o /dev/null --unix-socket "$CADDY_ADMIN_SOCK" -X DELETE http://localhost/id/ente-speedtest 2>/dev/null || true
   [[ -z $(ss -Htln "sport = :$port") ]] || die "port $port is in use"
   tok=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
   systemd-run --quiet --unit ente-speedtest --description "Ente speed test endpoint (temporary)" -p DynamicUser=yes -p RuntimeMaxSec=1800 \
-    -p ExecStopPost="/usr/bin/curl -fsS -m 5 -o /dev/null -X DELETE http://localhost:2019/id/ente-speedtest" \
+    -p ExecStopPost="+/usr/bin/curl -fsS -m 5 -o /dev/null --unix-socket $CADDY_ADMIN_SOCK -X DELETE http://localhost/id/ente-speedtest" \
     /usr/local/bin/ente-speedtest "$port"
   # first in the route list: the Caddyfile's host routes are terminal
-  curl -fsS -m 5 -o /dev/null -X PUT -H 'Content-Type: application/json' http://localhost:2019/config/apps/http/servers/srv0/routes/0 -d @- <<EOF ||
+  curl -fsS -m 5 -o /dev/null --unix-socket "$CADDY_ADMIN_SOCK" -X PUT -H 'Content-Type: application/json' http://localhost/config/apps/http/servers/srv0/routes/0 -d @- <<EOF ||
 {"@id": "ente-speedtest", "terminal": true,
  "match": [{"host": ["api.$DOMAIN"], "path": ["/speedtest-$tok/*"]}],
  "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:$port"}], "flush_interval": -1}]}
 EOF
-    { systemctl stop ente-speedtest.service; die "could not add the route to Caddy (admin API on localhost:2019)"; }
+    { systemctl stop ente-speedtest.service; die "could not add the route to Caddy (admin API on $CADDY_ADMIN_SOCK)"; }
   url=https://api.$DOMAIN/speedtest-$tok
   url_ok "$url/down/1" 5 || { systemctl stop ente-speedtest.service; die "the test endpoint does not answer"; }
   cat <<EOF
@@ -1423,7 +1448,7 @@ EOF
 # awg_genconf IP: keys, random obfuscation parameters (tried on a throwaway interface first), the server config and ONE
 # shared client config. Prints no secret.
 awg_genconf() {
-  python3 - "$1" "$AWG_PORT" "$AWG_CONF" "$AWG_CLIENT" "$AWG_NAT" <<'PY'
+  python3 -I - "$1" "$AWG_PORT" "$AWG_CONF" "$AWG_CLIENT" "$AWG_NAT" <<'PY'
 import os, random, subprocess, sys, tempfile
 
 R = random.SystemRandom()

@@ -231,6 +231,27 @@ class RewriterTest(unittest.TestCase):
             self.assertEqual(json.loads(data), {"message": "pong"})
         c.close()
 
+    def test_oversized_request_bodies_are_refused_not_buffered(self):
+        old, rw.MAX_BODY = rw.MAX_BODY, 1000
+        try:
+            r, data = self.req("POST", "/echo", body=b"x" * 2000)
+            self.assertEqual(r.status, 413)
+            self.assertEqual(FakeMuseum.seen, [])  # never forwarded
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            c.putrequest("POST", "/echo")
+            c.putheader("Transfer-Encoding", "chunked")
+            c.endheaders()
+            c.send(b"7d0\r\n" + b"x" * 2000 + b"\r\n0\r\n\r\n")
+            self.assertEqual(c.getresponse().status, 413)
+            c.close()
+            r, data = self.req("POST", "/echo", body=b"x" * 900)
+            self.assertEqual(r.status, 200)
+        finally:
+            rw.MAX_BODY = old
+
+    def test_handler_has_a_socket_timeout(self):
+        self.assertTrue(0 < rw.make_handler(self.proxy.RequestHandlerClass.__mro__ and rw.Config(("127.0.0.1", 0), ("127.0.0.1", 1), REAL, PROXY, BUCKET)).timeout <= 300)
+
     def test_parallel_requests(self):
         # a burst of simultaneous connections (the app loads many thumbnails at once) must not be refused
         n, results, errors = 100, [], []

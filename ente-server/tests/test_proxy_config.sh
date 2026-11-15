@@ -70,6 +70,7 @@ in_setup "" 'load_env; ensure_caddy_hooks; render_caddyfile' >"$T/main.caddy" 2>
 check "renders" '[[ -s $T/main.caddy && ! -s $T/main.err ]]' "$(cat "$T/main.err")"
 check "API upstream comes from the hook file" 'awk "/^api\./,/^}/" "$T/main.caddy" | grep -q "^	import $T/caddy/ente.d/api-upstream.caddy$"' "$(awk '/^api\./,/^}/' "$T/main.caddy")"
 check "extra sites are imported from ente.d/sites" 'grep -q "^import $T/caddy/ente.d/sites/\*.caddy$" "$T/main.caddy"'
+check "Caddy's admin API is on a socket, not on localhost:2019" 'grep -q "^	admin unix//run/caddy/admin.sock|0220$" "$T/main.caddy"'
 check "no proxy code left in the main Caddyfile" '! grep -qE "8081|s3\.photos|ente_s3_rewrite" "$T/main.caddy"'
 check "ensure_caddy_hooks creates the sites directory" '[[ -d $T/caddy/ente.d/sites ]]'
 check "the sites directory is never empty (an empty import glob makes Caddy warn)" '[[ -n $(ls "$T/caddy/ente.d/sites"/*.caddy 2>/dev/null) ]]'

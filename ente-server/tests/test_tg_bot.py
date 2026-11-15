@@ -292,6 +292,13 @@ class BotTest(unittest.TestCase):
             api.call("getMe")
         self.assertNotIn(TOKEN.split(":")[1], str(cm.exception))
 
+    def test_a_cut_off_response_is_an_api_error_not_a_crash(self):
+        import http.client
+        from unittest import mock
+        with mock.patch("urllib.request.urlopen", side_effect=http.client.IncompleteRead(b"{")):
+            with self.assertRaises(tb.ApiError):
+                self.bot.api.call("getUpdates")
+
     def test_start_registers_the_command_menu_for_the_owner_only(self):
         self.bot.register_commands()
         calls = [b for m, b in self.srv.calls if m == "setMyCommands"]

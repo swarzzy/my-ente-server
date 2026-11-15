@@ -10,7 +10,7 @@
 # accepts only private messages from TG_BOT_USER_ID and maps commands to six fixed action names. The only thing it may
 # run as root is /usr/local/sbin/ente-tg-action with one of those names (a sudo rule listing exactly those six command
 # lines); the helper checks the name again and runs `ente-tg-bot.sh action NAME`. Both scripts must be root's alone.
-BOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+BOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) # the real path: it is embedded in the root helper
 # shellcheck source=ente-setup.sh
 . "$BOT_DIR/ente-setup.sh" # its helpers and config; its own main does not run when sourced
 BOT_USER=ente-tg-bot
@@ -22,6 +22,15 @@ BOT_HELPER=/usr/local/sbin/ente-tg-action
 BOT_SCRIPT=${BOT_SCRIPT:-$BOT_DIR/ente-tg-bot.sh}
 ALERT_ENV=${ALERT_ENV:-/etc/ente-alert.env}
 BOT_ACTIONS="status check backup proxy-on proxy-off proxy-status"
+# How the helper starts an action: as a transient unit of its own, so it gets a clean environment and working directory
+# (nothing of the bot user's reaches root), survives a restart of the bot, and is stopped after 6 hours.
+BOT_RUN=${BOT_RUN:-systemd-run --quiet --wait --pipe --collect -p RuntimeMaxSec=21600}
+
+# bot_root_files: everything the actions run or source as root.
+bot_root_files() {
+  local f
+  for f in "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" "$BOT_DIR/ente-s3-proxy.sh" "$ENV_FILE" "$SECRETS_FILE"; do [[ ! -e $f ]] || echo "$f"; done
+}
 
 # bot_load_env: ente-setup.sh's config plus a valid TG_BOT_USER_ID (a person's id: positive).
 bot_load_env() {
@@ -100,7 +109,8 @@ case \$1 in
   status | check | backup | proxy-on | proxy-off | proxy-status) ;;
   *) echo "unknown action" >&2; exit 2 ;;
 esac
-exec /bin/bash "$BOT_SCRIPT" action "\$1"
+cd / || exit 1
+exec $BOT_RUN /bin/bash "$BOT_SCRIPT" action "\$1"
 EOF
 }
 
@@ -113,9 +123,10 @@ bot_checks() {
   else bad "bot may not run its actions (sudo rule $BOT_SUDOERS)"; fi
   if runuser -u "$BOT_USER" -- sudo -n -l /bin/bash >/dev/null 2>&1 || runuser -u "$BOT_USER" -- sudo -n -l "$BOT_HELPER" rm >/dev/null 2>&1
   then bad "bot may run more than its actions as root (check $BOT_SUDOERS)"; else ok "bot may run nothing else as root"; fi
-  if out=$(root_only_writable "$BOT_HELPER" "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" 2>&1); then ok "scripts run as root are root's alone"
+  # shellcheck disable=SC2046
+  if out=$(root_only_writable "$BOT_HELPER" $(bot_root_files) 2>&1); then ok "scripts run as root are root's alone"
   else bad "scripts the bot runs as root are writable by others: $out"; fi
-  n=$(journalctl -u ente-tg-bot.service --since -1h -q -o cat 2>/dev/null | grep -c 'Telegram API:' || true)
+  n=$(journalctl -u ente-tg-bot.service --since -1h -q -o cat 2>/dev/null | grep -cE '^[0-9-]+ [0-9:]+ Telegram API:' || true)
   if ((n <= 5)); then ok "bot reaches Telegram ($n errors in the last hour)"; else bad "bot cannot reach Telegram reliably: $n errors in the last hour"; fi
 }
 
@@ -154,7 +165,7 @@ act_status() {
 
 act_check() {
   local out rc
-  out=$(bash "$BOT_DIR/ente-setup.sh" check 2>&1); rc=$?
+  out=$(bash "$BOT_DIR/ente-setup.sh" check 2>&1) && rc=0 || rc=$?
   grep -E '^  (FAIL|WARN)' <<<"$out" | grep -v "check storage usage of both buckets" || true
   echo "$(grep -c '^  OK' <<<"$out") OK"
   tail -1 <<<"$out"
@@ -178,7 +189,7 @@ act_proxy() { # act_proxy on|off|status
   if [[ ! -f $BOT_DIR/ente-s3-proxy.sh || ! -e $CADDY_SITES/s3-proxy.caddy ]]; then
     echo "The S3 proxy is not installed (ente-s3-proxy.sh install)."; return 1
   fi
-  out=$(bash "$BOT_DIR/ente-s3-proxy.sh" "$1" 2>&1); rc=$?
+  out=$(bash "$BOT_DIR/ente-s3-proxy.sh" "$1" 2>&1) && rc=0 || rc=$?
   grep -vE '\] wrote |^\s*$' <<<"$out" | sed -E 's/^[0-9-]+ [0-9:]+ \[s3-proxy [a-z]+\] //' || true
   return $rc
 }
@@ -201,8 +212,9 @@ cmd_install() {
   token=$(bot_token)
   command -v sudo >/dev/null || die "sudo is not installed (run ente-setup.sh bootstrap)"
   [[ -f $BOT_DIR/ente_tg_bot.py ]] || die "ente_tg_bot.py is missing next to $0 (copy the whole ente-server folder)"
-  root_only_writable "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" ||
-    die "the scripts the bot runs as root must be owned by root and writable by root only (chown root: / chmod go-w)"
+  # shellcheck disable=SC2046
+  root_only_writable $(bot_root_files) ||
+    die "the files the bot's actions run as root must be owned by root and writable by root only (chown -R root: $BOT_DIR; chmod -R go-w $BOT_DIR)"
   TG_BOT_TOKEN=$token tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
   id "$BOT_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$BOT_USER"
   h0=$({ cat "$BOT_PY" "$BOT_UNIT" "$BOT_TOKEN_FILE" 2>/dev/null || true; } | sha256sum)
