@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
-# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|vpn>
+# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|proxy [on|off|status]|vpn>
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
 # Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
 set -euo pipefail
@@ -15,6 +15,10 @@ SECRETS_FILE=${SECRETS_FILE:-$SCRIPT_DIR/ente-setup.secrets}
 LOG=/var/log/ente-setup.log
 ENTE_DIR=/opt/my-ente
 PINS=$ENTE_DIR/image-pins
+CADDYFILE=${CADDYFILE:-/etc/caddy/Caddyfile}
+PROXY_STATE=${PROXY_STATE:-/var/lib/ente-setup/s3-proxy}
+REWRITE_PY=/usr/local/lib/ente-setup/ente_s3_rewrite.py
+REWRITE_PORT=8081
 QUICKSTART_URL=https://raw.githubusercontent.com/ente/ente/main/server/quickstart.sh
 INT_BEGIN='# BEGIN ente-setup internal'
 INT_END='# END ente-setup internal'
@@ -104,7 +108,7 @@ load_env() {
   S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-https://web.$DOMAIN,https://albums.$DOMAIN}
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
-  AWG_PORT=${AWG_PORT:-}; YANDEX_DIR=${YANDEX_DIR:-}; YANDEX_CLIENT_ID=${YANDEX_CLIENT_ID:-}; RESTORE_FROM=${RESTORE_FROM:-s3}; TG_CHAT_ID=${TG_CHAT_ID:-}
+  AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; YANDEX_DIR=${YANDEX_DIR:-}; YANDEX_CLIENT_ID=${YANDEX_CLIENT_ID:-}; RESTORE_FROM=${RESTORE_FROM:-s3}; TG_CHAT_ID=${TG_CHAT_ID:-}
   [[ ${1:-} != vpn ]] || return 0 # the VPN needs none of the Ente settings
   S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
@@ -120,6 +124,13 @@ load_env() {
   if [[ -n $YANDEX_DIR ]]; then
     [[ $YANDEX_DIR =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || die "YANDEX_DIR must be a relative folder path like ente-backup (letters, digits, . _ -)"
     YANDEX_ROOT=yandex:$YANDEX_DIR/
+  fi
+  if [[ -n $S3_PROXY_HOST ]]; then
+    [[ $S3_PROXY_HOST =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] ||
+      die "S3_PROXY_HOST must be a bare host name like s3.$DOMAIN (no https://)"
+    case $S3_PROXY_HOST in
+      "api.$DOMAIN" | "web.$DOMAIN" | "albums.$DOMAIN" | "$S3_ENDPOINT") die "S3_PROXY_HOST must be a host name of its own, not $S3_PROXY_HOST" ;;
+    esac
   fi
   [[ -z $HC_URL || $HC_URL =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/?\&=%:+-]*)?$ ]] || die "HC_URL must be an https:// ping URL without spaces or quotes"
   [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's ID starts with -)"
@@ -473,24 +484,28 @@ sync_internal() {
   yaml_ok "$m"
 }
 
-# Shared by install and restore: patch the Ente config, verify the photo bucket, write the Caddyfile and compose override.
-# Sets MUSEUM_CFG_CHANGED=1 when museum.yaml changed.
-configure_host() {
-  local h0; h0=$(sha256sum "$ENTE_DIR/museum.yaml")
-  apply_edits
-  s3_prepare
-  sync_internal
-  [[ $(sha256sum "$ENTE_DIR/museum.yaml") == "$h0" ]] || MUSEUM_CFG_CHANGED=1
+# render_caddyfile: print the Caddyfile for the current config and S3 proxy state (pure: writes nothing).
+render_caddyfile() {
   # Security headers. deferred, so they replace any the upstream sends. CSP only as Report-Only (CSP_REPORT_ONLY=yes):
   # violations show in the browser console, nothing is blocked. No CORS headers here: museum sets those itself.
-  local csp=''
+  local csp='' api
   if [[ $CSP_REPORT_ONLY == yes ]]; then
     csp="Content-Security-Policy-Report-Only \"default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';"
     csp+=" img-src 'self' blob: data:; media-src 'self' blob:; font-src 'self' data:; worker-src 'self' blob:;"
-    csp+=" connect-src 'self' https://api.$DOMAIN https://$S3_ENDPOINT https://$S3_BUCKET.$S3_ENDPOINT;"
+    csp+=" connect-src 'self' https://api.$DOMAIN https://$S3_ENDPOINT https://$S3_BUCKET.$S3_ENDPOINT${S3_PROXY_HOST:+ https://$S3_PROXY_HOST};"
     csp+=" object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'\""
   fi
-  write_file /etc/caddy/Caddyfile <<EOF
+  if [[ $(proxy_state) == on ]]; then
+    # through the link rewriter; museum directly if the rewriter does not answer (links then point at the bucket again)
+    api="reverse_proxy 127.0.0.1:$REWRITE_PORT 127.0.0.1:8080 {
+		lb_policy first
+		lb_try_duration 3s
+		fail_duration 10s
+	}"
+  else
+    api="reverse_proxy 127.0.0.1:8080"
+  fi
+  cat <<EOF
 (sec) {
 	header {
 		defer
@@ -504,14 +519,14 @@ configure_host() {
 (app) {
 	header {
 		defer
-		X-Frame-Options "DENY"
-		$csp
+		X-Frame-Options "DENY"${csp:+
+		$csp}
 	}
 }
 
 api.$DOMAIN {
 	import sec
-	reverse_proxy 127.0.0.1:8080
+	$api
 }
 web.$DOMAIN {
 	import sec
@@ -524,9 +539,186 @@ albums.$DOMAIN {
 	reverse_proxy 127.0.0.1:3002
 }
 EOF
-  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile invalid"
+  [[ -n $S3_PROXY_HOST ]] || return 0
+  # The S3 proxy site exists whenever S3_PROXY_HOST is set, so links handed out while the proxy was on keep working after
+  # it is turned off. It forwards only the photo bucket and only the methods the apps use, with the real endpoint as Host:
+  # pre-signed links sign the host, so the request must reach the provider as if sent there directly.
+  cat <<EOF
+$S3_PROXY_HOST {
+	import sec
+	@bucket {
+		path /$S3_BUCKET/*
+		method GET HEAD PUT POST OPTIONS
+	}
+	handle @bucket {
+		reverse_proxy https://$S3_ENDPOINT {
+			header_up Host $S3_ENDPOINT
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Proto
+			header_up -X-Forwarded-Host
+			flush_interval -1
+		}
+	}
+	handle {
+		respond 404
+	}
+}
+EOF
+}
+
+# write_caddyfile: write $CADDYFILE from render_caddyfile, validate it and reload Caddy (graceful, cheap when unchanged).
+write_caddyfile() {
+  render_caddyfile | write_file "$CADDYFILE"
+  caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile invalid (caddy validate --config $CADDYFILE)"
   systemctl enable caddy >/dev/null 2>&1
-  systemctl reload-or-restart caddy # graceful and cheap when nothing changed
+  systemctl reload-or-restart caddy
+}
+
+# ---------------------------------------------------------------- S3 proxy
+# With S3_PROXY_HOST set, photo uploads and downloads can be routed through this server: `proxy on` makes museum's
+# pre-signed bucket links point at https://$S3_PROXY_HOST/<bucket>/ (rewritten by ente-s3-rewrite between Caddy and museum),
+# and Caddy forwards that host to the real endpoint. `proxy off` returns to direct links. Toggling only reloads Caddy.
+# proxy_state: on|off (off when S3_PROXY_HOST is empty or the state file says anything else).
+proxy_state() { if [[ -n $S3_PROXY_HOST && $(cat "$PROXY_STATE" 2>/dev/null) == on ]]; then echo on; else echo off; fi; }
+# set_proxy_state on|off: persist the state (no-op without S3_PROXY_HOST).
+set_proxy_state() {
+  [[ -n $S3_PROXY_HOST ]] || return 0
+  install -d -m 755 "$(dirname "$PROXY_STATE")"
+  (umask 077; echo "$1" >"$PROXY_STATE")
+  chmod 600 "$PROXY_STATE"
+}
+
+# rewrite_unit: the systemd unit of the link rewriter.
+rewrite_unit() {
+  cat <<EOF
+[Unit]
+Description=Ente S3 link rewriter (pre-signed bucket links -> https://$S3_PROXY_HOST/$S3_BUCKET/)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 $REWRITE_PY --listen 127.0.0.1:$REWRITE_PORT --upstream 127.0.0.1:8080 --from-host $S3_ENDPOINT --to-host $S3_PROXY_HOST --bucket $S3_BUCKET
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# setup_s3_proxy: install (S3_PROXY_HOST set) or remove (empty) the link rewriter service. Restarts it only when changed.
+setup_s3_proxy() {
+  local h0 h1
+  if [[ -z $S3_PROXY_HOST ]]; then
+    if [[ -e /etc/systemd/system/ente-s3-rewrite.service ]]; then
+      systemctl disable --now ente-s3-rewrite.service >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/ente-s3-rewrite.service "$REWRITE_PY"
+      systemctl daemon-reload
+      log "S3 proxy removed (S3_PROXY_HOST empty)"
+    fi
+    rm -f "$PROXY_STATE"
+    return 0
+  fi
+  [[ -f $SCRIPT_DIR/ente_s3_rewrite.py ]] || die "ente_s3_rewrite.py is missing next to $0 (copy the whole ente-server folder)"
+  h0=$({ cat "$REWRITE_PY" /etc/systemd/system/ente-s3-rewrite.service 2>/dev/null || true; } | sha256sum) # absent on first install
+  install -d -m 755 "$(dirname "$REWRITE_PY")"
+  write_file "$REWRITE_PY" 644 <"$SCRIPT_DIR/ente_s3_rewrite.py"
+  rewrite_unit | write_file /etc/systemd/system/ente-s3-rewrite.service
+  h1=$(cat "$REWRITE_PY" /etc/systemd/system/ente-s3-rewrite.service | sha256sum)
+  systemctl daemon-reload
+  systemctl enable ente-s3-rewrite.service >/dev/null 2>&1
+  if [[ $h0 != "$h1" ]] || ! systemctl is-active --quiet ente-s3-rewrite.service; then systemctl restart ente-s3-rewrite.service; fi
+  url_ok "http://127.0.0.1:$REWRITE_PORT/ping" 10 || die "the link rewriter does not answer (journalctl -u ente-s3-rewrite)"
+}
+
+# proxy_probe_url: a pre-signed GET link (valid 5 minutes) for a key that does not exist, pointing at the proxy host.
+# Through a working proxy the provider answers 404 NoSuchKey: proof that forwarding, Host and signature are right.
+proxy_probe_url() {
+  local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
+  eval "$(museum_s3)"
+  M_KEY=$M_KEY M_SECRET=$M_SECRET M_ENDPOINT=$M_ENDPOINT M_REGION=$M_REGION M_BUCKET=$M_BUCKET P=$S3_PROXY_HOST python3 - <<'PY'
+import os, boto3
+from botocore.config import Config
+e = os.environ
+c = boto3.client("s3", endpoint_url="https://" + e["M_ENDPOINT"], region_name=e["M_REGION"], aws_access_key_id=e["M_KEY"],
+                 aws_secret_access_key=e["M_SECRET"], config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"))
+u = c.generate_presigned_url("get_object", Params={"Bucket": e["M_BUCKET"], "Key": "ente-setup-proxy-probe/none"}, ExpiresIn=300)
+print(u.replace("https://%s/" % e["M_ENDPOINT"], "https://%s/" % e["P"], 1))
+PY
+}
+
+# proxy_checks [TRIES]: OK/FAIL lines for the S3 proxy (counted in FAILS). TRIES: seconds/3 to wait for the proxy site's
+# certificate (a freshly added host gets it within a minute).
+proxy_checks() {
+  local out st i
+  if systemctl is-active --quiet ente-s3-rewrite.service; then ok "link rewriter running"; else bad "link rewriter not running (journalctl -u ente-s3-rewrite)"; fi
+  out=$(curl -sS -m 5 -D - "http://127.0.0.1:$REWRITE_PORT/ping" 2>&1 || true)
+  if grep -qi '^x-ente-link-rewrite: on' <<<"$out" && grep -q pong <<<"$out"; then ok "link rewriter answers and reaches museum"
+  else bad "link rewriter does not answer correctly on 127.0.0.1:$REWRITE_PORT"; fi
+  for ((i = 0; i < ${1:-1}; i++)); do
+    out=$(curl -sS -m 15 "$(proxy_probe_url)" 2>&1 || true)
+    [[ $out != *NoSuchKey* ]] || break
+    sleep 3
+  done
+  if [[ $out == *NoSuchKey* ]]; then ok "https://$S3_PROXY_HOST forwards signed links to $S3_ENDPOINT"
+  else bad "https://$S3_PROXY_HOST does not forward signed links: $(head -c 160 <<<"$out" | tr '\n' ' ')"; fi
+  out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT" \
+    "https://$S3_PROXY_HOST/$S3_BUCKET/ente-check" 2>&1 || true)
+  if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight through the proxy allowed for https://web.$DOMAIN"
+  else bad "CORS preflight through the proxy not allowed (web uploads through the proxy will fail)"; fi
+  st=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$S3_PROXY_HOST/" 2>&1 || true)
+  if [[ $st == 404 ]]; then ok "proxy site refuses paths outside the bucket"; else bad "proxy site answers $st outside the bucket (expected 404)"; fi
+  out=$(curl -sS -m 10 -o /dev/null -D - "https://api.$DOMAIN/ping" 2>&1 || true)
+  if [[ $(proxy_state) == on ]]; then
+    if grep -qi '^x-ente-link-rewrite: on' <<<"$out"; then ok "proxy ON: bucket links point at https://$S3_PROXY_HOST"
+    else bad "proxy is on but the API does not go through the link rewriter (falling back to museum?)"; fi
+  else
+    if grep -qi '^x-ente-link-rewrite' <<<"$out"; then bad "proxy is off but the API still goes through the link rewriter"
+    else ok "proxy OFF: bucket links point at $S3_ENDPOINT"; fi
+  fi
+}
+
+# proxy [on|off|status]
+cmd_proxy() {
+  load_env
+  local want=${1:-status} was f0
+  [[ -n $S3_PROXY_HOST ]] || die "set S3_PROXY_HOST in $ENV_FILE and run install first (README: S3 proxy)"
+  [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
+  if [[ $want == status ]]; then
+    echo "S3 proxy is $(proxy_state)"; proxy_checks
+    ((FAILS == 0)) || return 1
+    return 0
+  fi
+  setup_s3_proxy
+  was=$(proxy_state)
+  set_proxy_state "$want"
+  write_caddyfile
+  if [[ $want == on ]]; then
+    f0=$FAILS; proxy_checks 20
+    if ((FAILS > f0)); then
+      set_proxy_state "$was"; write_caddyfile
+      die "proxy self-test failed; left it $was"
+    fi
+  fi
+  log "S3 proxy $want (was $was)"
+}
+
+# Shared by install and restore: patch the Ente config, verify the photo bucket, write the Caddyfile and compose override.
+# Sets MUSEUM_CFG_CHANGED=1 when museum.yaml changed.
+configure_host() {
+  local h0; h0=$(sha256sum "$ENTE_DIR/museum.yaml")
+  apply_edits
+  s3_prepare
+  sync_internal
+  [[ $(sha256sum "$ENTE_DIR/museum.yaml") == "$h0" ]] || MUSEUM_CFG_CHANGED=1
+  setup_s3_proxy
+  write_caddyfile
   ensure_pins
   write_override
 }
@@ -1061,12 +1253,17 @@ rc_err() { grep -E 'ERROR|Failed to' <<<"$1" | sed -E 's|^[0-9/]+ [0-9:]+ ||' | 
 # check: read-only health report (containers, ports, ssh/firewall/TLS, bucket + CORS, backup freshness, system); exit 1 on any FAIL.
 cmd_check() {
   load_env
-  local s cid st pol p addrs ts res out ex
+  local s cid st pol p addrs ts res out ex i
   echo "== containers"
   for s in museum web postgres; do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
     if [[ -z $cid ]]; then bad "$s not running"; continue; fi
     st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")
+    for ((i = 0; i < 20; i++)); do # just restarted (lockdown, update, reboot): give it a minute instead of a false alarm
+      [[ $st == starting || $st == restarting ]] || break
+      sleep 3
+      st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")
+    done
     pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid")
     if [[ $st == healthy || $st == running ]]; then ok "$s $st"; else bad "$s $st"; fi
     if [[ $pol == unless-stopped ]]; then ok "$s restart=$pol"; else bad "$s restart=$pol"; fi
@@ -1109,6 +1306,10 @@ cmd_check() {
   out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT" \
     "https://$S3_ENDPOINT/$S3_BUCKET/ente-check" 2>&1 || true)
   if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight from https://web.$DOMAIN allowed"; else bad "CORS preflight from https://web.$DOMAIN not allowed (web uploads will fail)"; fi
+  if [[ -n $S3_PROXY_HOST ]]; then
+    echo "== s3 proxy ($(proxy_state))"
+    proxy_checks
+  fi
   echo "== backup"
   if systemctl is-enabled --quiet ente-backup.timer 2>/dev/null; then ok "timer enabled, next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value)"; else bad "ente-backup.timer not enabled"; fi
   ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
@@ -1596,7 +1797,7 @@ cmd_deploy() {
 }
 
 # usage: print the command list and exit 2. main CMD: dispatch to the cmd_* function.
-usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|vpn}" >&2; exit 2; }
+usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|proxy [on|off|status]|vpn}" >&2; exit 2; }
 
 main() {
   CMD=$1
@@ -1613,12 +1814,16 @@ main() {
     update) cmd_update ;;
     alert-test) cmd_alert_test ;;
     speedtest) cmd_speedtest ;;
+    proxy) cmd_proxy "${2:-status}" ;;
     vpn) cmd_vpn ;;
     *) usage ;;
   esac
 }
 
-[[ $# -eq 1 ]] || usage
-[[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $1)" >&2; exit 1; }
-touch "$LOG"; chmod 600 "$LOG"
-main "$1" 2>&1 | tee -a "$LOG"
+# sourced (tests): define the functions only
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  [[ $# -eq 1 || ($# -eq 2 && $1 == proxy && $2 =~ ^(on|off|status)$) ]] || usage
+  [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }
+  touch "$LOG"; chmod 600 "$LOG"
+  main "$@" 2>&1 | tee -a "$LOG"
+fi

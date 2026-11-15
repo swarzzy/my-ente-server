@@ -19,6 +19,8 @@ The full-featured previous version (local Silo storage, data disk, Storage Box, 
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `s3-speedtest.sh`, `vps-speedtest.ps1` | optional speed tests from a PC (see "Measuring connection speed") |
+| `ente_s3_rewrite.py` | the link rewriter of the optional S3 proxy (installed by the script) |
+| `tests/` | tests (see "Tests") |
 
 Both copies are git-ignored. Anything missing from the secrets file is asked at a prompt (never echoed, logged or stored in the env file).
 
@@ -173,6 +175,29 @@ The Amnezia packages are not covered by unattended upgrades (`apt list --upgrada
 Remove: `systemctl disable --now awg-quick@awg0`, `ufw delete allow <AWG_PORT>/udp`, `ufw route delete allow in on awg0 out on <nic> from 10.89.37.0/24`,
 `rm -rf /etc/amnezia /etc/sysctl.d/92-awg.conf`, `apt-get purge amneziawg amneziawg-tools amneziawg-dkms`.
 
+## S3 proxy (optional): photos through this server, toggled on demand
+
+The apps upload and download photos directly to the photo bucket with links museum signs. Where devices reach the bucket's
+endpoint badly (slow or blocked) but reach this server well, `proxy on` routes that traffic through the server instead,
+uploads included; `proxy off` returns to direct links. Measure first (next section): it only helps if the server is clearly faster.
+
+1. DNS: an A (and AAAA) record for the proxy host, e.g. `s3.<domain>`, pointing at the server.
+2. `S3_PROXY_HOST=s3.<domain>` in `ente-setup.env`, then `sudo ./ente-setup.sh install` (keeps everything else as it is).
+   This adds the proxy site to Caddy and the link rewriter service; the proxy stays **off**.
+3. `sudo ./ente-setup.sh proxy on`, `proxy off`, `proxy status`. Toggling only reloads Caddy: no restart, no downtime, and it
+   applies to every device at once. `proxy on` runs a self-test first and stays off if it fails.
+
+How it works: while on, API traffic passes through `ente-s3-rewrite` (a small local service, `ente_s3_rewrite.py`), which replaces
+`https://<bucket endpoint>/<bucket>/` with `https://<S3_PROXY_HOST>/<bucket>/` in museum's responses. Caddy forwards that host,
+only the bucket's path and only the methods the apps use, to the real endpoint with its original host name, so the signed links stay
+valid and the provider still checks every signature. Photo data streams through Caddy; the rewriter only sees API responses.
+
+- Links handed out while on keep working after `proxy off` (the proxy site stays up while `S3_PROXY_HOST` is set).
+- If the rewriter dies, Caddy sends the API straight to museum (links point at the bucket again); `check` reports it.
+- Every photo crosses the server twice while on: its bandwidth and monthly traffic become the limit.
+- Backups and museum's own bucket access always go direct. After `restore` on a new server the proxy starts off.
+- To remove it: empty `S3_PROXY_HOST` and run `install`.
+
 ## Measuring connection speed
 
 Photos travel between a device and the photo bucket directly; only the API goes through the server. Two tests from a PC:
@@ -185,9 +210,23 @@ Photos travel between a device and the photo bucket directly; only the API goes 
 
 Run each a few times: results vary a lot between runs.
 
+## Tests
+
+| Command | Where | What |
+| --- | --- | --- |
+| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum |
+| `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy | config checks, generated Caddyfile in each proxy state, unit, command line |
+| `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | the `proxy` command end to end, plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
+| `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |
+
+The two server tests restore the proxy state they found. The browser test opens registration for a throwaway account, deletes it
+afterwards, closes registration again and removes the Playwright image.
+
 ## Notes and limits
 
-- Users in countries that throttle foreign hosts need to reach the photo bucket's endpoint directly; pick a provider that works for them.
+- Users in countries that throttle foreign hosts need to reach the photo bucket's endpoint directly; pick a provider that works for
+  them, or use the S3 proxy.
+- IDrive e2 answers CORS preflights for any origin, whatever CORS rule the bucket holds: the signatures, not CORS, protect the bucket.
 - The installers (get.docker.com, Caddy repo key, rclone, Ente quickstart from `main`) are fetched at install time and run as root without pinning; the quickstart's output is asserted.
 - The VPS downloads and re-uploads every photo for the backup (bucket → VPS → bucket). Fine for hundreds of GB, slow for the first run.
 - Museum logs some request metadata (never photo plaintext); Docker log rotation bounds it (10 MB x 3).
