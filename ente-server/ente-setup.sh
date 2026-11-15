@@ -15,6 +15,7 @@ SECRETS_FILE=${SECRETS_FILE:-$SCRIPT_DIR/ente-setup.secrets}
 LOG=/var/log/ente-setup.log
 ENTE_DIR=/opt/my-ente
 PINS=$ENTE_DIR/image-pins
+PHOTO_CFG_DIR=ente-backup-config # inside the photo bucket: the encrypted config copy (see make_photo_crypt)
 CADDY_DIR=${CADDY_DIR:-/etc/caddy}
 CADDYFILE=$CADDY_DIR/Caddyfile
 # hooks for add-ons such as ente-s3-proxy.sh: the API's upstream (one reverse_proxy directive) and extra site blocks
@@ -123,6 +124,7 @@ load_env() {
   [[ $S3_ENDPOINT != *://* &&$BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
   [[ $S3_ENDPOINT/$S3_BUCKET != "$BACKUP_S3_ENDPOINT/$BACKUP_S3_BUCKET" ]] || die "backup bucket must differ from the photo bucket"
   BACKUP_ROOT=backup:$BACKUP_S3_BUCKET/
+  PHOTO_CFG_ROOT=ente-s3:$S3_BUCKET/$PHOTO_CFG_DIR/
   [[ -z $HC_URL || $HC_URL =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/?\&=%:+-]*)?$ ]] || die "HC_URL must be an https:// ping URL without spaces or quotes"
   [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's ID starts with -)"
 }
@@ -732,11 +734,42 @@ no_check_bucket=true
 EOF
 }
 
-# check_backup_owner: refuse to sync over a backup that belongs to another Ente instance
-# (a fresh install pointed at an old backup would wipe it).
+# make_photo_remote_env: the ente-s3 remote from S3_* and the keys (restore: museum.yaml does not exist yet).
+make_photo_remote_env() {
+  secret_var S3_ACCESS_KEY "S3 access key ID (photo bucket)"
+  secret_var S3_SECRET_KEY "S3 secret access key (photo bucket)"
+  rclone_set ente-s3 <<EOF
+type=s3
+provider=$S3_PROVIDER
+endpoint=$S3_ENDPOINT
+region=$S3_REGION
+access_key_id=$S3_ACCESS_KEY
+secret_access_key=$S3_SECRET_KEY
+no_check_bucket=true
+EOF
+}
+
+# make_photo_crypt: photo-crypt, a second encrypted copy of config/ (dumps, museum.yaml, compose files) inside the photo
+# bucket under $PHOTO_CFG_DIR/, with backup-crypt's passphrase: either bucket alone + BACKUP_PASSPHRASE restores everything.
+# Museum never lists its bucket (it only touches the object keys its database names), so the folder is invisible to it.
+make_photo_crypt() {
+  local pw
+  pw=$(python3 -I -c '
+import configparser, sys
+cp = configparser.RawConfigParser(); cp.read(sys.argv[1]); print(cp.get("backup-crypt", "password"))
+' "$(rclone config file | tail -1)") && [[ -n $pw ]] || die "backup-crypt remote has no passphrase; run make_backup_remotes first"
+  rclone_set photo-crypt <<EOF
+type=crypt
+remote=${PHOTO_CFG_ROOT}config
+password=$pw
+EOF
+}
+
+# check_backup_owner [ROOT CRYPT NAME]: refuse to sync over a backup that belongs to another Ente instance
+# (a fresh install pointed at an old backup would wipe it). Default: the backup bucket.
 check_backup_owner() {
-  local crypt=backup-crypt name="the backup bucket" theirs rc=0 listing
-  listing=$(rclone lsf "${BACKUP_ROOT}config" 2>/dev/null) || rc=$?
+  local root=${1:-$BACKUP_ROOT} crypt=${2:-backup-crypt} name=${3:-the backup bucket} theirs rc=0 listing
+  listing=$(rclone lsf "${root}config" 2>/dev/null) || rc=$?
   ((rc == 0 || rc == 3)) || die "cannot list $name (rclone exit $rc); not touching it"
   [[ -n $listing ]] || return 0
   theirs=$(mktemp); chmod 600 "$theirs"
@@ -752,13 +785,15 @@ PY
   rm -f "$theirs"
 }
 
-# Write the backup script (DB dump + config to backup-crypt, photo objects to the bucket, 60-day deleted retention)
+# Write the backup script (DB dump + config to backup-crypt and photo-crypt, photo objects to the bucket, 60-day deleted
+# retention)
 # and its systemd service + daily 03:00 timer.
 install_backup_units() {
   write_file /etc/ente-backup.env 600 <<EOF
 HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
 PHOTO_BUCKET="$S3_BUCKET"
+PHOTO_CFG_DIR="$PHOTO_CFG_DIR"
 EOF
   write_file /usr/local/bin/ente-backup.sh 755 <<'EOF'
 #!/usr/bin/env bash
@@ -784,7 +819,7 @@ target() {
   local name=$1 crypt=$2 root=$3 cutoff d
   echo "== $name"
   rclone sync "$DUMPS" "$crypt:" --checkers 4 --max-delete 20 || return 1
-  rclone sync "ente-s3:$PHOTO_BUCKET" "${root}objects" --size-only "${OPTS[@]}" \
+  rclone sync "ente-s3:$PHOTO_BUCKET" "${root}objects" --size-only "${OPTS[@]}" --exclude "/$PHOTO_CFG_DIR/**" \
     --max-delete 500 --backup-dir "${root}deleted/$(date +%F)" || return 1
   cutoff=$(date -d '60 days ago' +%F)
   for d in $(rclone lsf --dirs-only "${root}deleted" 2>/dev/null || true); do
@@ -794,6 +829,10 @@ target() {
 }
 rc=0
 target s3 backup-crypt "$BACKUP_ROOT" || { echo "ERROR: backup to the S3 bucket failed" >&2; rc=1; }
+# the same encrypted config/ also inside the photo bucket: either bucket alone + the passphrase restores everything
+echo "== config copy in the photo bucket"
+if rclone sync "$DUMPS" photo-crypt: --checkers 4 --max-delete 20; then echo "$START" > /var/lib/ente-backup/last-ok-photo-config
+else echo "ERROR: config copy to the photo bucket failed" >&2; rc=1; fi
 ((rc == 0)) || exit 1
 # heartbeat (healthchecks.io, Better Stack, ...): only after a fully good run. A failed ping does not fail the backup
 # (that would send a false "backup failed"); `check` reports it instead.
@@ -963,7 +1002,9 @@ cmd_backup_setup() {
   install_rclone
   make_backup_remotes
   make_photo_remote
+  make_photo_crypt
   check_backup_owner
+  check_backup_owner "$PHOTO_CFG_ROOT" photo-crypt "the photo bucket's $PHOTO_CFG_DIR/"
   setup_alerts
   install_backup_units
   systemctl start --no-block ente-backup.service
@@ -971,11 +1012,21 @@ cmd_backup_setup() {
 }
 
 # ---------------------------------------------------------------- restore
-# Fresh server (after bootstrap), same DOMAIN: config + database come from the backup bucket; photos stay in the photo
-# bucket, objects missing there are copied back from the backup.
+# Fresh server (after bootstrap), same DOMAIN. Config + database come from whichever bucket holds the newer dump: the backup
+# bucket (config/) or the photo bucket ($PHOTO_CFG_DIR/config/); either alone is enough, with BACKUP_PASSPHRASE. Photos stay in
+# the photo bucket; objects missing there (e.g. a new, empty photo bucket) are copied back from the backup bucket.
+# restore_newest CRYPT: the newest dump's name in that config/ copy (empty if none or unreadable).
+restore_newest() { rclone lsf "$1" --include 'ente_db-*.dump' 2>/dev/null | sort | tail -1 || true; }
+# restore_source: backup-crypt: or photo-crypt:, whichever holds the newer dump (the backup bucket on a tie); fails if neither has one.
+restore_source() {
+  local b p
+  b=$(restore_newest backup-crypt:); p=$(restore_newest photo-crypt:)
+  [[ -n $b || -n $p ]] || return 1
+  if [[ $p > $b ]]; then echo photo-crypt:; else echo backup-crypt:; fi
+}
 cmd_restore() {
   load_env
-  local tmp dump t0=$SECONDS
+  local tmp dump src t0=$SECONDS
   if [[ -e $ENTE_DIR/.restore-incomplete ]]; then
     log "previous restore did not finish; cleaning up and starting over"
     dc down -v >/dev/null 2>&1 || true
@@ -986,12 +1037,15 @@ cmd_restore() {
   install_docker; install_caddy; install_rclone
   rclone listremotes | grep -x 'backup-crypt:' >/dev/null && rclone config delete backup-crypt
   make_backup_remotes once
-  log "restoring from $BACKUP_ROOT"
+  make_photo_remote_env
+  make_photo_crypt
+  src=$(restore_source) || die "no readable backup in either bucket (wrong passphrase, wrong buckets or keys?)"
+  log "restoring config and database from ${src%%:*} ($(restore_newest "$src"))"
   tmp=$(mktemp -d /root/ente-restore.XXXXXX)
   # shellcheck disable=SC2064 # expand now: $tmp is local to this function
   trap "rm -rf '$tmp'" EXIT
   log "fetching config backup"
-  rclone copy backup-crypt: "$tmp" --checkers 4
+  rclone copy "$src" "$tmp" --checkers 4
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
   # keep the dumps: the next backup syncs /var/backups/ente to the backup and would delete every dump missing here
@@ -1009,8 +1063,10 @@ cmd_restore() {
   dc cp "$dump" postgres:/tmp/restore.dump
   dc exec -T postgres pg_restore -U pguser -d ente_db --clean --if-exists /tmp/restore.dump || die "pg_restore failed"
   dc exec -T postgres rm -f /tmp/restore.dump
-  log "copying objects missing from the photo bucket back from the backup (never deletes; can take long on a new bucket)"
-  rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
+  if [[ -n $(rclone lsf --max-depth 1 "${BACKUP_ROOT}objects" 2>/dev/null | head -1) ]]; then
+    log "copying objects missing from the photo bucket back from the backup (never deletes; can take long on a new bucket)"
+    rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
+  else warn "no photo objects in the backup bucket: using the photo bucket as it is"; fi
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
@@ -1027,12 +1083,13 @@ EOF
 
 # new_uploads NAME: prints a temp file of rclone exclude rules naming the photo objects uploaded since the last good backup to
 # NAME (s3) started. They are not in that backup yet, and that is not an error. The caller passes it as --exclude-from
-# and removes it. One listing, no request per object. (An age filter instead would also hide freshly copied backup objects.)
+# and removes it. It also excludes the config copy ($PHOTO_CFG_DIR/). One listing, no request per object. (An age filter instead would also hide freshly copied backup objects.)
 new_uploads() {
   local s f; f=$(mktemp)
+  echo "/$PHOTO_CFG_DIR/**" >"$f" # the config copy, not a photo
   if s=$(cat "/var/lib/ente-backup/last-ok-$1" 2>/dev/null); then
     rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$S3_BUCKET" 2>/dev/null |
-      sed 's/[][*?{}\\]/\\&/g; s|^|/|' >"$f" || true
+      sed 's/[][*?{}\\]/\\&/g; s|^|/|' >>"$f" || true
   fi
   echo "$f"
 }
@@ -1131,6 +1188,10 @@ cmd_check() {
   elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   rm -f "$ex"
+  s=$(cat /var/lib/ente-backup/last-ok-photo-config 2>/dev/null || true)
+  if [[ -z $s ]]; then bad "no config copy in the photo bucket yet (the next backup makes it)"
+  elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "config copy in the photo bucket is older than 36 h ($s)"
+  else ok "config copy in the photo bucket $s"; fi
   s=$(cat /var/lib/ente-backup/verify-ok 2>/dev/null || true)
   if ! systemctl is-enabled --quiet ente-verify.timer 2>/dev/null; then bad "ente-verify.timer not enabled (run backup-setup)"
   elif [[ -z $s ]]; then warn "monthly verify has not passed yet (run: $0 verify)"
@@ -1175,6 +1236,7 @@ cmd_verify() {
   load_env
   local out dump n i live rest lt lu lf rt ru rf ex
   rclone listremotes | grep -x 'backup-crypt:' >/dev/null || die "run backup-setup first"
+  rclone listremotes | grep -x 'photo-crypt:' >/dev/null || die "run backup-setup first (no config copy in the photo bucket)"
   for ((i = 0; i < 720; i++)); do # a backup that is still running would show false differences: wait for it, up to 6 h
     [[ $(systemctl show ente-backup.service -p ActiveState --value) == activating ]] || break
     ((i)) || log "a backup is running, waiting for it"
@@ -1198,6 +1260,9 @@ cmd_verify() {
   if out=$(rclone check /var/backups/ente backup-crypt: --download --checkers 4 2>&1); then
     ok "config backup decrypts with the stored passphrase and equals the local copies ($(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1))"
   else bad "config backup differs or cannot be decrypted: $(rc_err "$out")"; fi
+  if out=$(rclone check /var/backups/ente photo-crypt: --download --checkers 4 2>&1); then
+    ok "config copy in the photo bucket decrypts and equals the local copies ($(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1))"
+  else bad "config copy in the photo bucket differs or cannot be decrypted: $(rc_err "$out")"; fi
 
   echo "== database dump (test restore into a scratch database)"
   dump=$(rclone lsf backup-crypt: --include 'ente_db-*.dump' 2>/dev/null | sort | tail -1 || true)

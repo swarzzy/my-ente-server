@@ -14,14 +14,14 @@ Nov 15, 2026 · @Dmitrii
 - **Monitoring and extras:** Telegram alerts, a Better Stack heartbeat, and a monthly `verify` are on. Registration is locked and the image versions are pinned.
 - **Yandex Disk:** support was removed from the repo, but the server still has the old nightly Yandex step and rclone remote. They go when `backup-setup` is re-run; the Yandex token and the files on the Disk are then the owner's to revoke and delete.
 - **Add-ons:** the AmneziaWG VPN (`ente-vpn.sh`) is set up. The S3 proxy is installed but off. The Telegram bot is running.
-- **Repo:** the server runs commit `0ccd89a`. `master` is ahead of it: Yandex Disk removed, the VPN moved to `ente-vpn.sh`.
+- **Repo:** the server runs commit `0ccd89a`. `master` is ahead of it: Yandex Disk removed, the VPN moved to `ente-vpn.sh`, and an encrypted config copy in the photo bucket so either bucket alone restores.
 
 ## Open items
 
 - A stale `.restore-incomplete` marker can make a later `restore` wipe a live database (review finding 17). Do this one next.
 - `update` moves the image pins even when one image fails to pull (16).
 - The rclone config is written non-atomically (18).
-- The fix that makes `restore` keep downloaded dumps has only been code-reviewed, not run.
+- `restore` has not been run on a real fresh server since the restore-dumps fix and the photo-bucket config copy; both are covered only by tests (`tests/test_bucket_copies.sh`). Do a full restore drill.
 - Unattended upgrades don't cover the Amnezia packages.
 
 ## Ground rules
