@@ -226,18 +226,6 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 - Backups and museum's own bucket access always go direct. After `restore` on a new server, run `ente-s3-proxy.sh install` again.
 - After changing the photo bucket (`S3_ENDPOINT`/`S3_BUCKET`), run `ente-s3-proxy.sh install` again.
 
-## Measuring connection speed
-
-Photos travel between a device and the photo bucket directly; only the API goes through the server. Two tests from a PC:
-
-- **Device to bucket:** `s3-speedtest.sh` (Linux/macOS/WSL; needs rclone) uploads and downloads one random file in
-  `<bucket>/speedtest/` and deletes it: `S3_BUCKET=... ./s3-speedtest.sh` (asks for the keys).
-- **Device to server:** `sudo ./ente-setup.sh speedtest` opens a test endpoint under `https://api.<domain>/speedtest-<random token>/`
-  for 30 minutes (a Caddy route added at runtime, not in the Caddyfile; `systemctl stop ente-speedtest` ends it early) and prints
-  the URL. On Windows run `.\vps-speedtest.ps1 -Url <that URL>`; elsewhere use the two `curl` lines it prints.
-
-Run each a few times: results vary a lot between runs.
-
 ## Tests
 
 | Command | Where | What |

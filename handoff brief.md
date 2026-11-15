@@ -17,14 +17,7 @@ Build and test one reusable script that turns a fresh Debian server into a worki
 - A KVM VPS in the EU with a public IPv4 (and IPv6), Debian 12 or 13, 1–4 GB RAM and about 1 TB of disk. That's either one big disk, or a small SSD system disk plus a separate 1 TB HDD.
 - Offsite backups: a Hetzner Storage Box BX11 (1 TB), reached through an SSH sub-account on port 23, with daily automatic snapshots set in the Hetzner Console.
 - A domain the owner controls. Hostnames live under `ente.example.com`, a placeholder throughout this brief.
-
-**Your playground**
-
-- A VM on the owner's PC: Debian 13 (or 12), at least 2 GB RAM, about 30 GB system disk, plus a second virtual disk of about 20 GB standing in for the data disk.
-- It sits behind home NAT with no public IP, so Let's Encrypt and phones can't be tested there. See *Test mode*.
-- Snapshot the clean VM before the first run and revert to it for every fresh-install test.
-
-The owner also has a step-by-step plan for doing all this by hand. Everything the script needs from it is in this brief.
+- The owner also has a step-by-step plan for doing all this by hand. Everything the script needs from it is in this brief.
 
 ## Target setup
 
@@ -37,17 +30,12 @@ Caddy is the only service facing the internet, and every container listens on `1
 | Web apps (photos, public albums) | container `web` | 127.0.0.1:3000 and :3002 | `web.` and `albums.ente.example.com` | none |
 | Silo (maintained MinIO fork, S3) | container `minio` | 127.0.0.1:3200 | `s3.ente.example.com` | encrypted photo objects: on the data disk if there is one |
 | Postgres 15 | container `postgres` | not published | none | DB volume on the system disk |
-| socat helper | container `socat` | none | none | disabled: not needed once storage has a public hostname |
 | Backup | systemd timer at 03:00 running rclone | outbound SFTP to port 23 | none | Hetzner Storage Box |
 | Syncthing (optional) | container | 22000 tcp/udp public; UI 127.0.0.1:8384 | none | `/srv/syncthing` |
 
 - **Paths:** Ente's files go in `/opt/my-ente` (root-owned, mode 700). A data disk mounts at `/srv/ente-data` by UUID with `nofail`.
 - **Firewall:** UFW allows 22, 80 and 443. Ports Docker publishes bypass UFW, which is why everything is bound to `127.0.0.1`.
 - **DNS:** A/AAAA records for the four hostnames (or one wildcard), with a TTL of 300 so host moves take effect quickly.
-
-## Verified facts
-
-These were checked against Ente's quickstart script and docs, Hetzner's docs and rclone's docs on 8 Nov 2026. The quickstart lives on `main` and can change, so inspect the files it generates and fail loudly if an expected line is missing. Don't silently patch around it.
 
 ### Ente quickstart
 
@@ -347,21 +335,10 @@ Hand back a small repo plus a test report. Work only inside the VM, and stop to 
 - **Stay inside the VM.** Don't change the owner's PC: give them the steps (hosts file, certificate import) to do themselves. Test anything destructive, like formatting a disk, only on the VM's spare disk, and revert to the clean snapshot for fresh-install tests.
 - **No secrets anywhere visible.** No real `museum.yaml`, passphrases, keys or tokens go into the repo, logs or chat. Use placeholders.
 - **Keep the end-to-end encryption intact.** No plaintext photo copies on the server, no logging of request bodies, and never expose Silo's console (3201) or Postgres.
-- **Stay on this stack:** Ente's quickstart with Silo, Caddy, rclone, systemd and UFW. No Cloudflare proxy or tunnels in production (Cloudflare is throttled in Russia), no upstream MinIO image, no extra orchestration. Keep dependencies minimal: bash, coreutils, `python3-yaml` for validation.
+- **Stay on this stack:** Ente's quickstart with Silo, Caddy, rclone, systemd and UFW. No Cloudflare proxy or tunnels in production, no upstream MinIO image, no extra orchestration. Keep dependencies minimal: bash, coreutils, `python3-yaml` for validation.
 - **No provider lock-in.** No hosting-provider APIs; the script must work on any KVM Debian VPS.
 - **Fail loudly.** If Ente's quickstart output no longer matches *Verified facts*, stop and report instead of improvising.
 - **Ask the owner** for the domain, the Storage Box details, and whether they want Syncthing.
-
-## Open decisions and references
-
-None of these block the script; it takes them as config values.
-
-**Still open for the owner**
-
-- **Hosting provider:** AlphaVPS's 1 TB storage VPS is out of stock as of 8 Nov 2026. The script must not depend on which provider wins.
-- **Domain and DNS provider:** plus whether to try real certificates at home through the DNS challenge.
-- **Backup target:** a Storage Box, or IDrive e2 with Object Lock if Hetzner refuses the owner's billing address. Only the Box is needed for now.
-- **Optional extras:** healthchecks.io for backup alerts; Syncthing on or off.
 
 **References**
 
