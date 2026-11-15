@@ -1088,7 +1088,8 @@ new_uploads() {
   local s f; f=$(mktemp)
   echo "/$PHOTO_CFG_DIR/**" >"$f" # the config copy, not a photo
   if s=$(cat "/var/lib/ente-backup/last-ok-$1" 2>/dev/null); then
-    rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$S3_BUCKET" 2>/dev/null |
+    rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$S3_BUCKET" \
+      --exclude "/$PHOTO_CFG_DIR/**" 2>/dev/null |
       sed 's/[][*?{}\\]/\\&/g; s|^|/|' >>"$f" || true
   fi
   echo "$f"
@@ -1250,7 +1251,7 @@ cmd_verify() {
   ex=$(new_uploads s3)
   if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --checkers 4 --exclude-from "$ex" 2>&1); then
     n=$(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1 || true)
-    ok "photo bucket is in the backup with the same checksums (${n:-0 matching files}; $(wc -l <"$ex") uploaded around or after the last backup, not compared)"
+    ok "photo bucket is in the backup with the same checksums (${n:-0 matching files}; $(($(wc -l <"$ex") - 1)) uploaded around or after the last backup, not compared)"
     n=$(grep -oE '[0-9]+ hashes could not be checked' <<<"$out" | tail -1 || true)
     [[ -z $n ]] || warn "$n (no common checksum; compared by size)"
   else bad "photo objects differ from the backup: $(rc_err "$out")"; fi

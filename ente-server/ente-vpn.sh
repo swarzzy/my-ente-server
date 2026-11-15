@@ -299,11 +299,12 @@ cmd_vpn_uninstall() {
   [[ -z $port ]] || ufw delete allow "$port/udp" >/dev/null 2>&1 || true
   [[ -z $wan ]] || ufw route delete allow in on awg0 out on "$wan" from "$AWG_SUBNET" >/dev/null 2>&1 || true
   nft delete table ip awg_nat 2>/dev/null || true
+  ip link del awg0 2>/dev/null || true; rmmod amneziawg 2>/dev/null || true
   [[ ! -f $AWG_CLIENT ]] || shred -u "$AWG_CLIENT"
   find /etc/amnezia -type f -exec shred -u {} + 2>/dev/null || true
   rm -rf /etc/amnezia /etc/sysctl.d/92-awg.conf
   if dpkg -s amneziawg-tools >/dev/null 2>&1 || dpkg -s amneziawg >/dev/null 2>&1; then
-    apt_get purge amneziawg amneziawg-tools amneziawg-dkms || true
+    apt_get purge -y amneziawg amneziawg-tools amneziawg-dkms || true
   fi
   rm -f /etc/apt/sources.list.d/amnezia.sources /etc/apt/keyrings/amnezia.asc
   log "vpn uninstalled"; [[ -z $port ]] || log "close UDP $port in the provider firewall too, if you opened it there"
