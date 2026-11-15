@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
-# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|vpn>
+# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest>
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
 # Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
 set -euo pipefail
@@ -30,7 +30,7 @@ export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 FAILS=0
 MUSEUM_CFG_CHANGED=0
 CMD=
-SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE YANDEX_TOKEN YANDEX_CLIENT_SECRET TG_BOT_TOKEN'
+SECRET_VARS='S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE TG_BOT_TOKEN'
 
 # ---------------------------------------------------------------- helpers
 # log MSG / die MSG: timestamped line tagged with the command; die prints to stderr and exits 1.
@@ -111,11 +111,11 @@ load_env() {
   S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-https://web.$DOMAIN,https://albums.$DOMAIN}
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
-  AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; YANDEX_DIR=${YANDEX_DIR:-}; YANDEX_CLIENT_ID=${YANDEX_CLIENT_ID:-}; RESTORE_FROM=${RESTORE_FROM:-s3}; TG_CHAT_ID=${TG_CHAT_ID:-}
-  [[ ${1:-} != vpn ]] || return 0 # the VPN needs none of the Ente settings
+  AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; TG_CHAT_ID=${TG_CHAT_ID:-}
+  [[ ${1:-} != vpn ]] || return 0 # ente-vpn.sh needs none of the Ente settings
   S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
-  YANDEX_TOKEN=${YANDEX_TOKEN:-}; YANDEX_CLIENT_SECRET=${YANDEX_CLIENT_SECRET:-}; TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
+  TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
   need DOMAIN S3_ENDPOINT S3_REGION S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET
   [[ $DOMAIN =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z0-9-]+$ && $DOMAIN != *example.com ]] || die "DOMAIN missing, invalid or a placeholder"
   [[ $SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((SSH_PORT <= 65535)) && [[ ! $SSH_PORT =~ ^(80|443|3200|3201|5432)$ ]] ||
@@ -123,14 +123,8 @@ load_env() {
   [[ $S3_ENDPOINT != *://* &&$BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
   [[ $S3_ENDPOINT/$S3_BUCKET != "$BACKUP_S3_ENDPOINT/$BACKUP_S3_BUCKET" ]] || die "backup bucket must differ from the photo bucket"
   BACKUP_ROOT=backup:$BACKUP_S3_BUCKET/
-  YANDEX_ROOT=
-  if [[ -n $YANDEX_DIR ]]; then
-    [[ $YANDEX_DIR =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || die "YANDEX_DIR must be a relative folder path like ente-backup (letters, digits, . _ -)"
-    YANDEX_ROOT=yandex:$YANDEX_DIR/
-  fi
   [[ -z $HC_URL || $HC_URL =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/?\&=%:+-]*)?$ ]] || die "HC_URL must be an https:// ping URL without spaces or quotes"
   [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's ID starts with -)"
-  [[ $RESTORE_FROM == s3 || ($RESTORE_FROM == yandex && -n $YANDEX_DIR) ]] || die "RESTORE_FROM must be s3, or yandex with YANDEX_DIR set"
 }
 
 # ---------------------------------------------------------------- bootstrap
@@ -738,59 +732,11 @@ no_check_bucket=true
 EOF
 }
 
-# yandex (Yandex Disk, native API: its WebDAV is throttled) and yandex-crypt (encrypted config/ folder in YANDEX_DIR).
-# The token is the JSON printed by `rclone authorize "yandex"` on a PC with a browser; rclone refreshes it in rclone.conf,
-# so an existing remote is never rewritten. yandex-crypt reuses backup-crypt's passphrase (same BACKUP_PASSPHRASE).
-# Deletes go to the Yandex trash (rclone default, no hard_delete): some protection if the token is abused; it uses quota.
-make_yandex_remotes() {
-  [[ -n $YANDEX_DIR ]] || return 0
-  if ! rclone listremotes | grep -x 'yandex:' >/dev/null; then
-    [[ -z $YANDEX_CLIENT_ID ]] || secret_var YANDEX_CLIENT_SECRET "Yandex OAuth app client secret"
-    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\" CLIENT_ID CLIENT_SECRET)"
-    if [[ $YANDEX_TOKEN =~ ^y[0-9]_[A-Za-z0-9_-]+$ ]]; then
-      # a bare OAuth token (no refresh token): rclone needs the JSON form and a refresh_token field, which it never uses
-      # before the expiry. Yandex tokens last a year: renew it before then (a failed backup alerts you).
-      YANDEX_TOKEN="{\"access_token\":\"$YANDEX_TOKEN\",\"token_type\":\"OAuth\",\"refresh_token\":\"none\",\"expiry\":\"$(date -u -d '+360 days' +%FT%TZ)\"}"
-      warn "bare Yandex token: valid about a year, not renewed automatically (expires around $(date -d '+360 days' +%F))"
-    fi
-    [[ $YANDEX_TOKEN == *access_token* ]] || die "YANDEX_TOKEN does not look like the JSON from rclone authorize \"yandex\" (or a bare y0_... token)"
-    rclone_set yandex <<EOF
-type=yandex
-token=$YANDEX_TOKEN
-EOF
-    # the token only refreshes through the app that issued it
-    [[ -z $YANDEX_CLIENT_ID ]] || rclone_set yandex <<EOF
-client_id=$YANDEX_CLIENT_ID
-client_secret=$YANDEX_CLIENT_SECRET
-EOF
-    # mkdir and quota work even where file access is refused (rclone's built-in app gets 410 Gone since October 2026):
-    # prove listing and upload. The probe goes to the Yandex trash.
-    local err
-    if ! err=$(rclone mkdir "yandex:$YANDEX_DIR" 2>&1 && rclone lsf "yandex:$YANDEX_DIR" 2>&1 >/dev/null &&
-      echo probe | rclone rcat "yandex:$YANDEX_DIR/.ente-setup-probe" 2>&1 && rclone deletefile "yandex:$YANDEX_DIR/.ente-setup-probe" 2>&1); then
-      rclone config delete yandex
-      [[ $err != *410* ]] || err="410 Gone: Yandex refuses file access to this OAuth app; create your own app (README) and set YANDEX_CLIENT_ID"
-      die "Yandex Disk test failed: $(tail -1 <<<"$err" | cut -c1-200); remote removed, re-run with a working token"
-    fi
-    log "yandex remote created (list and upload work)"
-  fi
-  local pw
-  pw=$(python3 -I -c '
-import configparser, sys
-cp = configparser.RawConfigParser(); cp.read(sys.argv[1]); print(cp.get("backup-crypt", "password"))
-' "$(rclone config file | tail -1)") && [[ -n $pw ]] || die "backup-crypt remote has no passphrase; run make_backup_remotes first"
-  rclone_set yandex-crypt <<EOF
-type=crypt
-remote=${YANDEX_ROOT}config
-password=$pw
-EOF
-}
-
-# check_backup_owner [ROOT CRYPT NAME]: refuse to sync over a backup that belongs to another Ente instance
-# (a fresh install pointed at an old backup would wipe it). Default: the S3 backup bucket.
+# check_backup_owner: refuse to sync over a backup that belongs to another Ente instance
+# (a fresh install pointed at an old backup would wipe it).
 check_backup_owner() {
-  local root=${1:-$BACKUP_ROOT} crypt=${2:-backup-crypt} name=${3:-the backup bucket} theirs rc=0 listing
-  listing=$(rclone lsf "${root}config" 2>/dev/null) || rc=$?
+  local crypt=backup-crypt name="the backup bucket" theirs rc=0 listing
+  listing=$(rclone lsf "${BACKUP_ROOT}config" 2>/dev/null) || rc=$?
   ((rc == 0 || rc == 3)) || die "cannot list $name (rclone exit $rc); not touching it"
   [[ -n $listing ]] || return 0
   theirs=$(mktemp); chmod 600 "$theirs"
@@ -813,7 +759,6 @@ install_backup_units() {
 HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
 PHOTO_BUCKET="$S3_BUCKET"
-YANDEX_ROOT="$YANDEX_ROOT"
 EOF
   write_file /usr/local/bin/ente-backup.sh 755 <<'EOF'
 #!/usr/bin/env bash
@@ -833,7 +778,7 @@ find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
 [[ ! -f image-pins ]] || cp image-pins "$DUMPS/"
 # target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects, 60-day deleted/ retention.
-# A failed target does not stop the next one; the run fails at the end. Success leaves a per-target stamp for `check`:
+# Success leaves a per-target stamp for `check`:
 # the time the run STARTED, so that objects uploaded after it are not expected in the backup.
 target() {
   local name=$1 crypt=$2 root=$3 cutoff d
@@ -849,9 +794,6 @@ target() {
 }
 rc=0
 target s3 backup-crypt "$BACKUP_ROOT" || { echo "ERROR: backup to the S3 bucket failed" >&2; rc=1; }
-if [[ -n "${YANDEX_ROOT:-}" ]]; then
-  target yandex yandex-crypt "$YANDEX_ROOT" || { echo "ERROR: backup to Yandex Disk failed" >&2; rc=1; }
-fi
 ((rc == 0)) || exit 1
 # heartbeat (healthchecks.io, Better Stack, ...): only after a fully good run. A failed ping does not fail the backup
 # (that would send a false "backup failed"); `check` reports it instead.
@@ -862,7 +804,7 @@ fi
 EOF
   write_file /etc/systemd/system/ente-backup.service <<EOF
 [Unit]
-Description=Ente backup (database dump + photo objects to the backup bucket, and Yandex Disk if set)
+Description=Ente backup (database dump + photo objects to the backup bucket)
 After=docker.service network-online.target
 Wants=network-online.target
 $ALERT_ONFAIL
@@ -1022,10 +964,6 @@ cmd_backup_setup() {
   make_backup_remotes
   make_photo_remote
   check_backup_owner
-  if [[ -n $YANDEX_DIR ]]; then
-    make_yandex_remotes
-    check_backup_owner "$YANDEX_ROOT" yandex-crypt "Yandex Disk folder $YANDEX_DIR"
-  fi
   setup_alerts
   install_backup_units
   systemctl start --no-block ente-backup.service
@@ -1033,11 +971,11 @@ cmd_backup_setup() {
 }
 
 # ---------------------------------------------------------------- restore
-# Fresh server (after bootstrap), same DOMAIN: config + database come from the backup bucket (RESTORE_FROM=s3, default)
-# or Yandex Disk (RESTORE_FROM=yandex); photos stay in the photo bucket, objects missing there are copied back from the backup.
+# Fresh server (after bootstrap), same DOMAIN: config + database come from the backup bucket; photos stay in the photo
+# bucket, objects missing there are copied back from the backup.
 cmd_restore() {
   load_env
-  local tmp dump t0=$SECONDS src_crypt=backup-crypt src_root
+  local tmp dump t0=$SECONDS
   if [[ -e $ENTE_DIR/.restore-incomplete ]]; then
     log "previous restore did not finish; cleaning up and starting over"
     dc down -v >/dev/null 2>&1 || true
@@ -1048,15 +986,12 @@ cmd_restore() {
   install_docker; install_caddy; install_rclone
   rclone listremotes | grep -x 'backup-crypt:' >/dev/null && rclone config delete backup-crypt
   make_backup_remotes once
-  make_yandex_remotes
-  src_root=$BACKUP_ROOT
-  if [[ $RESTORE_FROM == yandex ]]; then src_crypt=yandex-crypt; src_root=$YANDEX_ROOT; fi
-  log "restoring from $RESTORE_FROM ($src_root)"
+  log "restoring from $BACKUP_ROOT"
   tmp=$(mktemp -d /root/ente-restore.XXXXXX)
   # shellcheck disable=SC2064 # expand now: $tmp is local to this function
   trap "rm -rf '$tmp'" EXIT
   log "fetching config backup"
-  rclone copy "$src_crypt:" "$tmp" --checkers 4
+  rclone copy backup-crypt: "$tmp" --checkers 4
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
   # keep the dumps: the next backup syncs /var/backups/ente to the backup and would delete every dump missing here
@@ -1075,7 +1010,7 @@ cmd_restore() {
   dc exec -T postgres pg_restore -U pguser -d ente_db --clean --if-exists /tmp/restore.dump || die "pg_restore failed"
   dc exec -T postgres rm -f /tmp/restore.dump
   log "copying objects missing from the photo bucket back from the backup (never deletes; can take long on a new bucket)"
-  rclone copy "${src_root}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
+  rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
@@ -1091,7 +1026,7 @@ EOF
 }
 
 # new_uploads NAME: prints a temp file of rclone exclude rules naming the photo objects uploaded since the last good backup to
-# NAME (s3|yandex) started. They are not in that backup yet, and that is not an error. The caller passes it as --exclude-from
+# NAME (s3) started. They are not in that backup yet, and that is not an error. The caller passes it as --exclude-from
 # and removes it. One listing, no request per object. (An age filter instead would also hide freshly copied backup objects.)
 new_uploads() {
   local s f; f=$(mktemp)
@@ -1212,21 +1147,6 @@ cmd_check() {
     elif s=$(cat /var/lib/ente-backup/hc-ok 2>/dev/null); then ok "heartbeat pinged $s (outside monitor)"
     else warn "heartbeat (HC_URL) not pinged yet: it is pinged after the next good backup"; fi
   fi
-  if [[ -n $YANDEX_DIR ]]; then
-    echo "== yandex disk"
-    if out=$(rclone lsf "$YANDEX_ROOT" --max-depth 1 2>&1 >/dev/null); then ok "Yandex Disk folder $YANDEX_DIR reachable"; else bad "Yandex Disk: $out"; fi
-    ts=$(cat /var/lib/ente-backup/last-ok-yandex 2>/dev/null || true)
-    if [[ -z $ts ]]; then bad "no successful backup to Yandex Disk yet"
-    elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last good Yandex Disk backup is older than 36 h ($ts)"
-    else ok "last good Yandex Disk backup $ts"; fi
-    ex=$(new_uploads yandex)
-    if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then warn "a backup is running: comparison with the backup skipped"
-  elif out=$(rclone check "ente-s3:$S3_BUCKET" "${YANDEX_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is on Yandex Disk"
-    else bad "rclone check (Yandex) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
-    rm -f "$ex"
-    out=$(rclone about yandex: 2>/dev/null | tr -s ' ' | tr '\n' ' ' || true)
-    [[ -z $out ]] || warn "Yandex Disk quota: $out(the trash counts too; empty it now and then)"
-  fi
   echo "== system"
   df -h / | sed 's/^/        /'
   warn "check storage usage of both buckets in the providers' consoles"
@@ -1242,7 +1162,7 @@ cmd_check() {
 # verify: deep test of the S3 backup, monthly by ente-verify.timer (a FAIL alerts like the daily check). It proves the backup
 # can be restored, which `check` does not: photo objects by checksum, the encrypted config byte for byte, a test restore of the
 # newest dump into a scratch database, and the keys in the backed-up museum.yaml. It changes neither the backup nor the live
-# database. The Yandex Disk copy is not verified here (the daily check compares it by size).
+# database.
 VERIFY_TMP=
 verify_cleanup() {
   [[ -z $VERIFY_TMP ]] || rm -rf "$VERIFY_TMP"
@@ -1309,7 +1229,6 @@ PY
     else bad "museum.yaml in the backup is missing or its keys differ from the live ones"; fi
   fi
   verify_cleanup; trap - EXIT
-  [[ -z $YANDEX_DIR ]] || warn "the Yandex Disk copy is not verified here (check compares it by size)"
   echo
   if ((FAILS)); then echo "$FAILS verify check(s) FAILED"; return 1; fi
   mkdir -p /var/lib/ente-backup; date -Is >/var/lib/ente-backup/verify-ok
@@ -1379,272 +1298,6 @@ EOF
 }
 
 # ---------------------------------------------------------------- deploy / main
-# ---------------------------------------------------------------- vpn (AmneziaWG 3.1, independent of Ente)
-AWG_CONF=/etc/amnezia/amneziawg/awg0.conf
-AWG_NAT=/etc/amnezia/amneziawg/awg0-nat.nft
-AWG_CLIENT=/root/awg-client.conf
-AWG_SUBNET=10.89.37.0/24
-
-# Amnezia's Launchpad PPA (suite focal: the project's own instructions for Debian), signing key pinned by fingerprint,
-# then kernel headers, the DKMS module and the tools.
-awg_install() {
-  local fl pkgs
-  [[ $(dpkg --print-architecture) == amd64 ]] || die "the Amnezia packages are amd64 only"
-  if [[ $(uname -r) == *-cloud-amd64 ]]; then fl=cloud-amd64; else fl=amd64; fi
-  install -d -m 755 /etc/apt/keyrings
-  write_file /etc/apt/keyrings/amnezia.asc <<'EOF'
------BEGIN PGP PUBLIC KEY BLOCK-----
-Version: Hockeypuck 2.2
-Comment: Hostname: 
-
-xsFNBGV0UhsBEAC33rMndHSN/k+u7gcZbh9/FjgYfGltQAtVe2QDxzn7UV+k/ChX
-OrYRw6Izw/DrhaapkNCThK2jwJE64e0NjboLH7UrrmSJLXMfOlDFbyGJVRA+1sTB
-lo7kKHY0xiZ1CHDzjKNV3czbesu80A9nuTZYyWHEn9ax6wsqKG3N8SvzQkUrIOVD
-2wZjh0p273CCEGkBnax1ghAV3MF8OrsPU6FRJ+ZakzKbu54g68xoV+2813YECme0
-JKsWfUUe/1uEJOXCvuACURSxnYr0sihJd8QI/jHSGlfeq72e5MflFEOrnu5xaDSJ
-r2W5lvUetG7EGSxtNKd7Jm/KhUV04g7arA0qydRjRToW3QqyzG7VB2nXKz3AOBYN
-earWAuBcTkfPvRVchxbjiYonKZA5tIlVrpawMZsdxKvYwl6LVnpBcccFWPhpudfy
-4TpCqCxRoAanOCvSirI3/y7TcZMBw643SaxXi1ifGeg6eyMzrLtP3CeonKBHGzrt
-1eeKGtEw/PFN4RmwpBePxi+uj0CoTD6zjCQa3c8EeB4Qz7tt6PnpibxdtZE8sBdd
-51wSA/fPGi2tFph8IVAsws7oxcQxZYl8CyncKDLcoR4dxVHYdFEDDf1GjRjoQ3Ai
-nD7fxD5qYzExe50DBVpuUbWcAiGICNxfvzQtUSRRtMoSHDcvzsy03KC6VwARAQAB
-zR5MYXVuY2hwYWQgUFBBIGZvciBJdXJpaSBFZ29yb3bCwY4EEwEKADgWIQR1yd1y
-x5mHDjEFQuJBZvLCVykIKAUCZXRSGwIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIX
-gAAKCRBBZvLCVykIKBu5D/9akmHCHlUqm2RTTBeTMbLNGc0l6YugpPaCM6vz0O9k
-BFP5PfRaNSRzyF7wHFHNY3JUHcor28my1fD8AE4+C3PwXz8tVYLh57UUsp4wjqHY
-+MTl/1ngDViPGD3PRjB8ZlO+19yerfplZv1Jaw7FZZv2BZOAXb+ddqUG4EmlzOnC
-EhcSDdFrzEBB3RGthjIb3QkKWKGbELDiMfogmsO9BE139Raiw23blagDrbnWsG4j
-ReZeu3atjG6AW8eL7m+i7bKKshD2CYVMznI5cYGLMKo9w7sb33uylPj1Vx9O7joP
-2GFf2rTpCY8wgzk7i1RqsipJ80u1/DY91Xdizv3f2BBe6UY7qHKoK00O11J0y8yU
-is2Asycy33Wy51pf6rCFUBLQu+c1fEypHF6jqANmQwaH7pPBliy4gGWvrVggzV4m
-xv7SnRiMi4PFyVwjKWm8dmuMxi/B9s++VG/ed+5aYgJYL58MohG3MUI/L58eitSC
-DDcQ1iAnBmawnGMKPqzMgRFB3OU3wDwfh7LNVvQqWpQ4q7pr4Cq1CvZvGoggXWDo
-1/vylPsRmiiuNetfsoVYmrkgtj1om07m5Xp1v4SyXJH11c3dc/xfMmn/4RlMWIpq
-86IsOjpr3avsw3FVUNCgD5Wf5+rHG+7gNmM6Cm/F8MDfAnnRmsw4h6hgvcJNQT5D
-ig==
-=OY2W
------END PGP PUBLIC KEY BLOCK-----
-EOF
-  [[ $(gpg --show-keys --with-colons /etc/apt/keyrings/amnezia.asc 2>/dev/null | awk -F: '/^fpr/ {print $10; exit}') == 75C9DD72C799870E310542E24166F2C257290828 ]] ||
-    die "Amnezia signing key fingerprint mismatch"
-  write_file /etc/apt/sources.list.d/amnezia.sources <<'EOF'
-Types: deb
-URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
-Suites: focal
-Components: main
-Architectures: amd64
-Signed-By: /etc/apt/keyrings/amnezia.asc
-EOF
-  apt_get update
-  apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 || die "no headers for the running kernel $(uname -r); reboot into the newest kernel first"
-  pkgs="linux-headers-$(uname -r) linux-headers-$fl dkms amneziawg amneziawg-tools nftables"
-  # shellcheck disable=SC2086
-  ! apt_get -s install --no-install-recommends $pkgs | grep '^Remv' >/dev/null || die "installing AmneziaWG would remove packages; refusing"
-  # shellcheck disable=SC2086
-  apt_install $pkgs
-}
-
-# awg_genconf IP: keys, random obfuscation parameters (tried on a throwaway interface first), the server config and ONE
-# shared client config. Prints no secret.
-awg_genconf() {
-  python3 -I - "$1" "$AWG_PORT" "$AWG_CONF" "$AWG_CLIENT" "$AWG_NAT" <<'PY'
-import os, random, subprocess, sys, tempfile
-
-R = random.SystemRandom()
-SERVER_IP, PORT, CONF, CLIENT, NAT = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
-SERVER_ADDR, PEER_ADDR, MTU = "10.89.37.1/24", "10.89.37.2/32", 1280
-
-
-def run(*a, inp=None):
-    return subprocess.run(a, input=inp, capture_output=True, text=True, check=True).stdout.strip()
-
-
-def pick_params():
-    jc = R.randint(4, 8)
-    jmin = R.randint(64, 128)
-    jmax = R.randint(jmin + 200, 900)
-    while True:  # message sizes: init 148+S1, response 92+S2, cookie 64+S3 must all differ; S1 + 56 != S2
-        s1, s2, s3, s4 = R.randint(16, 150), R.randint(16, 150), R.randint(12, 60), R.randint(12, 32)
-        if s1 + 56 != s2 and len({148 + s1, 92 + s2, 64 + s3}) == 3:
-            break
-    while True:  # four disjoint ranges above WireGuard's own type values 1-4
-        v = sorted(R.sample(range(5, 2**32 - 1), 8))
-        rs = [(v[0], v[1]), (v[2], v[3]), (v[4], v[5]), (v[6], v[7])]
-        if all(b - a >= 2**16 for a, b in rs):
-            break
-    R.shuffle(rs)
-    p = [("Jc", jc), ("Jmin", jmin), ("Jmax", jmax), ("S1", s1), ("S2", s2), ("S3", s3), ("S4", s4)]
-    p += [(f"H{i + 1}", f"{a}-{b}") for i, (a, b) in enumerate(rs)]
-    # no RandomTrailers: it loses 22-48 % of the packets; HeaderProtectionKey alone is clean
-    p += [("HeaderProtectionKey", run("awg", "genpsk"))]
-    return p
-
-
-def gate(params):
-    """Apply the parameters to a throwaway interface and read them back. Returns (ok, message without values)."""
-    name = "awgtst0"
-    text = "[Interface]\nPrivateKey = %s\n%s\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.255.255.2/32\n" % (
-        run("awg", "genkey"), "\n".join(f"{k} = {v}" for k, v in params),
-        run("awg", "pubkey", inp=run("awg", "genkey")), run("awg", "genpsk"))
-    with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
-        f.write(text)
-    run("ip", "link", "add", "dev", name, "type", "amneziawg")
-    try:
-        r = subprocess.run(["awg", "setconf", name, f.name], capture_output=True, text=True)
-        if r.returncode:
-            return False, "awg setconf rejected the parameters: " + (r.stderr.strip().splitlines() or ["?"])[0][:80]
-        have = {l.split("=")[0].strip().lower() for l in run("awg", "showconf", name).splitlines() if "=" in l}
-        missing = [k for k, _ in params if k.lower() not in have]
-        return (False, "read back without: " + ", ".join(missing)) if missing else (True, "parameters accepted")
-    finally:
-        subprocess.run(["ip", "link", "del", "dev", name], capture_output=True)
-        os.unlink(f.name)
-
-
-for attempt in range(1, 6):
-    params = pick_params()
-    ok, msg = gate(params)
-    print(f"gate attempt {attempt}: {msg}")
-    if ok:
-        break
-else:
-    sys.exit("no parameter set was accepted; nothing written")
-
-if any(l.split()[3].rsplit(":", 1)[1] == str(PORT) for l in run("ss", "-ulnH").splitlines()):
-    sys.exit(f"something already listens on UDP/{PORT}; nothing written")
-skey, ckey = run("awg", "genkey"), run("awg", "genkey")
-spub, cpub, psk = run("awg", "pubkey", inp=skey), run("awg", "pubkey", inp=ckey), run("awg", "genpsk")
-obf = "\n".join(f"{k} = {v}" for k, v in params)
-
-server = f"""[Interface]
-Address = {SERVER_ADDR}
-ListenPort = {PORT}
-PrivateKey = {skey}
-MTU = {MTU}
-PostUp = nft -f {NAT}
-PostDown = nft delete table ip awg_nat
-{obf}
-
-[Peer]
-PublicKey = {cpub}
-PresharedKey = {psk}
-AllowedIPs = {PEER_ADDR}
-"""
-client = f"""[Interface]
-PrivateKey = {ckey}
-Address = {PEER_ADDR}
-DNS = 1.1.1.1, 9.9.9.9
-MTU = {MTU}
-{obf}
-
-[Peer]
-PublicKey = {spub}
-PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = {SERVER_IP}:{PORT}
-PersistentKeepalive = 25
-"""
-for path, text in ((CONF, server), (CLIENT, client)):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-subprocess.run(["awg-quick", "strip", CONF], capture_output=True, check=True)  # the server file parses
-PY
-}
-
-# awg_selftest IP: a temporary second peer in a network namespace on this server connects through the live tunnel and checks
-# the handshake, DNS, the exit address, that IPv6 stays in, and a 20 MB download. Exercises forwarding, NAT and the ufw route
-# rule, not the real network path to your device. Everything temporary is removed afterwards.
-awg_selftest() {
-  local ip=$1 ns=awgtest tmp ckey pub hs out
-  ip netns del $ns 2>/dev/null || true; ip link del awgv0 2>/dev/null || true # leftovers of an interrupted run
-  tmp=$(mktemp -d)
-  ckey=$(awg genkey); pub=$(awg pubkey <<<"$ckey"); (umask 077; awg genpsk >"$tmp/psk")
-  # shellcheck disable=SC2064
-  trap "awg set awg0 peer '$pub' remove 2>/dev/null; ip netns del $ns 2>/dev/null; ip link del awgv0 2>/dev/null; rm -rf '$tmp' /etc/netns/$ns" EXIT
-  awg set awg0 peer "$pub" preshared-key "$tmp/psk" allowed-ips 10.89.37.9/32
-  {
-    echo "[Interface]"; echo "PrivateKey = $ckey"
-    grep -E '^(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey) *=' "$AWG_CONF"
-    echo; echo "[Peer]"; echo "PublicKey = $(awg show awg0 public-key)"; echo "PresharedKey = $(cat "$tmp/psk")"
-    echo "AllowedIPs = 0.0.0.0/0, ::/0"; echo "Endpoint = $ip:$AWG_PORT"; echo "PersistentKeepalive = 5"
-  } >"$tmp/client.conf"; chmod 600 "$tmp/client.conf"
-  install -d "/etc/netns/$ns"; echo 'nameserver 1.1.1.1' >"/etc/netns/$ns/resolv.conf" # ip netns exec mounts it
-  ip netns add $ns
-  ip link add awgv0 type veth peer name awgv1; ip link set awgv1 netns $ns
-  ip addr add 10.99.0.1/24 dev awgv0; ip link set awgv0 up
-  ip -n $ns addr add 10.99.0.2/24 dev awgv1; ip -n $ns link set awgv1 up; ip -n $ns link set lo up
-  ip -n $ns route add "$ip/32" via 10.99.0.1
-  ip -n $ns link add awgc type amneziawg
-  ip netns exec $ns awg setconf awgc "$tmp/client.conf"
-  ip -n $ns addr add 10.89.37.9/32 dev awgc; ip -n $ns link set awgc mtu 1280 up
-  ip -n $ns route add default dev awgc
-  ip -n $ns -6 addr add fd00:89:37::9/128 dev awgc; ip -n $ns -6 route add default dev awgc
-
-  echo "== vpn self-test"
-  out=$(ip netns exec $ns curl -sS -m 12 https://one.one.one.one/cdn-cgi/trace 2>&1 | grep -E '^(ip|loc)=' | tr '\n' ' ' || true)
-  hs=$(awg show awg0 latest-handshakes | awk -v k="$pub" '$1 == k {print $2}')
-  if [[ ${hs:-0} -gt 0 ]]; then ok "handshake"; else bad "no handshake"; fi
-  if [[ $out == *"ip=$ip "* ]]; then ok "DNS and exit address $ip through the tunnel ($out)"; else bad "unexpected exit: ${out:-no answer}"; fi
-  if ip netns exec $ns curl -6 -sS -m 6 -o /dev/null "https://[2606:4700:4700::1111]/" 2>/dev/null; then bad "IPv6 left the tunnel"; else ok "IPv6 does not get out"; fi
-  out=$(ip netns exec $ns curl -sS -m 25 -o /dev/null -w '%{size_download} %{speed_download}' "https://speed.cloudflare.com/__down?bytes=20000000" 2>/dev/null || true)
-  if [[ ${out%% *} == 20000000 ]]; then ok "20 MB download through the tunnel ($(awk -v s="${out##* }" 'BEGIN {printf "%.1f", s / 1e6}') MB/s)"; else bad "20 MB download did not complete"; fi
-  awg set awg0 peer "$pub" remove; ip netns del $ns; ip link del awgv0 2>/dev/null || true; rm -rf "$tmp" "/etc/netns/$ns"
-  trap - EXIT
-  ((FAILS == 0)) || die "vpn self-test: $FAILS check(s) failed"
-}
-
-# vpn: AmneziaWG on UDP AWG_PORT with one shared client (one device at a time). Re-runnable; keeps the keys, follows a changed AWG_PORT.
-cmd_vpn() {
-  load_env vpn; need AWG_PORT
-  [[ $AWG_PORT =~ ^[1-9][0-9]{3,4}$ ]] && ((AWG_PORT >= 1024 && AWG_PORT <= 65535)) || die "AWG_PORT must be a UDP port 1024-65535"
-  ufw status | grep '^Status: active' >/dev/null || die "ufw is not active; run bootstrap first"
-  local ip wan old
-  ip=$(host_ip)
-  wan=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
-  [[ -n $ip && -n $wan ]] || die "no default IPv4 route"
-  dpkg -s amneziawg-tools >/dev/null 2>&1 || awg_install
-  modprobe amneziawg || die "the amneziawg kernel module does not load (see: dkms status)"
-  install -d -m 700 /etc/amnezia/amneziawg
-  write_file "$AWG_NAT" 600 <<EOF
-table ip awg_nat
-delete table ip awg_nat
-table ip awg_nat {
-	chain postrouting {
-		type nat hook postrouting priority srcnat; policy accept;
-		ip saddr $AWG_SUBNET oifname "$wan" masquerade
-	}
-}
-EOF
-  if [[ ! -f $AWG_CONF ]]; then
-    log "generating keys and the server and client configs"
-    awg_genconf "$ip"
-  fi
-  old=$(awk -F' *= *' '$1 == "ListenPort" {print $2}' "$AWG_CONF")
-  if [[ $old != "$AWG_PORT" ]]; then
-    sed -i "s/^ListenPort = .*/ListenPort = $AWG_PORT/" "$AWG_CONF"
-    [[ ! -f $AWG_CLIENT ]] || sed -i "s/^Endpoint = .*/Endpoint = $ip:$AWG_PORT/" "$AWG_CLIENT"
-    ufw delete allow "$old/udp" >/dev/null || true
-    log "port changed from $old to $AWG_PORT: set Endpoint = $ip:$AWG_PORT in the client"
-  fi
-  write_file /etc/sysctl.d/92-awg.conf <<'EOF'
-net.ipv4.ip_forward = 1
-EOF
-  sysctl -q -p /etc/sysctl.d/92-awg.conf
-  ufw allow "$AWG_PORT/udp" comment amneziawg >/dev/null
-  # limited to the tunnel's IPv4 subnet: without `from`, ufw also adds an IPv6 forward rule
-  ufw route allow in on awg0 out on "$wan" from "$AWG_SUBNET" comment amneziawg >/dev/null
-  systemctl enable awg-quick@awg0 >/dev/null 2>&1
-  systemctl restart awg-quick@awg0 || die "awg-quick@awg0 did not start (journalctl -u awg-quick@awg0)"
-  [[ $(awg show awg0 listen-port) == "$AWG_PORT" ]] || die "awg0 does not listen on UDP $AWG_PORT"
-  awg_selftest "$ip"
-  if [[ -f $AWG_CLIENT ]]; then
-    log "client config: $AWG_CLIENT (holds the client's private key). Import it in the AmneziaVPN app, e.g. fetch it with"
-    log "  ssh -p <ssh port> <admin>@$ip sudo cat $AWG_CLIENT > awg.conf   then on the server: sudo shred -u $AWG_CLIENT"
-  fi
-  log "vpn ready on UDP $AWG_PORT. Allow it in your provider's firewall too, if it has one."
-}
-
 # bootstrap + (install | restore) + backup-setup in one go, from the config and secrets given.
 cmd_deploy() {
   need ADMIN_USER ADMIN_SSH_PUBKEY
@@ -1653,10 +1306,6 @@ cmd_deploy() {
   secret_var BACKUP_S3_ACCESS_KEY "Backup bucket access key ID"
   secret_var BACKUP_S3_SECRET_KEY "Backup bucket secret access key"
   secret_var BACKUP_PASSPHRASE "Backup passphrase (keep it in your password manager; losing it loses the config backups)" "$([[ $RESTORE == yes ]] && echo once || echo confirm)"
-  if [[ -n $YANDEX_DIR ]] && ! { command -v rclone >/dev/null && rclone listremotes | grep -x 'yandex:' >/dev/null; }; then
-    [[ -z $YANDEX_CLIENT_ID ]] || secret_var YANDEX_CLIENT_SECRET "Yandex OAuth app client secret"
-    secret_var YANDEX_TOKEN "Yandex Disk token (the JSON from: rclone authorize \"yandex\" CLIENT_ID CLIENT_SECRET)"
-  fi
   if [[ -n $TG_CHAT_ID && ! -f /etc/ente-alert.env ]]; then secret_var TG_BOT_TOKEN "Telegram bot token (from @BotFather)"; fi
   cmd_bootstrap
   if [[ $RESTORE == yes ]]; then cmd_restore; else cmd_install; fi
@@ -1664,9 +1313,9 @@ cmd_deploy() {
   log "deploy finished. Next: sign up the owner, then '$0 lockdown'."
 }
 
-COMMANDS="deploy bootstrap install codes lockdown backup-setup restore check verify update alert-test speedtest vpn"
+COMMANDS="deploy bootstrap install codes lockdown backup-setup restore check verify update alert-test speedtest"
 # usage: print the command list and exit 2. main CMD: dispatch to the cmd_* function.
-usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|vpn}" >&2; exit 2; }
+usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest}" >&2; exit 2; }
 
 main() {
   CMD=$1
@@ -1683,7 +1332,6 @@ main() {
     update) cmd_update ;;
     alert-test) cmd_alert_test ;;
     speedtest) cmd_speedtest ;;
-    vpn) cmd_vpn ;;
     *) usage ;;
   esac
 }

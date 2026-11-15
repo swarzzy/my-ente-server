@@ -1,1 +1,4 @@
 creds.txt
+ente-server/ente-setup.env
+ente-server/ente-setup.secrets
+__pycache__/

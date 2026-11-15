@@ -10,10 +10,11 @@ Nov 15, 2026 · @Dmitrii
 
 ## Current state
 
-- **Production:** one Debian 13 VPS deployed with `ente-setup.sh deploy`. Photos are in an external S3 bucket. Backups run daily to a second S3 bucket and to Yandex Disk.
+- **Production:** one Debian 13 VPS deployed with `ente-setup.sh deploy`. Photos are in an external S3 bucket. Backups run daily to a second S3 bucket.
 - **Monitoring and extras:** Telegram alerts, a Better Stack heartbeat, and a monthly `verify` are on. Registration is locked and the image versions are pinned.
-- **Add-ons:** the AmneziaWG VPN is set up. The S3 proxy is installed but off. The Telegram bot is running.
-- **Repo:** `master` on GitHub is the deployed version. The older version with local storage and a Storage Box is git tag `full-featured-v1`.
+- **Yandex Disk:** support was removed from the repo, but the server still has the old nightly Yandex step and rclone remote. They go when `backup-setup` is re-run; the Yandex token and the files on the Disk are then the owner's to revoke and delete.
+- **Add-ons:** the AmneziaWG VPN (`ente-vpn.sh`) is set up. The S3 proxy is installed but off. The Telegram bot is running.
+- **Repo:** the server runs commit `0ccd89a`. `master` is ahead of it: Yandex Disk removed, the VPN moved to `ente-vpn.sh`.
 
 ## Open items
 
@@ -21,7 +22,6 @@ Nov 15, 2026 · @Dmitrii
 - `update` moves the image pins even when one image fails to pull (16).
 - The rclone config is written non-atomically (18).
 - The fix that makes `restore` keep downloaded dumps has only been code-reviewed, not run.
-- The Yandex token expires around November 2027 and must be renewed before then.
 - Unattended upgrades don't cover the Amnezia packages.
 
 ## Ground rules

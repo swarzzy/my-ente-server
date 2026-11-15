@@ -9,7 +9,6 @@ One script, `ente-setup.sh`, turns a fresh Debian 12/13 VPS into a working, back
 - **Backups** go daily to a second S3 bucket: encrypted DB dump + `museum.yaml`, plus a mirror of the photo bucket.
 
 Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
-The full-featured previous version (local Silo storage, data disk, Storage Box, Syncthing, test mode) is git tag `full-featured-v1`.
 
 ## Files
 
@@ -19,6 +18,7 @@ The full-featured previous version (local Silo storage, data disk, Storage Box, 
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
+| `ente-vpn.sh` | optional, independent of Ente: an AmneziaWG VPN (see "AmneziaWG VPN") |
 | `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
 | `tests/` | tests (see "Tests") |
 
@@ -71,33 +71,12 @@ service alerts you when a run fails, does not happen, or the server is down. A f
 The server holds keys that can delete backups: turn on bucket versioning or Object Lock at the backup provider if it supports it, and use a key limited to that bucket.
 Two safety limits stop a run instead of deleting: more than 500 photo deletions, more than 20 dump deletions.
 
-### Second location: Yandex Disk (optional)
-
-Set `YANDEX_DIR` (a folder on the Disk) and run `backup-setup`. Every run then also writes the same layout (`config/` encrypted
-with the same `BACKUP_PASSPHRASE`, `objects/`, `deleted/`) to Yandex Disk through rclone's native `yandex` backend (Yandex's WebDAV
-is throttled). The S3 backup always runs first; if Yandex fails the S3 backup is still done, the run fails and `HC_URL` is not pinged.
-
-1. Use a separate Yandex account for this: the token can access the whole Disk.
-2. Since October 2026 Yandex answers `410 Gone` to file requests made through rclone's built-in OAuth app (quota still works), so
-   register your own: log in to that account, open <https://oauth.yandex.ru/client/new>, platform "Web services", redirect URI
-   `http://127.0.0.1:53682/`, and under Yandex.Disk REST API allow reading all of Disk, writing anywhere on Disk and Disk info.
-   Put its ID in `ente-setup.env` as `YANDEX_CLIENT_ID` and its secret in `ente-setup.secrets` as `YANDEX_CLIENT_SECRET`.
-3. On a PC with a browser: `rclone authorize "yandex" CLIENT_ID CLIENT_SECRET`, log in, copy the JSON it prints into `ente-setup.secrets` as
-   `YANDEX_TOKEN='{"access_token":...}'` (or paste it at the prompt). rclone refreshes it afterwards; it is never rewritten by the script.
-   If the refresh token ever expires, `rclone config delete yandex` and re-run `backup-setup` with a fresh one.
-4. `backup-setup` checks that it can list and upload (a token Yandex refuses stops it with the reason), creates the folder, refuses a
-   folder holding another instance's backup, and starts a run. The first mirror is slow.
-
-Deleted files go to the Yandex trash (some protection if the token is abused) and count against the quota, so empty it now and
-then; `check` shows the quota. Files larger than your plan's per-file upload limit fail (the run fails and `check` reports it).
-To restore from Yandex, set `RESTORE_FROM=yandex` (with `YANDEX_DIR` and a token) on the new server.
-
 ## Telegram alerts (optional)
 
 With `TG_CHAT_ID` set, `backup-setup` installs alerts that need no other service:
 - a failed backup sends "❌ ente-backup.service failed" with the last 30 log lines;
 - `check` runs daily at 09:00 (`ente-check.timer`) and sends its FAIL lines if anything fails
-  (stale or failed backup, Yandex token expired, a container down, missing headers, ...).
+  (stale or failed backup, a container down, missing headers, ...).
 
 Nothing is sent while all is well. Not covered: the VPS itself being down (only an outside monitor such as `HC_URL` sees that).
 
@@ -117,7 +96,7 @@ and re-run `backup-setup`.
 
 | Command | Does |
 | --- | --- |
-| `/status` | short summary: containers, last backup per location, last check and verify, proxy, disk, uptime |
+| `/status` | short summary: containers, last backup, last check and verify, proxy, disk, uptime |
 | `/check` | runs `ente-setup.sh check`, replies with the FAIL/WARN lines and the verdict |
 | `/backup` | runs a backup now; replies at once, then with the result |
 | `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |
@@ -137,7 +116,7 @@ bot: turn on Telegram's two-step verification. `ente-setup.sh check` includes th
 ## Monthly: `sudo ./ente-setup.sh check`
 
 OK/FAIL report: containers, restart policy, localhost-only ports, sshd, UFW, Caddy, HTTPS, photo bucket + CORS, backup timer and last
-result, `rclone check` photo bucket vs backup (and Yandex Disk: reachable, last good run, `rclone check`, quota), the last good `verify`, disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
+result, `rclone check` photo bucket vs backup, the last good `verify`, disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
 
 ## Monthly, automatic: `verify`
 
@@ -151,7 +130,7 @@ result, `rclone check` photo bucket vs backup (and Yandex Disk: reachable, last 
 - the keys in the backed-up `museum.yaml` equal the live ones.
 
 It changes neither the backup nor the live database, and waits for a running backup. Photos uploaded since the last backup started are
-not expected in the backup (same in `check`). The Yandex Disk copy is not verified here; `check` compares it by size daily.
+not expected in the backup (same in `check`).
 A full disaster-recovery drill (restore on a fresh server) is still worth doing once by hand.
 
 ## Updates
@@ -181,10 +160,10 @@ If a pinned build is ever deleted from the registry, `install`/`restore` warn an
 Apps keep working because the hostnames do not change. To restore into a *new* photo bucket, set the new `S3_*` values:
 objects are copied from the backup bucket.
 
-## AmneziaWG VPN (`vpn`, optional, independent of Ente)
+## AmneziaWG VPN (`ente-vpn.sh`, optional, independent of Ente)
 
 Needs only `bootstrap` and `AWG_PORT` (UDP, 1024-65535) in `ente-setup.env`; open that UDP port in your provider's firewall too.
-`sudo ./ente-setup.sh vpn` installs AmneziaWG 3.1 from Amnezia's PPA (pinned key, DKMS module), generates keys and random
+`sudo ./ente-vpn.sh install` installs AmneziaWG 3.1 from Amnezia's PPA (pinned key, DKMS module), generates keys and random
 obfuscation parameters, writes `/etc/amnezia/amneziawg/awg0.conf` and one shared client config `/root/awg-client.conf`
 (one device at a time), allows the port and the tunnel's forwarding in UFW, NATs the tunnel (`nft` table `ip awg_nat`, set up and
 removed by `awg-quick@awg0`), starts it at boot and runs a self-test from a network namespace on the server (handshake, DNS,
@@ -193,10 +172,11 @@ exit address, no IPv6 leak, 20 MB download). Tunnel `10.89.37.0/24`, MTU 1280, I
 Copy the client config to your device and import it in the AmneziaVPN app, then delete the server copy:
 `ssh -p <SSH_PORT> <ADMIN_USER>@<ip> sudo cat /root/awg-client.conf > awg.conf`, then on the server `sudo shred -u /root/awg-client.conf`.
 
-Re-running `vpn` keeps the keys (a new `AWG_PORT` is applied; update `Endpoint` in the client). New keys: move `awg0.conf` away, re-run.
+Re-running `install` keeps the keys (a new `AWG_PORT` is applied; update `Endpoint` in the client). New keys: move `awg0.conf` away, re-run.
 The Amnezia packages are not covered by unattended upgrades (`apt list --upgradable` now and then); a kernel update needs the DKMS build to succeed.
-Remove: `systemctl disable --now awg-quick@awg0`, `ufw delete allow <AWG_PORT>/udp`, `ufw route delete allow in on awg0 out on <nic> from 10.89.37.0/24`,
-`rm -rf /etc/amnezia /etc/sysctl.d/92-awg.conf`, `apt-get purge amneziawg amneziawg-tools amneziawg-dkms`.
+`sudo ./ente-vpn.sh status` shows the service, the port and each peer's last handshake. `sudo ./ente-vpn.sh uninstall` removes it all
+(service, keys and configs, UFW rules, NAT table, packages, the PPA); close the port in your provider's firewall yourself.
+The Amnezia PPA's signing key is embedded in `ente-vpn.sh` and checked by fingerprint, so apt accepts only packages Amnezia signed.
 
 ## S3 proxy (optional add-on): photos through this server, toggled on demand
 
