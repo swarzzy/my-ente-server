@@ -33,7 +33,7 @@ cleanup() {
   fi
   grep -qx '  disable-registration: true' "$M" && echo "  registration closed again"
   [[ $(sed -n 's/^  admins: \[\(.*\)\]$/\1/p' "$M") == "$admin" ]] && echo "  admin unchanged ($admin)"
-  ./ente-setup.sh proxy "$ORIG" </dev/null >/dev/null 2>&1 && echo "  proxy back to $ORIG"
+  ./ente-s3-proxy.sh "$ORIG" </dev/null >/dev/null 2>&1 && echo "  proxy back to $ORIG"
   docker rmi "$IMAGE" >/dev/null 2>&1 || true
   rm -rf "$W"
 }
@@ -47,7 +47,7 @@ if [[ $locked == yes ]]; then
   (cd /opt/my-ente && docker compose restart museum >/dev/null 2>&1); sleep 5
   echo "  registration opened for the test"
 fi
-./ente-setup.sh proxy on </dev/null >/dev/null 2>&1 || { echo "proxy on failed"; exit 1; }
+./ente-s3-proxy.sh on </dev/null >/dev/null 2>&1 || { echo "proxy on failed"; exit 1; }
 echo "  proxy on"
 
 docker run --rm --ipc=host -v "$W":/w -w /w -e WEB="web.$DOMAIN" -e PROXY="$PROXY" -e REAL="$REAL" -e EMAIL="$EMAIL" -e MODE="${MODE:-}" "$IMAGE" \
@@ -67,7 +67,7 @@ while kill -0 $pid 2>/dev/null; do
     echo done >"$W/bucket_checked"
   fi
   if [[ -e $W/need_proxy_off && ! -e $W/proxy_off_done ]]; then
-    ./ente-setup.sh proxy off </dev/null >/dev/null 2>&1 && echo done >"$W/proxy_off_done"
+    ./ente-s3-proxy.sh off </dev/null >/dev/null 2>&1 && echo done >"$W/proxy_off_done"
   fi
   sleep 1
 done

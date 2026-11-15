@@ -19,7 +19,7 @@ The full-featured previous version (local Silo storage, data disk, Storage Box, 
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `s3-speedtest.sh`, `vps-speedtest.ps1` | optional speed tests from a PC (see "Measuring connection speed") |
-| `ente_s3_rewrite.py` | the link rewriter of the optional S3 proxy (installed by the script) |
+| `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
 | `tests/` | tests (see "Tests") |
 
 Both copies are git-ignored. Anything missing from the secrets file is asked at a prompt (never echoed, logged or stored in the env file).
@@ -175,28 +175,32 @@ The Amnezia packages are not covered by unattended upgrades (`apt list --upgrada
 Remove: `systemctl disable --now awg-quick@awg0`, `ufw delete allow <AWG_PORT>/udp`, `ufw route delete allow in on awg0 out on <nic> from 10.89.37.0/24`,
 `rm -rf /etc/amnezia /etc/sysctl.d/92-awg.conf`, `apt-get purge amneziawg amneziawg-tools amneziawg-dkms`.
 
-## S3 proxy (optional): photos through this server, toggled on demand
+## S3 proxy (optional add-on): photos through this server, toggled on demand
 
 The apps upload and download photos directly to the photo bucket with links museum signs. Where devices reach the bucket's
-endpoint badly (slow or blocked) but reach this server well, `proxy on` routes that traffic through the server instead,
-uploads included; `proxy off` returns to direct links. Measure first (next section): it only helps if the server is clearly faster.
+endpoint badly (slow or blocked) but reach this server well, the add-on `ente-s3-proxy.sh` routes that traffic through the
+server instead, uploads included, and back again on demand. Measure first (next section): it only helps if the server is clearly faster.
 
 1. DNS: an A (and AAAA) record for the proxy host, e.g. `s3.<domain>`, pointing at the server.
-2. `S3_PROXY_HOST=s3.<domain>` in `ente-setup.env`, then `sudo ./ente-setup.sh install` (keeps everything else as it is).
-   This adds the proxy site to Caddy and the link rewriter service; the proxy stays **off**.
-3. `sudo ./ente-setup.sh proxy on`, `proxy off`, `proxy status`. Toggling only reloads Caddy: no restart, no downtime, and it
-   applies to every device at once. `proxy on` runs a self-test first and stays off if it fails.
+2. `S3_PROXY_HOST=s3.<domain>` in `ente-setup.env`, then `sudo ./ente-s3-proxy.sh install`: the link rewriter service and the
+   proxy site; the proxy stays **off**. (Needs `ente-setup.sh install` from this version: its Caddyfile has the hooks.)
+3. `sudo ./ente-s3-proxy.sh on`, `off`, `status`. Toggling only reloads Caddy: no restart, no downtime, and it applies to every
+   device at once. `on` runs a self-test first and stays off if it fails. `uninstall` removes it all.
 
 How it works: while on, API traffic passes through `ente-s3-rewrite` (a small local service, `ente_s3_rewrite.py`), which replaces
 `https://<bucket endpoint>/<bucket>/` with `https://<S3_PROXY_HOST>/<bucket>/` in museum's responses. Caddy forwards that host,
 only the bucket's path and only the methods the apps use, to the real endpoint with its original host name, so the signed links stay
 valid and the provider still checks every signature. Photo data streams through Caddy; the rewriter only sees API responses.
 
-- Links handed out while on keep working after `proxy off` (the proxy site stays up while `S3_PROXY_HOST` is set).
+The add-on owns two files that `ente-setup.sh`'s Caddyfile imports: `/etc/caddy/ente.d/api-upstream.caddy` (where the API goes)
+and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh install` never overwrites them, and
+`ente-setup.sh check` includes the add-on's checks while it is installed (so the daily check alerts on it too).
+
+- Links handed out while on keep working after `off` (the proxy site stays up while installed).
 - If the rewriter dies, Caddy sends the API straight to museum (links point at the bucket again); `check` reports it.
 - Every photo crosses the server twice while on: its bandwidth and monthly traffic become the limit.
-- Backups and museum's own bucket access always go direct. After `restore` on a new server the proxy starts off.
-- To remove it: empty `S3_PROXY_HOST` and run `install`.
+- Backups and museum's own bucket access always go direct. After `restore` on a new server, run `ente-s3-proxy.sh install` again.
+- After changing the photo bucket (`S3_ENDPOINT`/`S3_BUCKET`), run `ente-s3-proxy.sh install` again.
 
 ## Measuring connection speed
 
@@ -215,11 +219,11 @@ Run each a few times: results vary a lot between runs.
 | Command | Where | What |
 | --- | --- | --- |
 | `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum |
-| `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy | config checks, generated Caddyfile in each proxy state, unit, command line |
-| `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | the `proxy` command end to end, plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
+| `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, unit, command lines |
+| `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
 | `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |
 
-The two server tests restore the proxy state they found. The browser test opens registration for a throwaway account, deletes it
+The two server tests leave the add-on as they found it (installed or not, on or off). The browser test opens registration for a throwaway account, deletes it
 afterwards, closes registration again and removes the Playwright image.
 
 ## Notes and limits
