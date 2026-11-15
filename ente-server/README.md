@@ -18,6 +18,7 @@ The full-featured previous version (local Silo storage, data disk, Storage Box, 
 | `ente-setup.sh` | the script |
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
+| `s3-speedtest.sh`, `vps-speedtest.ps1` | optional speed tests from a PC (see "Measuring connection speed") |
 
 Both copies are git-ignored. Anything missing from the secrets file is asked at a prompt (never echoed, logged or stored in the env file).
 
@@ -171,6 +172,18 @@ Re-running `vpn` keeps the keys (a new `AWG_PORT` is applied; update `Endpoint` 
 The Amnezia packages are not covered by unattended upgrades (`apt list --upgradable` now and then); a kernel update needs the DKMS build to succeed.
 Remove: `systemctl disable --now awg-quick@awg0`, `ufw delete allow <AWG_PORT>/udp`, `ufw route delete allow in on awg0 out on <nic> from 10.89.37.0/24`,
 `rm -rf /etc/amnezia /etc/sysctl.d/92-awg.conf`, `apt-get purge amneziawg amneziawg-tools amneziawg-dkms`.
+
+## Measuring connection speed
+
+Photos travel between a device and the photo bucket directly; only the API goes through the server. Two tests from a PC:
+
+- **Device to bucket:** `s3-speedtest.sh` (Linux/macOS/WSL; needs rclone) uploads and downloads one random file in
+  `<bucket>/speedtest/` and deletes it: `S3_BUCKET=... ./s3-speedtest.sh` (asks for the keys).
+- **Device to server:** `sudo ./ente-setup.sh speedtest` opens a test endpoint under `https://api.<domain>/speedtest-<random token>/`
+  for 30 minutes (a Caddy route added at runtime, not in the Caddyfile; `systemctl stop ente-speedtest` ends it early) and prints
+  the URL. On Windows run `.\vps-speedtest.ps1 -Url <that URL>`; elsewhere use the two `curl` lines it prints.
+
+Run each a few times: results vary a lot between runs.
 
 ## Notes and limits
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
-# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|vpn>
+# Usage: ente-setup.sh <deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|vpn>
 # Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
 # Secrets: prompted, or from the environment / ente-setup.secrets (mode 600). See ente-setup.secrets.example.
 set -euo pipefail
@@ -1246,6 +1246,69 @@ PY
   echo "backup verified"
 }
 
+# ---------------------------------------------------------------- speedtest
+# speedtest: for 30 minutes serve a download/upload test under https://api.$DOMAIN/speedtest-<random token>/ to measure the
+# connection between a device and this server (the photos themselves travel device <-> bucket, not through here).
+# A small local server streams random data and swallows uploads; Caddy gets the route through its admin API, so the
+# Caddyfile is untouched and the route is gone when the test ends (or at the next Caddy reload). Client: s3-speedtest docs.
+cmd_speedtest() {
+  load_env
+  local tok url port=8099
+  command -v caddy >/dev/null || die "run install first"
+  write_file /usr/local/bin/ente-speedtest 755 <<'EOF'
+#!/usr/bin/env python3
+# Managed by ente-setup.sh. GET .../down/<MB> streams random data; PUT/POST .../up reads and discards the body.
+import os, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+BLOCK = os.urandom(1 << 20)
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_GET(self):
+        try: mb = max(1, min(2000, int(self.path.rstrip("/").rsplit("/", 1)[1])))
+        except ValueError: mb = 100
+        self.send_response(200); self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(mb << 20)); self.send_header("Cache-Control", "no-store"); self.end_headers()
+        for _ in range(mb): self.wfile.write(BLOCK)
+    def do_PUT(self):
+        n = int(self.headers.get("Content-Length") or 0); left = n
+        while left > 0:
+            d = self.rfile.read(min(left, 1 << 20))
+            if not d: break
+            left -= len(d)
+        b = str(n - left).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    do_POST = do_PUT
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+EOF
+  systemctl stop ente-speedtest.service >/dev/null 2>&1 || true
+  systemctl reset-failed ente-speedtest.service >/dev/null 2>&1 || true
+  curl -fsS -m 5 -o /dev/null -X DELETE http://localhost:2019/id/ente-speedtest 2>/dev/null || true
+  [[ -z $(ss -Htln "sport = :$port") ]] || die "port $port is in use"
+  tok=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  systemd-run --quiet --unit ente-speedtest --description "Ente speed test endpoint (temporary)" -p DynamicUser=yes -p RuntimeMaxSec=1800 \
+    -p ExecStopPost="/usr/bin/curl -fsS -m 5 -o /dev/null -X DELETE http://localhost:2019/id/ente-speedtest" \
+    /usr/local/bin/ente-speedtest "$port"
+  # first in the route list: the Caddyfile's host routes are terminal
+  curl -fsS -m 5 -o /dev/null -X PUT -H 'Content-Type: application/json' http://localhost:2019/config/apps/http/servers/srv0/routes/0 -d @- <<EOF ||
+{"@id": "ente-speedtest", "terminal": true,
+ "match": [{"host": ["api.$DOMAIN"], "path": ["/speedtest-$tok/*"]}],
+ "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:$port"}], "flush_interval": -1}]}
+EOF
+    { systemctl stop ente-speedtest.service; die "could not add the route to Caddy (admin API on localhost:2019)"; }
+  url=https://api.$DOMAIN/speedtest-$tok
+  url_ok "$url/down/1" 5 || { systemctl stop ente-speedtest.service; die "the test endpoint does not answer"; }
+  cat <<EOF
+
+Speed test endpoint is up for 30 minutes (stop earlier: systemctl stop ente-speedtest):
+  $url
+
+Windows:      .\\vps-speedtest.ps1 -Url $url
+Linux/macOS:  curl -o /dev/null -w 'download: %{speed_download} bytes/s\\n' $url/down/100
+              head -c 100000000 /dev/urandom > /tmp/up.bin && curl -o /dev/null -T /tmp/up.bin -w 'upload: %{speed_upload} bytes/s\\n' $url/up
+EOF
+}
+
 # ---------------------------------------------------------------- deploy / main
 # ---------------------------------------------------------------- vpn (AmneziaWG 3.1, independent of Ente)
 AWG_CONF=/etc/amnezia/amneziawg/awg0.conf
@@ -1533,7 +1596,7 @@ cmd_deploy() {
 }
 
 # usage: print the command list and exit 2. main CMD: dispatch to the cmd_* function.
-usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|vpn}" >&2; exit 2; }
+usage() { echo "usage: $0 {deploy|bootstrap|install|codes|lockdown|backup-setup|restore|check|verify|update|alert-test|speedtest|vpn}" >&2; exit 2; }
 
 main() {
   CMD=$1
@@ -1549,6 +1612,7 @@ main() {
     verify) cmd_verify ;;
     update) cmd_update ;;
     alert-test) cmd_alert_test ;;
+    speedtest) cmd_speedtest ;;
     vpn) cmd_vpn ;;
     *) usage ;;
   esac
