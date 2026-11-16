@@ -19,15 +19,25 @@ printf '%s\n' DOMAIN=photos.example.org S3_ENDPOINT=s3.example.net S3_REGION=r1 
 printf 'TG_BOT_TOKEN=%s\n' "$TOKEN" >"$T/secrets"
 
 echo "== setup_alerts writes the alert path"
-( ENV_FILE=$T/env SECRETS_FILE=$T/secrets CMD=test
-  # shellcheck source=/dev/null
-  . "$HERE/../ente-setup.sh"
-  set +e
-  load_env
-  write_file() { local f=$T/root$1; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "${2:-644}" "$f"; }
-  systemctl() { :; }; tg_api() { :; }
-  SCRIPT_DIR=/opt/ente-server setup_alerts ) >"$T/out" 2>&1
+# run_setup: setup_alerts into $T/root with Telegram's API stubbed (calls logged to $T/tg; sendMessage fails with SEND_FAILS)
+run_setup() {
+  ( ENV_FILE=$T/env SECRETS_FILE=$T/secrets CMD=test
+    # shellcheck source=/dev/null
+    . "$HERE/../ente-setup.sh"
+    set +e
+    load_env
+    write_file() { local f=$T/root$1; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "${2:-644}" "$f"; }
+    systemctl() { :; }
+    tg_api() { echo "$*" >>"$T/tg"; [[ $1 != sendMessage || -z ${SEND_FAILS:-} ]]; }
+    SCRIPT_DIR=/opt/ente-server setup_alerts ) >"$T/out" 2>&1
+}
+SEND_FAILS=1 run_setup; RC=$?
+check "a test message that cannot be sent stops it, before anything is installed" \
+  '((RC != 0)) && grep -q "could not send to TG_CHAT_ID" "$T/out" && [[ ! -e $T/root ]]' "$(tail -3 "$T/out")"
+rm -f "$T/tg"
+run_setup
 R=$T/root
+check "it sends a test message to the chat" 'grep -q "^sendMessage .*chat_id=$CHAT" "$T/tg"' "$(cat "$T/tg" 2>/dev/null)"
 check "the token and chat id are stored in /etc/ente-alert.env, mode 600" \
   '[[ $(stat -c %a "$R/etc/ente-alert.env") == 600 ]] && grep -qx "TG_BOT_TOKEN='"'"'$TOKEN'"'"'" "$R/etc/ente-alert.env" && grep -qx "TG_CHAT_ID='"'"'$CHAT'"'"'" "$R/etc/ente-alert.env"' \
   "$(tail -3 "$T/out")"

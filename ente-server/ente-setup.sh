@@ -96,7 +96,6 @@ load_env() {
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
   AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; TG_CHAT_ID=${TG_CHAT_ID:-}
-  BACKUP_DELETE_WARN=${BACKUP_DELETE_WARN:-500}; BACKUP_KEEP_DELETED_DAYS=${BACKUP_KEEP_DELETED_DAYS:-60}
   [[ ${1:-} != vpn ]] || return 0 # ente-vpn.sh needs none of the Ente settings
   S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
@@ -779,8 +778,6 @@ HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
 PHOTO_BUCKET="$S3_BUCKET"
 PHOTO_CFG_DIR="$PHOTO_CFG_DIR"
-BACKUP_DELETE_WARN="$BACKUP_DELETE_WARN"
-BACKUP_KEEP_DELETED_DAYS="$BACKUP_KEEP_DELETED_DAYS"
 EOF
   # the backup run itself is ente-backup.sh (standalone; this only installs it)
   [[ -f $SCRIPT_DIR/ente-backup.sh ]] || die "ente-backup.sh is missing next to $0 (copy the whole ente-server folder)"
@@ -841,6 +838,7 @@ EOF
 # ---------------------------------------------------------------- telegram alerts
 # setup_alerts: with TG_CHAT_ID set, install /usr/local/bin/ente-alert (send a message), ente-alert@.service (sends the log of a
 # failed unit), and ente-check.timer (daily `check` at 09:00; a FAIL triggers an alert). Sets ALERT_ONFAIL for ente-backup.service.
+# Each run first sends a test message, so a wrong token or chat id stops it here, not on the day a backup fails.
 # The bot token lives only in /etc/ente-alert.env (600) and is passed to curl on stdin, never on a command line.
 # Without TG_CHAT_ID the alert units are removed.
 ALERT_ONFAIL=
@@ -861,6 +859,9 @@ setup_alerts() {
   if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
   need_secret TG_BOT_TOKEN
   tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
+  tg_api sendMessage --data-urlencode "chat_id=$TG_CHAT_ID" \
+    --data-urlencode "text=🔔 Ente alerts on $(hostname) ($DOMAIN) are set up. Alerts arrive here when a backup or the daily check fails." 2>/dev/null ||
+    die "could not send to TG_CHAT_ID: wrong chat id, or nobody pressed Start in the bot / the bot is not in the group"
   write_file /etc/ente-alert.env 600 <<EOF
 TG_BOT_TOKEN='$TG_BOT_TOKEN'
 TG_CHAT_ID='$TG_CHAT_ID'
@@ -926,62 +927,10 @@ EOF
   systemctl daemon-reload
   systemctl enable --now ente-check.timer >/dev/null 2>&1
   ALERT_ONFAIL='OnFailure=ente-alert@%n.service'
-  log "telegram alerts on (failed backup, daily check at 09:00); test: $SCRIPT_DIR/ente-ops.sh alert-test. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
+  log "telegram alerts on (failed backup, daily check at 09:00), test message sent. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
 }
 
 # backup-setup: rclone remotes, refuse a foreign backup, install the timer and start a first backup.
-# backup_versions get|set: the backup bucket keeps old versions, so files the mirror deletes stay recoverable. Prints
-# "<versioning status> <days old versions are kept, or none>"; set first turns versioning on and adds or updates a lifecycle
-# rule (all files: old versions expire after BACKUP_KEEP_DELETED_DAYS), keeping any other rules. Uses the backup remote's key.
-backup_versions() {
-  dpkg -s python3-boto3 >/dev/null 2>&1 || apt_install python3-boto3 >/dev/null
-  python3 -I - "$1" "$RCLONE_CONFIG" "$BACKUP_S3_BUCKET" "$BACKUP_KEEP_DELETED_DAYS" <<'PY'
-import configparser, sys, boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
-mode, conf, bucket, days = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-c = configparser.RawConfigParser(); c.read(conf); r = c["backup"]
-s3 = boto3.client("s3", endpoint_url="https://" + r["endpoint"], region_name=r.get("region") or None,
-                  aws_access_key_id=r["access_key_id"], aws_secret_access_key=r["secret_access_key"],
-                  config=Config(s3={"addressing_style": "path"}))
-def rules():
-    try:
-        return s3.get_bucket_lifecycle_configuration(Bucket=bucket).get("Rules", [])
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "NoSuchLifecycleConfiguration":
-            return []
-        raise
-def whole(x):  # an enabled rule for every file in the bucket
-    f = x.get("Filter", {})
-    return x.get("Status") == "Enabled" and f.get("Prefix", x.get("Prefix", "")) == "" and set(f) <= {"Prefix"}
-if mode == "set":
-    if s3.get_bucket_versioning(Bucket=bucket).get("Status") != "Enabled":
-        s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
-    rs = [x for x in rules() if not (whole(x) and "NoncurrentVersionExpiration" in x)]
-    rs.append({"ID": "ente-setup-keep-deleted", "Status": "Enabled", "Filter": {"Prefix": ""},
-               "NoncurrentVersionExpiration": {"NoncurrentDays": days}})
-    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": rs})
-status = s3.get_bucket_versioning(Bucket=bucket).get("Status") or "Off"
-keep = [x["NoncurrentVersionExpiration"]["NoncurrentDays"] for x in rules() if whole(x) and "NoncurrentVersionExpiration" in x]
-print(status, min(keep) if keep else "none")
-PY
-}
-
-# Make the backup bucket keep old versions for BACKUP_KEEP_DELETED_DAYS; without versions, the mirror's deletes would be final.
-setup_backup_versions() {
-  local out st days
-  out=$(backup_versions set 2>&1) || true
-  read -r st days <<<"$(tail -1 <<<"$out")"
-  if [[ $st == Enabled && $days == "$BACKUP_KEEP_DELETED_DAYS" ]]; then
-    log "backup bucket keeps old versions for $days days"
-  elif [[ $st == Enabled ]]; then
-    log "WARNING: could not set the backup bucket's lifecycle ($(tail -1 <<<"$out" | cut -c1-160)). Set it by hand: old (noncurrent)" \
-      "versions expire after $BACKUP_KEEP_DELETED_DAYS days (B2: Lifecycle Settings, keep prior versions for $BACKUP_KEEP_DELETED_DAYS days)"
-  else
-    die "the backup bucket does not keep old versions and versioning could not be turned on ($(tail -1 <<<"$out" | cut -c1-160)); deleted photos would be lost for good. Turn versioning on for $BACKUP_S3_BUCKET and re-run"
-  fi
-}
-
 cmd_backup_setup() {
   load_env
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
@@ -991,7 +940,6 @@ cmd_backup_setup() {
   make_photo_crypt
   check_backup_owner
   check_backup_owner "$PHOTO_CFG_ROOT" photo-crypt "the photo bucket's $PHOTO_CFG_DIR/"
-  setup_backup_versions
   setup_alerts
   install_backup_units
   systemctl start --no-block ente-backup.service
@@ -1043,12 +991,12 @@ cmd_restore() {
   # shellcheck disable=SC2064 # expand now: $tmp is local to this function
   trap "rm -rf '$tmp'" EXIT
   log "fetching config backup"
-  rclone copy "$src" "$tmp" --checkers 4
+  # only the newest dump: the backup bucket keeps every dump ever made
+  rclone copy "$src" "$tmp" --checkers 4 --filter "+ $(restore_newest "$src")" --filter '- ente_db-*.dump'
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
-  # keep the dumps: the next backup syncs $DUMP_DIR to the backup and would delete every dump missing here
   install -d -m 700 "$DUMP_DIR"
-  cp -p "$tmp"/ente_db-*.dump "$DUMP_DIR/"
+  cp -p "$dump" "$DUMP_DIR/"
   install -d -m 700 "$ENTE_DIR"; touch "$ENTE_DIR/.restore-incomplete"
   install -m 600 "$tmp/compose.yaml" "$ENTE_DIR/compose.yaml"
   install -m 644 "$tmp/museum.yaml" "$ENTE_DIR/museum.yaml"
@@ -1103,7 +1051,7 @@ cmd_deploy() {
 COMMANDS="deploy bootstrap install codes lockdown backup-setup restore update"
 usage() {
   echo "usage: $0 {${COMMANDS// /|}}" >&2
-  [[ " check verify alert-test speedtest " != *" ${1:-} "* ]] || echo "$1 is now: $SCRIPT_DIR/ente-ops.sh $1" >&2
+  [[ " check verify " != *" ${1:-} "* ]] || echo "$1 is now: $SCRIPT_DIR/ente-ops.sh $1" >&2
   exit 2
 }
 main() { CMD=$1; "cmd_${CMD//-/_}"; }

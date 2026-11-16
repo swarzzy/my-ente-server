@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# ente-ops.sh - running an Ente server set up by ente-setup.sh: health checks, backup verification, tests.
+# ente-ops.sh - running an Ente server set up by ente-setup.sh: health checks and backup verification.
 # Usage: ente-ops.sh <command> (see OPS_COMMANDS below)
 #   check       read-only health report; exit 1 on any FAIL (daily by ente-check.timer when Telegram alerts are on)
 #   verify      deep test that the S3 backup restores (monthly by ente-verify.timer)
-#   alert-test  send a test message through the Telegram alert path
-#   speedtest   a temporary download/upload test endpoint on this server (30 minutes)
 # Config and secrets: those of ente-setup.sh. Needs ente-setup.sh next to it (its helpers).
 OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=ente-setup.sh
@@ -53,14 +51,6 @@ check_backup() {
   elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   rm -f "$ex"
-  # the mirror deletes what is gone from the photo bucket: only the backup bucket's old versions keep it recoverable
-  read -r s ts <<<"$(backup_versions get 2>/dev/null | tail -1)"
-  if [[ $s != Enabled ]]; then bad "the backup bucket does not keep old versions (${s:-cannot read it}): photos deleted by mistake would be lost (run backup-setup)"
-  elif [[ $ts != "$BACKUP_KEEP_DELETED_DAYS" ]]; then warn "the backup bucket keeps old versions for ${ts} days, not $BACKUP_KEEP_DELETED_DAYS (run backup-setup)"
-  else ok "the backup bucket keeps deleted photos as old versions for $ts days"; fi
-  if read -r ts s <"$BACKUP_STATE/deletes-warn" 2>/dev/null && (($(date +%s) - $(date -d "$ts" +%s) <= 7 * 86400)); then
-    warn "$s photo files were deleted from the photo bucket before the backup of $ts (over $BACKUP_DELETE_WARN); fine after a cleanup in Ente"
-  fi
   s=$(cat "$BACKUP_STATE"/last-ok-photo-config 2>/dev/null || true)
   if [[ -z $s ]]; then bad "no config copy in the photo bucket yet (the next backup makes it)"
   elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "config copy in the photo bucket is older than 36 h ($s)"
@@ -205,7 +195,7 @@ cmd_verify() {
   rm -f "$ex"
 
   echo "== config backup (decrypted, byte for byte)"
-  if out=$(rclone check "$DUMP_DIR" backup-crypt: --download --checkers 4 2>&1); then
+  if out=$(rclone check "$DUMP_DIR" backup-crypt: --one-way --download --checkers 4 2>&1); then
     ok "config backup decrypts with the stored passphrase and equals the local copies ($(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1))"
   else bad "config backup differs or cannot be decrypted: $(rc_err "$out")"; fi
   if out=$(rclone check "$DUMP_DIR" photo-crypt: --download --checkers 4 2>&1); then
@@ -248,80 +238,8 @@ PY
   echo "backup verified"
 }
 
-# ---------------------------------------------------------------- speedtest
-# speedtest: for 30 minutes serve a download/upload test under https://api.$DOMAIN/speedtest-<random token>/ to measure the
-# connection between a device and this server (the photos themselves travel device <-> bucket, not through here).
-# A small local server streams random data and swallows uploads; Caddy gets the route through its admin API, so the
-# Caddyfile is untouched and the route is gone when the test ends (or at the next Caddy reload).
-cmd_speedtest() {
-  load_env
-  local tok url port=8099
-  command -v caddy >/dev/null || die "run install first"
-  write_file /usr/local/bin/ente-speedtest 755 <<'EOF'
-#!/usr/bin/env python3
-# Managed by ente-setup.sh. GET .../down/<MB> streams random data; PUT/POST .../up reads and discards the body.
-import os, sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-BLOCK = os.urandom(1 << 20)
-class H(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    def log_message(self, *a): pass
-    def do_GET(self):
-        try: mb = max(1, min(2000, int(self.path.rstrip("/").rsplit("/", 1)[1])))
-        except ValueError: mb = 100
-        self.send_response(200); self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(mb << 20)); self.send_header("Cache-Control", "no-store"); self.end_headers()
-        for _ in range(mb): self.wfile.write(BLOCK)
-    def do_PUT(self):
-        n = int(self.headers.get("Content-Length") or 0); left = n
-        while left > 0:
-            d = self.rfile.read(min(left, 1 << 20))
-            if not d: break
-            left -= len(d)
-        b = str(n - left).encode()
-        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
-    do_POST = do_PUT
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
-EOF
-  systemctl stop ente-speedtest.service >/dev/null 2>&1 || true
-  systemctl reset-failed ente-speedtest.service >/dev/null 2>&1 || true
-  curl -fsS -m 5 -o /dev/null --unix-socket "$CADDY_ADMIN_SOCK" -X DELETE http://localhost/id/ente-speedtest 2>/dev/null || true
-  [[ -z $(ss -Htln "sport = :$port") ]] || die "port $port is in use"
-  tok=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  systemd-run --quiet --unit ente-speedtest --description "Ente speed test endpoint (temporary)" -p DynamicUser=yes -p RuntimeMaxSec=1800 \
-    -p ExecStopPost="+/usr/bin/curl -fsS -m 5 -o /dev/null --unix-socket $CADDY_ADMIN_SOCK -X DELETE http://localhost/id/ente-speedtest" \
-    /usr/local/bin/ente-speedtest "$port"
-  # first in the route list: the Caddyfile's host routes are terminal
-  curl -fsS -m 5 -o /dev/null --unix-socket "$CADDY_ADMIN_SOCK" -X PUT -H 'Content-Type: application/json' http://localhost/config/apps/http/servers/srv0/routes/0 -d @- <<EOF ||
-{"@id": "ente-speedtest", "terminal": true,
- "match": [{"host": ["api.$DOMAIN"], "path": ["/speedtest-$tok/*"]}],
- "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:$port"}], "flush_interval": -1}]}
-EOF
-    { systemctl stop ente-speedtest.service; die "could not add the route to Caddy (admin API on $CADDY_ADMIN_SOCK)"; }
-  url=https://api.$DOMAIN/speedtest-$tok
-  url_ok "$url/down/1" 5 || { systemctl stop ente-speedtest.service; die "the test endpoint does not answer"; }
-  cat <<EOF
-
-Speed test endpoint is up for 30 minutes (stop earlier: systemctl stop ente-speedtest):
-  $url
-
-Linux/macOS:  curl -o /dev/null -w 'download: %{speed_download} bytes/s\\n' $url/down/100
-              head -c 100000000 /dev/urandom > /tmp/up.bin && curl -o /dev/null -T /tmp/up.bin -w 'upload: %{speed_upload} bytes/s\\n' $url/up
-EOF
-}
-
-# ---------------------------------------------------------------- alert-test
-# alert-test: send a test message through the installed alert path.
-cmd_alert_test() {
-  load_env
-  [[ -n $TG_CHAT_ID && -x /usr/local/bin/ente-alert ]] || die "alerts not set up: set TG_CHAT_ID, then run backup-setup"
-  echo "Test from ente-setup on $(hostname) ($DOMAIN). Alerts arrive here when a backup or the daily check fails." |
-    /usr/local/bin/ente-alert "🔔 Ente alert test" || die "sending failed: wrong TG_CHAT_ID, or nobody pressed Start in the bot / the bot is not in the group"
-  log "test message sent"
-}
-
 # ---------------------------------------------------------------- main
-OPS_COMMANDS="check verify alert-test speedtest"
+OPS_COMMANDS="check verify"
 ops_usage() { echo "usage: $0 {${OPS_COMMANDS// /|}}" >&2; exit 2; }
 
 # sourced (tests): define the functions only

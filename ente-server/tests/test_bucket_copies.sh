@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests for "either bucket alone + BACKUP_PASSPHRASE restores everything": the encrypted config copy in the photo bucket
-# (photo-crypt), the real backup script writing both copies while keeping that copy out of the photo mirror, the exclusion in
+# (photo-crypt), the real backup script writing both copies while keeping that copy out of the photo copy, the exclusion in
 # check/verify (new_uploads), the ownership check on the photo bucket, and restore's choice of source and how it resumes an interrupted run.
 # The buckets are local folders behind rclone alias remotes and docker is a stub, so this changes nothing outside a temp dir.
 # Needs bash, python3 and rclone (the server has them). Run: bash tests/test_bucket_copies.sh
@@ -24,9 +24,9 @@ check "the env file names the config copy's folder" 'grep -qx "PHOTO_CFG_DIR=\"e
 check "without its config the backup stops at once and says so" '((RC != 0)) && grep -q "BACKUP_ROOT: not set" "$T/out"' "$(cat "$T/out")"
 run_backup; RC=$?
 check "a backup run succeeds" '((RC == 0))' "$(tail -5 "$T/out")"
-check "photos are mirrored to the backup bucket" '[[ $(cat "$T/b2/bk/objects/1580559962386439/aaa" 2>/dev/null) == photo-a ]]'
+check "photos are copied to the backup bucket" '[[ $(cat "$T/b2/bk/objects/1580559962386439/aaa" 2>/dev/null) == photo-a ]]'
 check "the config copy is in the photo bucket" '[[ -d $T/s3/photo/ente-backup-config/config ]]'
-check "the config copy is NOT mirrored into the backup's objects/" '[[ ! -e $T/b2/bk/objects/ente-backup-config ]]' "$(find "$T/b2/bk/objects" | head)"
+check "the config copy is NOT copied into the backup's objects/" '[[ ! -e $T/b2/bk/objects/ente-backup-config ]]' "$(find "$T/b2/bk/objects" | head)"
 check "the copy's names are encrypted (no plaintext museum.yaml or dump name)" \
   '! find "$T/s3/photo/ente-backup-config" | grep -E "museum|ente_db|compose" >/dev/null'
 check "the copy's contents are encrypted" '! grep -r "KEY-ONE" "$T/s3/photo/ente-backup-config" >/dev/null'
@@ -39,10 +39,9 @@ run_backup; RC=$?
 check "a second run succeeds" '((RC == 0))' "$(tail -5 "$T/out")"
 ( env "${BACKUP_ENV[@]}" ENTE_BACKUP_ENV="$T/root/etc/ente-backup.env" PATH="$T/bin:$PATH" bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; RC=$?
 check "run by hand (no environment from systemd): it reads /etc/ente-backup.env itself" '((RC == 0))' "$(tail -5 "$T/out")"
-check "a deleted photo is deleted from the mirror too (its history is the backup bucket's old versions)" '[[ ! -e $T/b2/bk/objects/1580559962386439/bbb && -f $T/b2/bk/objects/1580559962386439/aaa ]]'
-check "with the copy present, it is still not mirrored into objects/ (the exclusion, not luck)" \
+check "a photo deleted from the photo bucket stays in the backup (the backup never deletes)" '[[ -f $T/b2/bk/objects/1580559962386439/bbb && -f $T/b2/bk/objects/1580559962386439/aaa ]]'
+check "with the copy present, it is still not copied into objects/ (the exclusion, not luck)" \
   '[[ -d $T/s3/photo/ente-backup-config && ! -e $T/b2/bk/objects/ente-backup-config ]]' "$(find "$T/b2/bk/objects" | head)"
-check "no deleted/ folder is made" '[[ ! -e $T/b2/bk/deleted ]]'
 check "the config copy is still in the photo bucket" 'rclone lsf photo-crypt: 2>/dev/null | grep -x museum.yaml >/dev/null'
 chmod 000 "$T/s3/photo/ente-backup-config"
 run_backup; RC=$?
@@ -128,10 +127,12 @@ check "... and leaves .restore-incomplete (not .restore-finishing)" '[[ -e $R/.r
 check "... museum was never started" '! grep -qx "up -d" "$T/dc.log"' "$(cat "$T/dc.log")"
 MUSEUM_UP=1 restore_run; RC=$?
 check "re-run while museum runs: refused, nothing wiped" '((RC != 0)) && ! wiped && [[ -f $R/museum.yaml ]] && grep -q "not wiping" "$T/out"' "$(tail -3 "$T/out")"
+for d in 2000-01-01 2000-01-02; do echo old | rclone rcat "photo-crypt:ente_db-$d.dump" 2>/dev/null; done # older dumps in the source (as the backup bucket keeps)
 restore_run; RC=$?
 check "re-run before the database was restored: wipes the half-done attempt and succeeds" '((RC == 0)) && wiped' "$(tail -3 "$T/out")"
 check "... and leaves no marker" '[[ ! -e $R/.restore-incomplete && ! -e $R/.restore-finishing && -f $R/museum.yaml ]]'
-check "... and keeps the dumps (the next backup would delete missing ones)" '[[ -n $(find "$T/re-dumps" -name "ente_db-*.dump") ]]'
+check "... fetches only the newest dump into the dump folder (the backup bucket holds every dump)" \
+  '[[ $(cd "$T/re-dumps" && ls ente_db-*.dump) == "ente_db-$(date +%F).dump" ]]' "$(ls "$T/re-dumps")"
 restore_run; RC=$?
 check "restore on a finished server: refused, nothing wiped" '((RC != 0)) && ! wiped && grep -q "already exists" "$T/out"' "$(tail -3 "$T/out")"
 rm -rf "$R"

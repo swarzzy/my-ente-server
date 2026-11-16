@@ -6,7 +6,7 @@ One script, `ente-setup.sh`, turns a fresh Debian 12/13 VPS into a working, back
 - **Caddy** (Let's Encrypt TLS, security headers) is the only public service; Museum, the web apps and Postgres run in Docker on `127.0.0.1`.
 - **Photos** are stored in an external S3 bucket (IDrive e2, Backblaze B2, Wasabi, ...). Apps upload and download
   straight to that bucket through links Museum signs, so the VPS needs almost no disk (25 GB is plenty).
-- **Backups** go daily to a second S3 bucket: encrypted DB dump + `museum.yaml`, plus a mirror of the photo bucket. The same
+- **Backups** go daily to a second S3 bucket: encrypted DB dump + `museum.yaml`, plus a copy of the photo bucket (nothing is ever deleted there). The same
   encrypted dump + config is also kept inside the photo bucket, so **either bucket alone + `BACKUP_PASSPHRASE` restores everything**.
 
 Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
@@ -17,7 +17,7 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 | --- | --- |
 | `ente-setup.sh` | the script: sets up the server (deploy, install, backup-setup, restore, update, ...) |
 | `ente-backup.sh` | one backup run, standalone (installed by `backup-setup` as `/usr/local/bin/ente-backup.sh`, run daily by `ente-backup.service`) |
-| `ente-ops.sh` | running it: `check`, `verify`, `alert-test`, `speedtest` (needs `ente-setup.sh` next to it) |
+| `ente-ops.sh` | running it: `check`, `verify` (needs `ente-setup.sh` next to it) |
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
@@ -32,8 +32,7 @@ them) and stops naming any that a command needs but is missing; it never logs th
 
 1. **Buckets.** Create two buckets at two providers if you can. The key for the photo bucket needs read/write/delete and
    permission to set CORS (the script sets it; if the provider refuses it prints what to set by hand).
-   Backup bucket: it must keep old versions (versioning; B2 always does). `backup-setup` turns versioning on if needed and sets a
-   lifecycle rule that removes old versions after `BACKUP_KEEP_DELETED_DAYS` (60); its key needs permission for both, or set them by hand.
+   Backup bucket: the backup only adds to it, so its key needs read/write (no delete). It grows: clean it up by hand (see "Backups").
 2. **DNS.** A (and AAAA) records for `api.`, `web.` and `albums.` under your domain → the VPS, TTL 300.
 3. **Config.** Copy `ente-server/` to the VPS, create `ente-setup.env` and `ente-setup.secrets` from the examples.
    `BACKUP_PASSPHRASE` encrypts the config backup: keep it in a password manager, without it the backup is unreadable.
@@ -70,20 +69,24 @@ browser console open and look for CSP reports before considering enforcing it. H
 
 A run of `ente-backup.sh` (`systemctl start --no-block ente-backup.service`, logs `journalctl -u ente-backup.service`; config in
 `/etc/ente-backup.env`, written by `backup-setup`):
-dumps Postgres (verified, atomic), copies `museum.yaml`/`compose*.yaml`, syncs them to `<backup bucket>/config` (names and contents
-encrypted with `BACKUP_PASSPHRASE`), mirrors the photo bucket to `<backup bucket>/objects`, then syncs the same encrypted config to
-`<photo bucket>/ente-backup-config/config` (excluded from the mirror; museum never lists its bucket, so it ignores the folder).
-Objects deleted from the photo bucket are deleted from the mirror too; the backup bucket keeps them as old versions for
-`BACKUP_KEEP_DELETED_DAYS` (60), so `check` FAILs if it stops keeping versions. When more than `BACKUP_DELETE_WARN` (500) files
-vanish between two backups, the backup still runs and sends a Telegram warning (and `check` WARNs for a week) with the command to
-put them back as they were at the last backup: `rclone copy --s3-version-at '<time>' backup:<backup bucket>/objects ente-s3:<photo bucket>`.
-After a cleanup in Ente that is expected (Ente removes a file from its bucket 45 days after it leaves the trash); otherwise act within the 60 days.
+dumps Postgres (verified, atomic; 7 days kept on the server), copies `museum.yaml`/`compose*.yaml`, copies them to `<backup bucket>/config`
+(names and contents encrypted with `BACKUP_PASSPHRASE`), copies the photo bucket to `<backup bucket>/objects`, then syncs the same
+encrypted config (the last 7 dumps) to `<photo bucket>/ente-backup-config/config` (excluded from the copy; museum never lists its
+bucket, so it ignores the folder).
+**The backup never deletes anything in the backup bucket**: photos Ente deletes and every daily dump stay there until you clean up
+by hand. To see what is in the backup but no longer in the photo bucket, then remove it, and to drop dumps older than 90 days:
+
+```
+sudo rclone check ente-s3:<photo bucket> backup:<backup bucket>/objects --exclude '/ente-backup-config/**' --size-only --missing-on-src -
+sudo rclone sync  ente-s3:<photo bucket> backup:<backup bucket>/objects --exclude '/ente-backup-config/**' --size-only --dry-run   # then without --dry-run
+sudo rclone delete backup-crypt: --include 'ente_db-*.dump' --min-age 90d --dry-run
+```
 `HC_URL` (optional; any heartbeat URL: healthchecks.io, Better Stack, Cronitor, ...) is pinged only after a fully successful run, so the
 service alerts you when a run fails, does not happen, or the server is down. A failed ping does not fail the backup; `check` reports it.
 
 `backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, one the passphrase cannot read, or one it cannot list.
-The server holds keys that can delete backups: turn on bucket versioning or Object Lock at the backup provider if it supports it, and use a key limited to that bucket.
-The dumps have no other history, so a run that would delete more than 20 of them stops instead, before deleting anything.
+The backup never deletes, so give the backup bucket a key limited to that bucket without delete permission (B2: no `deleteFiles`): then
+the server cannot destroy the backup. Do the clean-up above with a separate key, from your PC.
 
 What survives what (you also need each provider's account to create new keys, and your Ente password to log in):
 
@@ -107,7 +110,8 @@ Nothing is sent while all is well. Not covered: the VPS itself being down (only 
 2. Chat ID: open `https://api.telegram.org/bot<TOKEN>/getUpdates` after writing to the bot and read `"chat":{"id":...}`
    (groups start with `-`), or ask @userinfobot.
 3. `TG_CHAT_ID=...` in `ente-setup.env`, `TG_BOT_TOKEN=...` in `ente-setup.secrets`, then
-   `sudo ./ente-setup.sh backup-setup` and `sudo ./ente-ops.sh alert-test`.
+   `sudo ./ente-setup.sh backup-setup`. It sends a test message to the chat and stops with an error if that fails
+   (re-run it to test again).
 
 The daily check runs the script from where `backup-setup` was run: keep the folder there (or re-run `backup-setup` after moving it).
 The token is stored only in `/etc/ente-alert.env` (mode 600) and passed to curl on stdin. To turn alerts off, empty `TG_CHAT_ID`
@@ -208,8 +212,8 @@ The Amnezia PPA's signing key is embedded in `ente-vpn.sh` and checked by finger
 
 The apps upload and download photos directly to the photo bucket with links museum signs. Where devices reach the bucket's
 endpoint badly (slow or blocked) but reach this server well, the add-on `ente-s3-proxy.sh` routes that traffic through the
-server instead, uploads included, and back again on demand. Measure first: it only helps if the server is clearly faster.
-`sudo ./ente-ops.sh speedtest` opens a test endpoint on the server for 30 minutes and prints `curl` lines for download and upload.
+server instead, uploads included, and back again on demand. Measure first: it only helps if devices reach the server clearly
+faster than the bucket's endpoint.
 
 1. DNS: an A (and AAAA) record for the proxy host, e.g. `s3.<domain>`, pointing at the server.
 2. `S3_PROXY_HOST=s3.<domain>` in `ente-setup.env`, then `sudo ./ente-s3-proxy.sh install`: the link rewriter service and the
@@ -238,13 +242,12 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 | --- | --- | --- |
 | `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum, the bot against a fake Telegram |
 | `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, command lines |
-| `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the mirror's exclusion, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
-| `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the warning on a large photo deletion (Telegram, log, stamp; the backup still runs), the dumps' limit (over it nothing is deleted), `verify` catching a bad dump, empty tables, a damaged photo, other keys or missing config files, and every FAIL in the backup part of `check` |
+| `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the copy's exclusion, restore fetching only the newest dump, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
+| `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the backup never deletes in the backup bucket (photos or dumps gone from the server stay there), `verify` catching a bad dump, empty tables, a damaged photo, other keys or missing config files, and every FAIL in the backup part of `check` |
 | `bash tests/test_quickstart.sh` | anywhere with network (fetches Ente's current quickstart; docker stubbed) | `install`'s edits against today's quickstart: ports on 127.0.0.1, URLs, the external bucket, keys kept, in place, idempotent; a changed layout is refused |
 | `bash tests/test_lockdown.sh` | anywhere (Postgres stubbed) | `lockdown`: oldest user becomes admin only after `y`, re-runs change nothing, install keeps the block, a hand-made `internal:` is refused, edited in place |
 | `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down |
 | `sudo bash tests/test_vpn_config.sh` | the server, after `ente-vpn.sh install` | the VPN config generator: keys pair up, same obfuscation on both sides within AmneziaWG's rules, mode 600, never overwrites, refuses a busy port |
-| `sudo bash tests/backup_versions_e2e.sh` | the server, after `backup-setup` (uses a throwaway prefix in the real backup bucket, removed after) | the backup bucket keeps a file the mirror deletes as an old version, and the warning's `--s3-version-at` command brings it back |
 | `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev` |
 | `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |

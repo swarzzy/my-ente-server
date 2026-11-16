@@ -169,7 +169,11 @@ out=$(asuser bash "$CLI/ente-setup.sh" nonsense 2>&1); rc=$?
 check "ente-setup.sh rejects unknown commands before asking for root" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
 out=$(asuser bash "$CLI/ente-setup.sh" install extra 2>&1); check "ente-setup.sh commands take no argument" '[[ $out == *usage* ]]' "$out"
 out=$(asuser bash "$CLI/ente-setup.sh" install 2>&1); check "ente-setup.sh install asks for root" '[[ $out == *"run as root"* ]]' "$out"
-for c in check verify alert-test speedtest; do
+for c in alert-test speedtest; do
+  out=$(asuser bash "$CLI/ente-ops.sh" "$c" 2>&1); rc=$?
+  check "ente-ops.sh no longer has $c" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
+done
+for c in check verify; do
   out=$(asuser bash "$CLI/ente-setup.sh" "$c" 2>&1); rc=$?
   check "ente-setup.sh no longer has $c (moved to ente-ops.sh)" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
   out=$(asuser bash "$CLI/ente-ops.sh" "$c" 2>&1); check "ente-ops.sh $c is a known command (asks for root here)" '[[ $out == *"run as root"* ]]' "$out"
