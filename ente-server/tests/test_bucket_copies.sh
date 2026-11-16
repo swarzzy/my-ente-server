@@ -204,6 +204,19 @@ MUSEUM_UP=1 restore_run; RC=$?
 check "re-run after the database restore (museum running, in use): finishes without wiping or restoring again" \
   '((RC == 0)) && ! wiped && ! grep -q pg_restore "$T/dc.log" && [[ ! -e $R/.restore-finishing ]]' "$(cat "$T/out" "$T/dc.log" | tail -8)"
 
+echo "== rclone.conf is replaced atomically"
+cp -p "$RCLONE_CONFIG" "$T/conf.before"
+printf 'zz=ok\n' | in_setup 'rclone_set extra-remote' >/dev/null 2>&1; RC=$?
+check "rclone_set adds a remote and keeps the others" \
+  '((RC == 0)) && [[ $(conf_get extra-remote zz) == ok && $(conf_get ente-s3 remote) == "$T/s3" ]]' "$(cat "$RCLONE_CONFIG")"
+check "... the config stays private (600)" '[[ $(stat -c %a "$RCLONE_CONFIG") == 600 ]]'
+cp -p "$RCLONE_CONFIG" "$T/conf.before"
+# an invalid byte makes the write fail half-way (the first section is written, then the encoder fails)
+printf 'zz=\xff\n' | LC_ALL=C in_setup 'rclone_set ente-s3' >"$T/out" 2>&1; RC=$?
+check "a write that fails half-way: rclone_set fails" '((RC != 0))' "$(tail -3 "$T/out")"
+check "... and the config is exactly as before (no remote lost)" 'cmp -s "$RCLONE_CONFIG" "$T/conf.before"' "$(cat "$RCLONE_CONFIG")"
+check "... and no temp file is left next to it" '[[ -z $(find "$(dirname "$RCLONE_CONFIG")" -maxdepth 1 -name ".rclone.conf.*") ]]'
+
 echo
 echo "$PASS passed, $FAIL failed"
 ((FAIL == 0))

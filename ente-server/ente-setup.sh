@@ -663,15 +663,23 @@ rclone_set() {
   local conf
   conf=$(rclone config file | tail -1)
   mkdir -p "$(dirname "$conf")"
+  # written to a temp file and renamed over the old one: an interrupted write (disk full, Ctrl-C, reboot) never leaves a
+  # truncated config, which would lose every remote
   (umask 077; python3 -I -c '
-import configparser, sys
+import configparser, os, sys, tempfile
 conf, remote = sys.argv[1:]
 cp = configparser.RawConfigParser(); cp.optionxform = str; cp.read(conf)
 if not cp.has_section(remote): cp.add_section(remote)
 for line in sys.stdin.read().splitlines():
     if line:
         k, v = line.split("=", 1); cp.set(remote, k, v)
-with open(conf, "w") as f: cp.write(f)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".rclone.conf.")
+try:
+    with os.fdopen(fd, "w") as f:
+        cp.write(f); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, conf)
+except BaseException:
+    os.unlink(tmp); raise
 ' "$conf" "$1")
 }
 
