@@ -150,7 +150,7 @@ echo "== command lines"
 # as root (on the server) a known command would really run: run those checks as an unprivileged user on a copy
 asuser() { "$@"; }
 if [[ $EUID -eq 0 ]]; then
-  mkdir -p "$T/bin"; cp "$HERE/../ente-setup.sh" "$HERE/../ente-s3-proxy.sh" "$T/bin/"; chmod 755 "$T" "$T/bin" "$T/bin"/*
+  mkdir -p "$T/bin"; cp "$HERE/../ente-setup.sh" "$HERE/../ente-ops.sh" "$HERE/../ente-s3-proxy.sh" "$T/bin/"; chmod 755 "$T" "$T/bin" "$T/bin"/*
   asuser() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
   CLI=$T/bin
 else
@@ -167,8 +167,16 @@ out=$(asuser bash "$CLI/ente-setup.sh" proxy 2>&1); rc=$?
 check "ente-setup.sh no longer has a proxy command" '[[ $rc -eq 2 && $out == *usage* ]] && ! grep -q "proxy" <<<"$out"' "$out"
 out=$(asuser bash "$CLI/ente-setup.sh" nonsense 2>&1); rc=$?
 check "ente-setup.sh rejects unknown commands before asking for root" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
-out=$(asuser bash "$CLI/ente-setup.sh" check extra 2>&1); check "ente-setup.sh commands take no argument" '[[ $out == *usage* ]]' "$out"
-out=$(asuser bash "$CLI/ente-setup.sh" check 2>&1); check "ente-setup.sh check asks for root" '[[ $out == *"run as root"* ]]' "$out"
+out=$(asuser bash "$CLI/ente-setup.sh" install extra 2>&1); check "ente-setup.sh commands take no argument" '[[ $out == *usage* ]]' "$out"
+out=$(asuser bash "$CLI/ente-setup.sh" install 2>&1); check "ente-setup.sh install asks for root" '[[ $out == *"run as root"* ]]' "$out"
+for c in check verify alert-test speedtest; do
+  out=$(asuser bash "$CLI/ente-setup.sh" "$c" 2>&1); rc=$?
+  check "ente-setup.sh no longer has $c (moved to ente-ops.sh)" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
+  out=$(asuser bash "$CLI/ente-ops.sh" "$c" 2>&1); check "ente-ops.sh $c is a known command (asks for root here)" '[[ $out == *"run as root"* ]]' "$out"
+done
+out=$(asuser bash "$CLI/ente-ops.sh" install 2>&1); rc=$?
+check "ente-ops.sh has no setup commands" '[[ $rc -eq 2 && $out == *usage* && $out != *install* ]]' "$out"
+out=$(asuser bash "$CLI/ente-ops.sh" check extra 2>&1); check "ente-ops.sh commands take no argument" '[[ $out == *usage* ]]' "$out"
 
 echo
 echo "$PASS passed, $FAIL failed"

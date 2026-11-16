@@ -3,7 +3,7 @@
 # Usage: ente-s3-proxy.sh {install|on|off|status|check|uninstall}
 #   install    the link rewriter service and the proxy site (state unchanged, off at first)
 #   on | off   switch museum's bucket links to https://$S3_PROXY_HOST/<bucket>/ or back to the bucket (installs if needed)
-#   status     the state and the checks          check   the checks only (ente-setup.sh check runs this)
+#   status     the state and the checks          check   the checks only (ente-ops.sh check runs this)
 #   uninstall  remove everything; links point at the bucket again
 # Config: S3_PROXY_HOST in ente-setup.env (its DNS record pointing here); everything else comes from ente-setup.sh's config.
 # Needs ente-setup.sh (and ente_s3_rewrite.py) next to it, and `ente-setup.sh install` done.
@@ -254,7 +254,7 @@ cmd_status() {
   ((FAILS == 0))
 }
 
-# check: only the OK/FAIL lines (for ente-setup.sh check); exit 1 on any FAIL.
+# check: only the OK/FAIL lines (for ente-ops.sh check); exit 1 on any FAIL.
 cmd_check() {
   proxy_load_env
   [[ -e $PROXY_SITE ]] || { bad "S3 proxy is not installed"; return 1; }
@@ -293,7 +293,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   [[ $# -eq 1 && " install on off status check uninstall " == *" $1 "* ]] || proxy_usage
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $1)" >&2; exit 1; }
   CMD="s3-proxy $1"
-  if [[ $1 == check ]]; then proxy_main check; exit; fi # quiet, not logged: run by ente-setup.sh check
+  if [[ $1 == check ]]; then proxy_main check; exit; fi # quiet, not logged: run by ente-ops.sh check
   touch "$LOG"; chmod 600 "$LOG"
   proxy_main "$1" 2>&1 | tee -a "$LOG"
 fi

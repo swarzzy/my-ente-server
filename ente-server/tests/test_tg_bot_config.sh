@@ -94,12 +94,12 @@ out=$("$T/helper" status check 2>&1); rc=$?; check "helper refuses two arguments
 check "helper does not pass the environment through (absolute paths only)" '! grep -qE "\\\$[A-Z_]+[^0-9]" <(grep -v "^#" "$T/helper" | grep -v "\\\$1\|\\\$#")' "$(cat "$T/helper")"
 
 echo "== failing actions still report"
-if [[ $EUID -ne 0 ]]; then # here ente-setup.sh check fails with "run as root": the reply must carry that, not be empty
+if [[ $EUID -ne 0 ]]; then # here ente-ops.sh check fails with "run as root": the reply must carry that, not be empty
   out=$(in_bot "$U" "" 'bot_load_env; act_check; echo "rc=$?"' 2>&1)
   check "a failing check returns its output and exit code" '[[ $out == *"run as root"* && $out == *"rc=1"* ]]' "$out"
 fi
 out=$(in_bot "$U" "" 'bot_load_env; bot_root_files' 2>&1)
-check "the root-only check covers the scripts, the env file and the secrets file" '[[ $out == *"ente-tg-bot.sh"* && $out == *"ente-setup.sh"* && $out == *"ente-s3-proxy.sh"* && $out == *"$T/env"* && $out == *"$T/secrets"* ]]' "$out"
+check "the root-only check covers the scripts, the env file and the secrets file" '[[ $out == *"ente-tg-bot.sh"* && $out == *"ente-setup.sh"* && $out == *"ente-ops.sh"* && $out == *"ente-s3-proxy.sh"* && $out == *"$T/env"* && $out == *"$T/secrets"* ]]' "$out"
 
 echo "== the scripts the helper runs as root must be root's alone"
 mkdir -p "$T/own"; touch "$T/own/a"; chmod 755 "$T/own"; chmod 644 "$T/own/a"
@@ -122,7 +122,7 @@ if [[ $EUID -ne 0 ]]; then out=$(in_bot "$U" "" "root_only_writable $T/own/a" 2>
 echo "== command lines"
 asuser() { "$@"; }
 if [[ $EUID -eq 0 ]]; then
-  mkdir -p "$T/bin"; cp "$HERE/../ente-setup.sh" "$HERE/../ente-tg-bot.sh" "$T/bin/"; chmod 755 "$T" "$T/bin" "$T/bin"/*
+  mkdir -p "$T/bin"; cp "$HERE/../ente-setup.sh" "$HERE/../ente-ops.sh" "$HERE/../ente-tg-bot.sh" "$T/bin/"; chmod 755 "$T" "$T/bin" "$T/bin"/*
   asuser() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
   CLI=$T/bin
 else

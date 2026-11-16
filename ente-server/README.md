@@ -15,7 +15,8 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 
 | File | Purpose |
 | --- | --- |
-| `ente-setup.sh` | the script |
+| `ente-setup.sh` | the script: sets up the server (deploy, install, backup-setup, restore, update, ...) |
+| `ente-ops.sh` | running it: `check`, `verify`, `alert-test`, `speedtest` (needs `ente-setup.sh` next to it) |
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
@@ -98,7 +99,7 @@ Nothing is sent while all is well. Not covered: the VPS itself being down (only 
 2. Chat ID: open `https://api.telegram.org/bot<TOKEN>/getUpdates` after writing to the bot and read `"chat":{"id":...}`
    (groups start with `-`), or ask @userinfobot.
 3. `TG_CHAT_ID=...` in `ente-setup.env`, `TG_BOT_TOKEN=...` in `ente-setup.secrets`, then
-   `sudo ./ente-setup.sh backup-setup` and `sudo ./ente-setup.sh alert-test`.
+   `sudo ./ente-setup.sh backup-setup` and `sudo ./ente-ops.sh alert-test`.
 
 The daily check runs the script from where `backup-setup` was run: keep the folder there (or re-run `backup-setup` after moving it).
 The token is stored only in `/etc/ente-alert.env` (mode 600) and passed to curl on stdin. To turn alerts off, empty `TG_CHAT_ID`
@@ -111,7 +112,7 @@ and re-run `backup-setup`.
 | Command | Does |
 | --- | --- |
 | `/status` | short summary: containers, last backup, last check and verify, proxy, disk, uptime |
-| `/check` | runs `ente-setup.sh check`, replies with the FAIL/WARN lines and the verdict |
+| `/check` | runs `ente-ops.sh check`, replies with the FAIL/WARN lines and the verdict |
 | `/backup` | runs a backup now; replies at once, then with the result |
 | `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |
 
@@ -125,9 +126,9 @@ than a minute, and maps each command to a fixed action name: no text from Telegr
 `/usr/local/sbin/ente-tg-action <one of six names>` (`/etc/sudoers.d/ente-tg-bot`); that helper runs `ente-tg-bot.sh action <name>`,
 so the script folder must be root's alone (`chown -R root: ente-server; chmod -R go-w ente-server`; `install` refuses otherwise).
 The token reaches the bot as a systemd credential, never on a command line. Anyone who controls your Telegram account can use the
-bot: turn on Telegram's two-step verification. `ente-setup.sh check` includes the bot's checks while it is installed.
+bot: turn on Telegram's two-step verification. `ente-ops.sh check` includes the bot's checks while it is installed.
 
-## Monthly: `sudo ./ente-setup.sh check`
+## Monthly: `sudo ./ente-ops.sh check`
 
 OK/FAIL report: containers, restart policy, localhost-only ports, sshd, UFW, Caddy, HTTPS, photo bucket + CORS, backup timer and last
 result, `rclone check` photo bucket vs backup, the age of the config copy in the photo bucket, the last good `verify`, disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
@@ -135,7 +136,7 @@ result, `rclone check` photo bucket vs backup, the age of the config copy in the
 ## Monthly, automatic: `verify`
 
 `check` proves that backups ran and that object sizes match; `verify` proves the S3 backup can be restored. `backup-setup` installs
-`ente-verify.timer` (the 1st of each month, 04:30; a FAIL sends a Telegram alert if alerts are on). By hand: `sudo ./ente-setup.sh verify`.
+`ente-verify.timer` (the 1st of each month, 04:30; a FAIL sends a Telegram alert if alerts are on). By hand: `sudo ./ente-ops.sh verify`.
 
 - photo bucket against the backup by checksum (objects without a common checksum, e.g. multipart uploads, are compared by size and counted in a WARN);
 - the encrypted config backup and its copy in the photo bucket, downloaded, decrypted with the stored passphrase and compared byte for
@@ -170,7 +171,8 @@ If a pinned build is ever deleted from the registry, `install`/`restore` warn an
 2. `./ente-setup.sh deploy` (bootstrap, then `restore`, then `backup-setup`). `restore` reads the encrypted config from whichever
    bucket holds the newer dump (the log says which), puts back `museum.yaml`, restores that DB dump, uses the photos already in the
    photo bucket and tops up any objects missing there from the backup bucket (copy only, never deletes). About 2 minutes for a small library.
-   If a restore is interrupted, just run it again: it cleans up and starts over.
+   If a restore is interrupted, just run it again. Stopped before the database was restored, it cleans up and starts over;
+   after, it only finishes the remaining steps. It never wipes a restored database, and `check` FAILs until it finishes.
 3. Point DNS (`api.`, `web.`, `albums.`, TTL 300) at the new IP; certificates are issued once it resolves. Run `check`.
 
 Apps keep working because the hostnames do not change. To restore into a *new* photo bucket, set the new `S3_*` values:
@@ -199,7 +201,7 @@ The Amnezia PPA's signing key is embedded in `ente-vpn.sh` and checked by finger
 The apps upload and download photos directly to the photo bucket with links museum signs. Where devices reach the bucket's
 endpoint badly (slow or blocked) but reach this server well, the add-on `ente-s3-proxy.sh` routes that traffic through the
 server instead, uploads included, and back again on demand. Measure first: it only helps if the server is clearly faster.
-`sudo ./ente-setup.sh speedtest` opens a test endpoint on the server for 30 minutes and prints `curl` lines for download and upload.
+`sudo ./ente-ops.sh speedtest` opens a test endpoint on the server for 30 minutes and prints `curl` lines for download and upload.
 
 1. DNS: an A (and AAAA) record for the proxy host, e.g. `s3.<domain>`, pointing at the server.
 2. `S3_PROXY_HOST=s3.<domain>` in `ente-setup.env`, then `sudo ./ente-s3-proxy.sh install`: the link rewriter service and the
@@ -214,7 +216,7 @@ valid and the provider still checks every signature. Photo data streams through 
 
 The add-on owns two files that `ente-setup.sh`'s Caddyfile imports: `/etc/caddy/ente.d/api-upstream.caddy` (where the API goes)
 and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh install` never overwrites them, and
-`ente-setup.sh check` includes the add-on's checks while it is installed (so the daily check alerts on it too).
+`ente-ops.sh check` includes the add-on's checks while it is installed (so the daily check alerts on it too).
 
 - Links handed out while on keep working after `off` (the proxy site stays up while installed).
 - If the rewriter dies, Caddy sends the API straight to museum (links point at the bucket again); `check` reports it.

@@ -29,7 +29,7 @@ BOT_RUN=${BOT_RUN:-systemd-run --quiet --wait --pipe --collect -p RuntimeMaxSec=
 # bot_root_files: everything the actions run or source as root.
 bot_root_files() {
   local f
-  for f in "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" "$BOT_DIR/ente-s3-proxy.sh" "$ENV_FILE" "$SECRETS_FILE"; do [[ ! -e $f ]] || echo "$f"; done
+  for f in "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" "$BOT_DIR/ente-ops.sh" "$BOT_DIR/ente-s3-proxy.sh" "$ENV_FILE" "$SECRETS_FILE"; do [[ ! -e $f ]] || echo "$f"; done
 }
 
 # bot_load_env: ente-setup.sh's config plus a valid TG_BOT_USER_ID (a person's id: positive).
@@ -50,7 +50,7 @@ bot_token() {
 }
 
 # root_only_writable PATH...: true if each path and every directory above it is owned by root and not group/world-writable.
-# The helper runs ente-tg-bot.sh and ente-setup.sh as root: anyone who could change them could run anything as root.
+# The helper runs ente-tg-bot.sh, ente-setup.sh and ente-ops.sh as root: anyone who could change them could run anything as root.
 root_only_writable() {
   local p d
   for p in "$@"; do
@@ -165,7 +165,7 @@ act_status() {
 
 act_check() {
   local out rc
-  out=$(bash "$BOT_DIR/ente-setup.sh" check 2>&1) && rc=0 || rc=$?
+  out=$(bash "$BOT_DIR/ente-ops.sh" check 2>&1) && rc=0 || rc=$?
   grep -E '^  (FAIL|WARN)' <<<"$out" | grep -v "check storage usage of both buckets" || true
   echo "$(grep -c '^  OK' <<<"$out") OK"
   tail -1 <<<"$out"
@@ -259,7 +259,7 @@ cmd_status() {
   ((FAILS == 0))
 }
 
-# check: only the OK/FAIL lines (for ente-setup.sh check); exit 1 on any FAIL.
+# check: only the OK/FAIL lines (for ente-ops.sh check); exit 1 on any FAIL.
 cmd_check() {
   bot_load_env
   [[ -e $BOT_UNIT ]] || { bad "telegram bot is not installed"; return 1; }
@@ -279,7 +279,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }
   CMD="tg-bot $1"
   case $1 in
-    check) cmd_check; exit ;;           # quiet, not logged: run by ente-setup.sh check
+    check) cmd_check; exit ;;           # quiet, not logged: run by ente-ops.sh check
     action) cmd_action "$2"; exit ;;    # its output is the bot's reply
   esac
   touch "$LOG"; chmod 600 "$LOG"

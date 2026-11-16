@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for "either bucket alone + BACKUP_PASSPHRASE restores everything": the encrypted config copy in the photo bucket
 # (photo-crypt), the real backup script writing both copies while keeping that copy out of the photo mirror, the exclusion in
-# check/verify (new_uploads), the ownership check on the photo bucket, and restore's choice of source.
+# check/verify (new_uploads), the ownership check on the photo bucket, and restore's choice of source and how it resumes an interrupted run.
 # The buckets are local folders behind rclone alias remotes and docker is a stub, so this changes nothing outside a temp dir.
 # Needs bash, python3 and rclone (the server has them). Run: bash tests/test_bucket_copies.sh
 set -uo pipefail
@@ -23,11 +23,11 @@ BACKUP_S3_ENDPOINT=b2.example.net
 BACKUP_S3_REGION=r2
 BACKUP_S3_BUCKET=bk
 X
-# in_setup CODE: source ente-setup.sh with that config and ENTE_DIR in the temp dir, load it, run CODE in a subshell
+# in_setup CODE: source ente-ops.sh (and so ente-setup.sh) with that config and ENTE_DIR in the temp dir, load it, run CODE in a subshell
 in_setup() {
   ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test
     # shellcheck source=/dev/null
-    . "$HERE/../ente-setup.sh"
+    . "$HERE/../ente-ops.sh"
     ENTE_DIR=$T/ente RCLONE_CONFIG=$T/rclone.conf BACKUP_STATE=$T/state # never the host's real config or stamps
     set +e
     load_env
@@ -160,6 +160,49 @@ in_setup 'restore_source' >/dev/null 2>&1; RC=$?
 check "wrong passphrase: restore_source fails (nothing readable)" '((RC != 0))'
 remotes 'correct horse'
 check "right passphrase again: the photo copy is found" '[[ $(src) == photo-crypt: ]]' "$(src)"
+
+echo "== restore: an interrupted run never wipes a restored database"
+# restore_run: cmd_restore into $T/re with the installers, the remotes' setup, docker compose and the health checks stubbed.
+# FAIL_AT=pg_restore|healthy makes that step fail; MUSEUM_UP=1 makes museum look running. Every dc call is logged to $T/dc.log.
+R=$T/re
+restore_run() {
+  : >"$T/dc.log"
+  in_setup '
+    ENTE_DIR='"$R"' PINS='"$R"'/image-pins DUMP_DIR='"$T"'/re-dumps
+    apt_get() { :; }; apt_install() { :; }; install_docker() { :; }; install_caddy() { :; }; install_rclone() { :; }
+    make_backup_remotes() { :; }; make_photo_remote_env() { :; }; make_photo_crypt() { :; }; make_photo_remote() { :; }
+    configure_host() { :; }; url_ok() { :; }; host_ip() { echo 192.0.2.1; }
+    mktemp() { command mktemp -d "$T/restore.XXXXXX"; }
+    wait_healthy() { [[ ${FAIL_AT:-} != healthy ]] || die "museum not healthy (test)"; }
+    dc() {
+      echo "$*" >>"$T/dc.log"
+      case "$*" in
+        "ps -q museum") [[ -z ${MUSEUM_UP:-} ]] || echo cid ;;
+        *pg_restore*) [[ ${FAIL_AT:-} != pg_restore ]] ;;
+      esac
+    }
+    cmd_restore' >"$T/out" 2>&1
+}
+wiped() { grep -qx 'down -v' "$T/dc.log"; }
+FAIL_AT=pg_restore restore_run; RC=$?
+check "pg_restore fails: restore fails" '((RC != 0))' "$(tail -3 "$T/out")"
+check "... and leaves .restore-incomplete (not .restore-finishing)" '[[ -e $R/.restore-incomplete && ! -e $R/.restore-finishing ]]'
+check "... museum was never started" '! grep -qx "up -d" "$T/dc.log"' "$(cat "$T/dc.log")"
+MUSEUM_UP=1 restore_run; RC=$?
+check "re-run while museum runs: refused, nothing wiped" '((RC != 0)) && ! wiped && [[ -f $R/museum.yaml ]] && grep -q "not wiping" "$T/out"' "$(tail -3 "$T/out")"
+restore_run; RC=$?
+check "re-run before the database was restored: wipes the half-done attempt and succeeds" '((RC == 0)) && wiped' "$(tail -3 "$T/out")"
+check "... and leaves no marker" '[[ ! -e $R/.restore-incomplete && ! -e $R/.restore-finishing && -f $R/museum.yaml ]]'
+check "... and keeps the dumps (the next backup would delete missing ones)" '[[ -n $(find "$T/re-dumps" -name "ente_db-*.dump") ]]'
+restore_run; RC=$?
+check "restore on a finished server: refused, nothing wiped" '((RC != 0)) && ! wiped && grep -q "already exists" "$T/out"' "$(tail -3 "$T/out")"
+rm -rf "$R"
+FAIL_AT=healthy restore_run; RC=$?
+check "museum not healthy after the database restore: restore fails" '((RC != 0)) && grep -qx "exec -T postgres pg_restore -U pguser -d ente_db --clean --if-exists /tmp/restore.dump" "$T/dc.log"' "$(cat "$T/dc.log")"
+check "... and leaves .restore-finishing (not .restore-incomplete)" '[[ -e $R/.restore-finishing && ! -e $R/.restore-incomplete ]]'
+MUSEUM_UP=1 restore_run; RC=$?
+check "re-run after the database restore (museum running, in use): finishes without wiping or restoring again" \
+  '((RC == 0)) && ! wiped && ! grep -q pg_restore "$T/dc.log" && [[ ! -e $R/.restore-finishing ]]' "$(cat "$T/out" "$T/dc.log" | tail -8)"
 
 echo
 echo "$PASS passed, $FAIL failed"

@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
-SETUP=./ente-setup.sh PROXYSH=./ente-s3-proxy.sh STATE=/var/lib/ente-setup/s3-proxy SITE=/etc/caddy/ente.d/sites/s3-proxy.caddy
+SETUP=./ente-setup.sh OPS=./ente-ops.sh PROXYSH=./ente-s3-proxy.sh STATE=/var/lib/ente-setup/s3-proxy SITE=/etc/caddy/ente.d/sites/s3-proxy.caddy
 DOMAIN=$(sed -n 's/^DOMAIN=\([^ #]*\).*/\1/p' ente-setup.env)
 PROXY=$(sed -n 's/^S3_PROXY_HOST=\([^ #]*\).*/\1/p' ente-setup.env)
 [[ -n $PROXY ]] || { echo "S3_PROXY_HOST is not set in ente-setup.env" >&2; exit 1; }
@@ -17,6 +17,7 @@ pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | tail -15; }
 check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
 run() { "$SETUP" "$@" </dev/null >"$T/out" 2>&1; RC=$?; }  # RC: exit code of the last run
+ops() { "$OPS" "$@" </dev/null >"$T/out" 2>&1; RC=$?; }
 prx() { "$PROXYSH" "$@" </dev/null >"$T/out" 2>&1; RC=$?; }
 api_rewrites() { curl -sS -m 10 -o /dev/null -D - "https://api.$DOMAIN/ping" | grep -i '^x-ente-link-rewrite: on' >/dev/null; }
 api_code() { curl -sS -m 10 -o /dev/null -w '%{http_code}' "$@"; }
@@ -69,7 +70,7 @@ check "state file says on" '[[ $(cat $STATE) == on ]]'
 check "API goes through the rewriter" 'api_rewrites'
 h0=$(sha256sum /etc/caddy/Caddyfile "$SITE" /etc/caddy/ente.d/api-upstream.caddy)
 prx on; check "proxy on again is a no-op" '[[ $RC -eq 0 && $(sha256sum /etc/caddy/Caddyfile "$SITE" /etc/caddy/ente.d/api-upstream.caddy) == "$h0" ]]' "$(cat "$T/out")"
-run check; check "ente-setup.sh check includes the proxy and passes" '[[ $RC -eq 0 ]] && grep -q "== s3 proxy" "$T/out" && grep -q "proxy ON" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
+ops check; check "ente-ops.sh check includes the proxy and passes" '[[ $RC -eq 0 ]] && grep -q "== s3 proxy" "$T/out" && grep -q "proxy ON" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
 run install; check "ente-setup.sh install leaves the proxy on" '[[ $RC -eq 0 && $(cat $STATE) == on ]] && api_rewrites && caddy_has_s3' "$(tail -5 "$T/out")"
 
 echo "== the rewriter fails"
@@ -77,7 +78,7 @@ systemctl stop ente-s3-rewrite.service
 check "API still answers when the rewriter is down (museum fallback)" '[[ $(api_code "https://api.$DOMAIN/ping") == 200 ]] && ! api_rewrites'
 st=$(api_code -X POST -H 'Content-Type: application/json' -d '{"email":"fallback-probe@'"$DOMAIN"'","purpose":"signup"}' "https://api.$DOMAIN/users/ott")
 check "requests with a body also fall back (got $st, not 502)" '[[ $st != 502 && $st != 000 ]]'
-run check; check "ente-setup.sh check reports the dead rewriter" '[[ $RC -ne 0 ]] && grep -q "FAIL  link rewriter not running" "$T/out"' "$(grep FAIL "$T/out")"
+ops check; check "ente-ops.sh check reports the dead rewriter" '[[ $RC -ne 0 ]] && grep -q "FAIL  link rewriter not running" "$T/out"' "$(grep FAIL "$T/out")"
 prx on; check "proxy on restarts the rewriter" '[[ $RC -eq 0 ]] && systemctl is-active --quiet ente-s3-rewrite.service' "$(cat "$T/out")"
 sleep 11 # Caddy retries the rewriter after fail_duration
 check "API goes through the rewriter again" 'api_rewrites'
@@ -95,8 +96,8 @@ prx off; check "the real config is back" '[[ $RC -eq 0 ]] && caddy_has_s3 && ! g
 
 echo "== a broken add-on setting fails the main check"
 sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=/" ente-setup.env >"$T/none.env"
-ENV_FILE=$T/none.env "$SETUP" check </dev/null >"$T/out" 2>&1; RC=$?
-check "ente-setup.sh check fails when the add-on's check cannot run" '[[ $RC -ne 0 ]] && grep -q "FAIL  the s3 proxy check did not run" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
+ENV_FILE=$T/none.env "$OPS" check </dev/null >"$T/out" 2>&1; RC=$?
+check "ente-ops.sh check fails when the add-on's check cannot run" '[[ $RC -ne 0 ]] && grep -q "FAIL  the s3 proxy check did not run" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
 
 echo "== links handed out while on keep working after off"
 prx on
@@ -110,7 +111,7 @@ prx uninstall; check "uninstall succeeds" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
 check "rewriter service is removed" '! systemctl cat ente-s3-rewrite.service >/dev/null 2>&1 && [[ ! -e /usr/local/lib/ente-setup/ente_s3_rewrite.py ]]'
 check "proxy site and state are removed, API goes to museum" '[[ ! -e $SITE && ! -e $STATE ]] && ! api_rewrites && [[ $(cat /etc/caddy/ente.d/api-upstream.caddy) == "reverse_proxy 127.0.0.1:8080" ]]'
 check "the API still answers" '[[ $(api_code "https://api.$DOMAIN/ping") == 200 ]]'
-run check; check "ente-setup.sh check passes without the proxy and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "s3 proxy" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
+ops check; check "ente-ops.sh check passes without the proxy and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "s3 proxy" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
 prx uninstall; check "uninstall again is harmless" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
 prx on; check "on installs it again (and turns it on)" '[[ $RC -eq 0 ]] && caddy_has_s3 && api_rewrites' "$(cat "$T/out")"
 sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=/" ente-setup.env >"$T/none.env"

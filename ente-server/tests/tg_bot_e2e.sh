@@ -141,10 +141,10 @@ n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"age\": 300}"; slee
 check "an old command is not run" '[[ $(last) == *"too old"* && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]' "$(last)"
 check "the token never appears in the bot's log" '! journalctl -u ente-tg-bot-e2e.service -u ente-tg-bot.service -q -o cat --no-pager | grep -qF "${token#*:}"'
 
-echo "== ente-setup.sh check includes the bot"
-run ./ente-setup.sh check; check "check has a telegram bot section and passes" '[[ $RC -eq 0 ]] && grep -q "== telegram bot" "$T/out" && grep -q "bot may run nothing else as root" "$T/out"' "$(grep -E "FAIL|bot" "$T/out")"
+echo "== ente-ops.sh check includes the bot"
+run ./ente-ops.sh check; check "check has a telegram bot section and passes" '[[ $RC -eq 0 ]] && grep -q "== telegram bot" "$T/out" && grep -q "bot may run nothing else as root" "$T/out"' "$(grep -E "FAIL|bot" "$T/out")"
 systemctl stop ente-tg-bot.service
-run ./ente-setup.sh check; check "check reports a stopped bot" '[[ $RC -ne 0 ]] && grep -q "FAIL  telegram bot not running" "$T/out"' "$(grep FAIL "$T/out")"
+run ./ente-ops.sh check; check "check reports a stopped bot" '[[ $RC -ne 0 ]] && grep -q "FAIL  telegram bot not running" "$T/out"' "$(grep FAIL "$T/out")"
 systemctl start ente-tg-bot.service
 
 echo "== uninstall and install again"
@@ -155,7 +155,7 @@ check "processes of the bot user were stopped" '! kill -0 $lingering 2>/dev/null
 wait $lingering 2>/dev/null
 check "everything is gone: service, user, sudo rule, helper, token" \
   '! systemctl cat ente-tg-bot.service >/dev/null 2>&1 && ! id ente-tg-bot >/dev/null 2>&1 && [[ ! -e /etc/sudoers.d/ente-tg-bot && ! -e $HELPER && ! -e /etc/ente-tg-bot ]]'
-run ./ente-setup.sh check; check "check passes without the bot and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "telegram bot" "$T/out"' "$(grep -E "FAIL|bot" "$T/out")"
+run ./ente-ops.sh check; check "check passes without the bot and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "telegram bot" "$T/out"' "$(grep -E "FAIL|bot" "$T/out")"
 run $BOTSH install; check "install again works" '[[ $RC -eq 0 ]] && systemctl is-active --quiet ente-tg-bot.service' "$(cat "$T/out")"
 
 echo
