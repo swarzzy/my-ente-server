@@ -17,9 +17,11 @@ check "photo-crypt is a crypt remote" '[[ $(conf_get photo-crypt type) == crypt 
 echo "== the backup script"
 # generate the real script and env file into the temp dir, then point its fixed paths there too
 backup_script
-check "install_backup_units wrote the script and its env file" '[[ -s $T/root/usr/local/bin/ente-backup.sh && -s $T/root/etc/ente-backup.env ]]'
+check "backup-setup installs ente-backup.sh unchanged, and its env file" \
+  'cmp -s "$T/root/usr/local/bin/ente-backup.sh" "$HERE/../ente-backup.sh" && [[ $(stat -c %a "$T/root/usr/local/bin/ente-backup.sh") == 755 && -s $T/root/etc/ente-backup.env ]]'
 check "the env file names the config copy's folder" 'grep -qx "PHOTO_CFG_DIR=\"ente-backup-config\"" "$T/root/etc/ente-backup.env"'
-check "the paths were redirected (no /var or /opt left)" '! grep -E "/var/(backups|lib)/ente|/opt/my-ente" "$T/backup.sh" >/dev/null'
+( env "${BACKUP_ENV[@]}" BACKUP_ROOT= ENTE_BACKUP_ENV=$T/none bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; RC=$?
+check "without its config the backup stops at once and says so" '((RC != 0)) && grep -q "BACKUP_ROOT: not set" "$T/out"' "$(cat "$T/out")"
 run_backup; RC=$?
 check "a backup run succeeds" '((RC == 0))' "$(tail -5 "$T/out")"
 check "photos are mirrored to the backup bucket" '[[ $(cat "$T/b2/bk/objects/1580559962386439/aaa" 2>/dev/null) == photo-a ]]'
@@ -35,6 +37,8 @@ check "both stamps are written (s3, photo-config)" '[[ -s $T/state/last-ok-s3 &&
 rm "$T/s3/photo/1580559962386439/bbb"
 run_backup; RC=$?
 check "a second run succeeds" '((RC == 0))' "$(tail -5 "$T/out")"
+( env "${BACKUP_ENV[@]}" ENTE_BACKUP_ENV="$T/root/etc/ente-backup.env" PATH="$T/bin:$PATH" bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; RC=$?
+check "run by hand (no environment from systemd): it reads /etc/ente-backup.env itself" '((RC == 0))' "$(tail -5 "$T/out")"
 check "a deleted photo is deleted from the mirror too (its history is the backup bucket's old versions)" '[[ ! -e $T/b2/bk/objects/1580559962386439/bbb && -f $T/b2/bk/objects/1580559962386439/aaa ]]'
 check "with the copy present, it is still not mirrored into objects/ (the exclusion, not luck)" \
   '[[ -d $T/s3/photo/ente-backup-config && ! -e $T/b2/bk/objects/ente-backup-config ]]' "$(find "$T/b2/bk/objects" | head)"

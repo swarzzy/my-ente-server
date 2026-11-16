@@ -16,6 +16,7 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 | File | Purpose |
 | --- | --- |
 | `ente-setup.sh` | the script: sets up the server (deploy, install, backup-setup, restore, update, ...) |
+| `ente-backup.sh` | one backup run, standalone (installed by `backup-setup` as `/usr/local/bin/ente-backup.sh`, run daily by `ente-backup.service`) |
 | `ente-ops.sh` | running it: `check`, `verify`, `alert-test`, `speedtest` (needs `ente-setup.sh` next to it) |
 | `ente-setup.env.example` | non-secret config → copy to `ente-setup.env` |
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
@@ -67,7 +68,8 @@ browser console open and look for CSP reports before considering enforcing it. H
 
 ## Backups
 
-A run (`systemctl start --no-block ente-backup.service`, logs `journalctl -u ente-backup.service`):
+A run of `ente-backup.sh` (`systemctl start --no-block ente-backup.service`, logs `journalctl -u ente-backup.service`; config in
+`/etc/ente-backup.env`, written by `backup-setup`):
 dumps Postgres (verified, atomic), copies `museum.yaml`/`compose*.yaml`, syncs them to `<backup bucket>/config` (names and contents
 encrypted with `BACKUP_PASSPHRASE`), mirrors the photo bucket to `<backup bucket>/objects`, then syncs the same encrypted config to
 `<photo bucket>/ente-backup-config/config` (excluded from the mirror; museum never lists its bucket, so it ignores the folder).

@@ -1,5 +1,5 @@
 # buckets_lib.sh - shared setup for the tests that need the two "buckets" (source it): local folders behind rclone alias
-# remotes, a fake Ente dir, the real backup script generated into the temp dir with its fixed paths redirected, docker as a
+# remotes, a fake Ente dir, the real ente-backup.sh with its paths in the temp dir, docker as a
 # stub (FAKE_DUMP sets the dump content), BACKUP_DELETE_WARN=5, the Telegram alert redirected to $T/bin/ente-alert. Gives T, check/pass/fail, in_setup, remotes, conf_get, backup_script, run_backup, summary.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -65,15 +65,15 @@ case "$*" in
 esac
 X
 chmod 755 "$T/bin/docker"
-# backup_script: generate the real backup script and its env file into $T/root, then $T/backup.sh with the paths redirected
+# backup_script: what backup-setup installs (the backup script, its env file /etc/ente-backup.env, the units), into $T/root
 backup_script() {
   in_setup '
     write_file() { local f=$T/root$1; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "${2:-644}" "$f"; }
     systemctl() { :; }
-    ALERT_ONFAIL= SCRIPT_DIR=$T install_backup_units' >/dev/null 2>&1
-  sed -e "s|/opt/my-ente|$T/ente|g; s|/var/backups/ente|$T/dumps|g; s|/var/lib/ente-backup|$T/state|g" \
-    -e "s|/usr/local/bin/ente-alert|$T/bin/ente-alert|g" \
-    "$T/root/usr/local/bin/ente-backup.sh" >"$T/backup.sh"
+    ALERT_ONFAIL= SCRIPT_DIR=$HERE/.. install_backup_units' >/dev/null 2>&1
 }
-run_backup() { ( set -a; . "$T/root/etc/ente-backup.env"; set +a; PATH=$T/bin:$PATH bash "$T/backup.sh" ) >"$T/out" 2>&1; }
+# BACKUP_ENV: the backup's paths, all in the temp dir (the script reads them from the environment)
+BACKUP_ENV=(ENTE_DIR="$T/ente" DUMP_DIR="$T/dumps" BACKUP_STATE="$T/state" ENTE_ALERT="$T/bin/ente-alert" RCLONE_CONFIG="$RCLONE_CONFIG")
+# run_backup: one run of the repo's ente-backup.sh with the installed env file, as ente-backup.service runs it
+run_backup() { ( set -a; . "$T/root/etc/ente-backup.env"; set +a; env "${BACKUP_ENV[@]}" PATH="$T/bin:$PATH" bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; }
 summary() { echo; echo "$PASS passed, $FAIL failed"; ((FAIL == 0)); }
