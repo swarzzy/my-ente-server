@@ -796,13 +796,25 @@ mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
 [[ ! -f image-pins ]] || cp image-pins "$DUMPS/"
+# limit_deletes MAX SRC DST [FILTER...]: fail if a sync from SRC would delete more than MAX files from DST. rclone's own
+# --max-delete only stops AFTER deleting that many, so the limits are checked before each sync (--max-delete stays as a cap).
+# A SRC that cannot be listed fails; a DST that cannot be listed (first run) counts as empty.
+limit_deletes() {
+  local max=$1 src=$2 dst=$3 s d n; shift 3
+  s=$(rclone lsf -R --files-only "$@" "$src") || { echo "ERROR: cannot list $src" >&2; return 1; }
+  d=$(rclone lsf -R --files-only "$@" "$dst" 2>/dev/null) || d=
+  n=$(LC_ALL=C comm -13 <(LC_ALL=C sort <<<"$s") <(LC_ALL=C sort <<<"$d") | grep -c . || true)
+  ((n <= max)) || { echo "ERROR: syncing would delete $n files from $dst (limit $max); nothing synced" >&2; return 1; }
+}
 # target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects, 60-day deleted/ retention.
 # Success leaves a per-target stamp for `check`:
 # the time the run STARTED, so that objects uploaded after it are not expected in the backup.
 target() {
   local name=$1 crypt=$2 root=$3 cutoff d
   echo "== $name"
+  limit_deletes 20 "$DUMPS" "$crypt:" || return 1
   rclone sync "$DUMPS" "$crypt:" --checkers 4 --max-delete 20 || return 1
+  limit_deletes 500 "ente-s3:$PHOTO_BUCKET" "${root}objects" --exclude "/$PHOTO_CFG_DIR/**" || return 1
   rclone sync "ente-s3:$PHOTO_BUCKET" "${root}objects" --size-only "${OPTS[@]}" --exclude "/$PHOTO_CFG_DIR/**" \
     --max-delete 500 --backup-dir "${root}deleted/$(date +%F)" || return 1
   cutoff=$(date -d '60 days ago' +%F)
@@ -815,7 +827,8 @@ rc=0
 target s3 backup-crypt "$BACKUP_ROOT" || { echo "ERROR: backup to the S3 bucket failed" >&2; rc=1; }
 # the same encrypted config/ also inside the photo bucket: either bucket alone + the passphrase restores everything
 echo "== config copy in the photo bucket"
-if rclone sync "$DUMPS" photo-crypt: --checkers 4 --max-delete 20; then echo "$START" > /var/lib/ente-backup/last-ok-photo-config
+if limit_deletes 20 "$DUMPS" photo-crypt: && rclone sync "$DUMPS" photo-crypt: --checkers 4 --max-delete 20; then
+  echo "$START" > /var/lib/ente-backup/last-ok-photo-config
 else echo "ERROR: config copy to the photo bucket failed" >&2; rc=1; fi
 ((rc == 0)) || exit 1
 # heartbeat (healthchecks.io, Better Stack, ...): only after a fully good run. A failed ping does not fail the backup

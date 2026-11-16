@@ -77,7 +77,8 @@ service alerts you when a run fails, does not happen, or the server is down. A f
 
 `backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, one the passphrase cannot read, or one it cannot list.
 The server holds keys that can delete backups: turn on bucket versioning or Object Lock at the backup provider if it supports it, and use a key limited to that bucket.
-Two safety limits stop a run instead of deleting: more than 500 photo deletions, more than 20 dump deletions.
+Two safety limits stop a run instead of deleting: more than 500 photo deletions, more than 20 dump deletions. They are counted
+before each sync, so a run over the limit deletes nothing (rclone's own `--max-delete` would delete up to the limit first).
 
 What survives what (you also need each provider's account to create new keys, and your Ente password to log in):
 
@@ -233,6 +234,7 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 | `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum, the bot against a fake Telegram |
 | `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, command lines |
 | `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the mirror's exclusion, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
+| `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the deletion limits (over the limit nothing is deleted) and the 60-day purge, `verify` catching a bad dump, empty tables, a damaged photo, other keys or missing config files, and every FAIL in the backup part of `check` |
 | `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev` |
 | `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |

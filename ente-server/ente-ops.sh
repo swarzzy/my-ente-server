@@ -27,10 +27,58 @@ new_uploads() {
 rc_err() { grep -E 'ERROR|Failed to' <<<"$1" | sed -E 's|^[0-9/]+ [0-9:]+ ||' | head -3 | tr '\n' ' ' || true; }
 
 # ---------------------------------------------------------------- check
+# check_backup: the backup part of check (timer, last run, stamps, photo bucket vs backup, verify, alerts, restore markers);
+# counts FAILs in FAILS like the rest of check.
+check_backup() {
+  local s ts res out ex
+  echo "== backup"
+  for s in .restore-incomplete .restore-finishing; do
+    [[ ! -e $ENTE_DIR/$s ]] || bad "a restore did not finish ($ENTE_DIR/$s): run ente-setup.sh restore again"
+  done
+  if systemctl is-enabled --quiet ente-backup.timer 2>/dev/null; then ok "timer enabled, next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value)"; else bad "ente-backup.timer not enabled"; fi
+  ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
+  res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
+  if [[ -z $ts ]]; then # systemd forgets the result at a reboot: fall back to the stamp the last good run left
+    s=$(cat "$BACKUP_STATE"/last-ok-s3 2>/dev/null || true)
+    if [[ -z $s ]]; then warn "backup has not run yet"
+    elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "last good backup is older than 36 h ($s)"
+    else ok "last good backup $s (no run since boot)"; fi
+  elif [[ $res != success ]]; then bad "last backup run $ts: $res (journalctl -u ente-backup.service)"
+    s=$(cat "$BACKUP_STATE"/last-ok-s3 2>/dev/null || true)
+    if [[ -n $s ]] && (($(date +%s) - $(date -d "$s" +%s) <= 36 * 3600)); then ok "S3 part of the backup succeeded $s"; fi
+  elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
+  else ok "last backup finished $ts: $res"; fi
+  ex=$(new_uploads s3)
+  if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then warn "a backup is running: comparison with the backup skipped"
+  elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
+  else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
+  rm -f "$ex"
+  s=$(cat "$BACKUP_STATE"/last-ok-photo-config 2>/dev/null || true)
+  if [[ -z $s ]]; then bad "no config copy in the photo bucket yet (the next backup makes it)"
+  elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "config copy in the photo bucket is older than 36 h ($s)"
+  else ok "config copy in the photo bucket $s"; fi
+  s=$(cat "$BACKUP_STATE"/verify-ok 2>/dev/null || true)
+  if ! systemctl is-enabled --quiet ente-verify.timer 2>/dev/null; then bad "ente-verify.timer not enabled (run backup-setup)"
+  elif [[ -z $s ]]; then warn "monthly verify has not passed yet (run: $0 verify)"
+  elif (($(date +%s) - $(date -d "$s" +%s) > 45 * 86400)); then bad "last good verify is older than 45 days ($s)"
+  else ok "monthly verify: last passed $s"; fi
+  if [[ -n $TG_CHAT_ID ]]; then
+    if grep -qx 'OnFailure=ente-alert@%n.service' /etc/systemd/system/ente-backup.service 2>/dev/null &&
+      systemctl is-enabled --quiet ente-check.timer 2>/dev/null; then ok "telegram alerts on (backup failure, daily check)"
+    else bad "telegram alerts not installed (run backup-setup)"; fi
+  elif [[ -z $HC_URL ]]; then warn "no failure alerts (set TG_CHAT_ID or HC_URL)"; fi
+  if [[ -n $HC_URL ]]; then
+    s=$(cat "$BACKUP_STATE"/hc-fail 2>/dev/null || true)
+    if [[ -n $s ]]; then bad "heartbeat ping (HC_URL) failed after the backup of $s"
+    elif s=$(cat "$BACKUP_STATE"/hc-ok 2>/dev/null); then ok "heartbeat pinged $s (outside monitor)"
+    else warn "heartbeat (HC_URL) not pinged yet: it is pinged after the next good backup"; fi
+  fi
+}
+
 # check: read-only health report (containers, ports, ssh/firewall/TLS, bucket + CORS, backup freshness, system); exit 1 on any FAIL.
 cmd_check() {
   load_env
-  local s cid st pol p addrs ts res out ex i
+  local s cid st pol p addrs out i
   echo "== containers"
   for s in museum web postgres; do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
@@ -52,9 +100,6 @@ cmd_check() {
   done
   for s in minio socat; do
     if [[ -z $(dc ps -q "$s" 2>/dev/null || true) ]]; then ok "$s not running"; else bad "$s is running"; fi
-  done
-  for s in .restore-incomplete .restore-finishing; do
-    [[ ! -e $ENTE_DIR/$s ]] || bad "a restore did not finish ($ENTE_DIR/$s): run ente-setup.sh restore again"
   done
   if internal_locked; then ok "sign-ups closed"
   elif [[ -n $(internal_admin) ]]; then bad "sign-ups are OPEN although lockdown was done (re-run lockdown)"
@@ -102,45 +147,7 @@ cmd_check() {
       if ((i != 0)) && ! grep -q '^  FAIL' <<<"$out"; then bad "the $name check did not run (exit $i): $(tail -1 <<<"$out" | cut -c1-160)"; fi
     else bad "the $name is installed but $script is not next to $0"; fi
   done
-  echo "== backup"
-  if systemctl is-enabled --quiet ente-backup.timer 2>/dev/null; then ok "timer enabled, next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value)"; else bad "ente-backup.timer not enabled"; fi
-  ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
-  res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
-  if [[ -z $ts ]]; then # systemd forgets the result at a reboot: fall back to the stamp the last good run left
-    s=$(cat "$BACKUP_STATE"/last-ok-s3 2>/dev/null || true)
-    if [[ -z $s ]]; then warn "backup has not run yet"
-    elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "last good backup is older than 36 h ($s)"
-    else ok "last good backup $s (no run since boot)"; fi
-  elif [[ $res != success ]]; then bad "last backup run $ts: $res (journalctl -u ente-backup.service)"
-    s=$(cat "$BACKUP_STATE"/last-ok-s3 2>/dev/null || true)
-    if [[ -n $s ]] && (($(date +%s) - $(date -d "$s" +%s) <= 36 * 3600)); then ok "S3 part of the backup succeeded $s"; fi
-  elif (($(date +%s) - $(date -d "$ts" +%s) > 36 * 3600)); then bad "last backup is older than 36 h ($ts)"
-  else ok "last backup finished $ts: $res"; fi
-  ex=$(new_uploads s3)
-  if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then warn "a backup is running: comparison with the backup skipped"
-  elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
-  else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
-  rm -f "$ex"
-  s=$(cat "$BACKUP_STATE"/last-ok-photo-config 2>/dev/null || true)
-  if [[ -z $s ]]; then bad "no config copy in the photo bucket yet (the next backup makes it)"
-  elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "config copy in the photo bucket is older than 36 h ($s)"
-  else ok "config copy in the photo bucket $s"; fi
-  s=$(cat "$BACKUP_STATE"/verify-ok 2>/dev/null || true)
-  if ! systemctl is-enabled --quiet ente-verify.timer 2>/dev/null; then bad "ente-verify.timer not enabled (run backup-setup)"
-  elif [[ -z $s ]]; then warn "monthly verify has not passed yet (run: $0 verify)"
-  elif (($(date +%s) - $(date -d "$s" +%s) > 45 * 86400)); then bad "last good verify is older than 45 days ($s)"
-  else ok "monthly verify: last passed $s"; fi
-  if [[ -n $TG_CHAT_ID ]]; then
-    if grep -qx 'OnFailure=ente-alert@%n.service' /etc/systemd/system/ente-backup.service 2>/dev/null &&
-      systemctl is-enabled --quiet ente-check.timer 2>/dev/null; then ok "telegram alerts on (backup failure, daily check)"
-    else bad "telegram alerts not installed (run backup-setup)"; fi
-  elif [[ -z $HC_URL ]]; then warn "no failure alerts (set TG_CHAT_ID or HC_URL)"; fi
-  if [[ -n $HC_URL ]]; then
-    s=$(cat "$BACKUP_STATE"/hc-fail 2>/dev/null || true)
-    if [[ -n $s ]]; then bad "heartbeat ping (HC_URL) failed after the backup of $s"
-    elif s=$(cat "$BACKUP_STATE"/hc-ok 2>/dev/null); then ok "heartbeat pinged $s (outside monitor)"
-    else warn "heartbeat (HC_URL) not pinged yet: it is pinged after the next good backup"; fi
-  fi
+  check_backup
   echo "== system"
   df -h / | sed 's/^/        /'
   warn "check storage usage of both buckets in the providers' consoles"
