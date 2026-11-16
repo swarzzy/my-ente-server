@@ -1,8 +1,8 @@
-"""A fake Telegram Bot API for tests/tg_bot_e2e.sh. Python stdlib only.
+"""A fake Telegram Bot API for tests/tg_bot_e2e.sh and tests/test_alerts.sh. Python stdlib only.
 
     python3 tests/fake_telegram.py PORT_FILE
 Listens on 127.0.0.1 (free port, written to PORT_FILE) and implements getUpdates, sendMessage, setMyCommands, getMe for
-any token. Test control (plain HTTP, also on 127.0.0.1):
+any token, with JSON or form-encoded bodies. Test control (plain HTTP, also on 127.0.0.1):
     POST /control/message   {"text": ..., "from": ID, "chat": ID, "type": "private", "age": 0}  -> queues a message
     GET  /control/sent                                                                       -> the bot's messages so far
     GET  /control/tokens                                                                     -> sha256 of tokens seen
@@ -12,6 +12,7 @@ import json
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
@@ -42,7 +43,11 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {})
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):  # curl --data-urlencode
+            body = {k: v[-1] for k, v in urllib.parse.parse_qs(raw.decode(), keep_blank_values=True).items()}
+        else:
+            body = json.loads(raw or b"{}")
         if self.path == "/control/message":
             with LOCK:
                 NEXT[0] += 1

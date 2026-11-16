@@ -251,7 +251,8 @@ run_quickstart() {
   if [[ -f $ENTE_DIR/compose.yaml && -f $ENTE_DIR/museum.yaml ]]; then log "$ENTE_DIR exists, skipping quickstart"; return 0; fi
   [[ ! -e $ENTE_DIR ]] || die "$ENTE_DIR exists but is incomplete (failed quickstart?); remove it and re-run"
   log "running Ente quickstart (answering n)"
-  (cd /opt && printf 'n\n' | sh -c "$(curl -fsSL "$QUICKSTART_URL")") >/dev/null || die "quickstart failed"
+  # the quickstart creates my-ente/ in the current directory
+  (cd "$(dirname "$ENTE_DIR")" && printf 'n\n' | sh -c "$(curl -fsSL "$QUICKSTART_URL")") >/dev/null || die "quickstart failed"
   [[ -f $ENTE_DIR/compose.yaml && -f $ENTE_DIR/museum.yaml ]] || die "quickstart did not create compose.yaml/museum.yaml"
 }
 
@@ -939,7 +940,7 @@ if [[ -n $id ]]; then out=$(journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION
 else out=$(journalctl -q -o cat --no-pager -u "$u" -n 40 || true); fi
 if [[ $u == ente-check.service || $u == ente-verify.service ]]; then
   n=${u#ente-}; title="⚠️ Ente ${n%.service} found problems on $h"
-  out=$(grep -E 'FAIL|ERROR' <<<"$out" || tail -n 30 <<<"$out")
+  out=$(grep -aE 'FAIL|ERROR' <<<"$out" || tail -n 30 <<<"$out") # -a: a stray non-UTF-8 byte must not make it "binary"
 else
   title="❌ $u failed on $h"
   out=$(tail -n 30 <<<"$out")
