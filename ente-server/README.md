@@ -60,7 +60,7 @@ Run steps separately instead of `deploy` if you prefer: `bootstrap`, `install`, 
 ## Security headers
 
 Caddy adds HSTS (1 year), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a `Permissions-Policy` that turns off
-camera/microphone/geolocation, removes the `Server` header, and on `web.`/`albums.` sends `X-Frame-Options: DENY`. `check` verifies them.
+camera/microphone/geolocation, removes the `Server` header, and on `web.`/`albums.` sends `X-Frame-Options: DENY`.
 The Caddyfile is rewritten by `install`/`restore`: change headers in `configure_host()`, not in `/etc/caddy/Caddyfile`.
 `CSP_REPORT_ONLY=yes` adds a Content-Security-Policy in report-only mode: use the web app (log in, upload, open a shared album) with the
 browser console open and look for CSP reports before considering enforcing it. HSTS stays in browsers for a year: keep serving HTTPS.
@@ -82,7 +82,8 @@ sudo rclone sync  ente-s3:<photo bucket> backup:<backup bucket>/objects --exclud
 sudo rclone delete backup-crypt: --include 'ente_db-*.dump' --min-age 90d --dry-run
 ```
 `HC_URL` (optional; any heartbeat URL: healthchecks.io, Better Stack, Cronitor, ...) is pinged only after a fully successful run, so the
-service alerts you when a run fails, does not happen, or the server is down. A failed ping does not fail the backup; `check` reports it.
+service alerts you when a run fails, does not happen, or the server is down. A failed ping does not fail the backup (the service
+alerts you about the missing ping; the bot's `/status` shows it).
 
 `backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, one the passphrase cannot read, or one it cannot list.
 The backup never deletes, so give the backup bucket a key limited to that bucket without delete permission (B2: no `deleteFiles`): then
@@ -140,32 +141,43 @@ so the script folder must be root's alone (`chown -R root: ente-server; chmod -R
 The token reaches the bot as a systemd credential, never on a command line. Anyone who controls your Telegram account can use the
 bot: turn on Telegram's two-step verification. `ente-ops.sh check` includes the bot's checks while it is installed.
 
-## Monthly: `sudo ./ente-ops.sh check`
+## Daily, automatic: `check`
 
-OK/FAIL report: containers, restart policy, localhost-only ports, sshd, UFW, Caddy, HTTPS, photo bucket + CORS, backup timer and last
-result, `rclone check` photo bucket vs backup, the age of the config copy in the photo bucket, the last good `verify`, disk, OOM kills, pending reboot. Also look at both buckets' usage in the provider consoles.
+`sudo ./ente-ops.sh check`: an OK/WARN/FAIL report, run daily at 09:00 when Telegram alerts are on (a FAIL sends an alert).
+Every FAIL is something that can break by itself and that nothing else reports:
+
+- services: museum, web and postgres healthy; sign-ups closed (WARN until `lockdown`); a WARN when an Ente image is over 60 days old;
+- web: Caddy running, `api./ping`, `web.` and `albums.` answer, their certificates valid for at least 20 more days (Caddy renews at 30);
+- security: nothing reachable over TCP from outside but SSH, 80 and 443 (Docker bypasses UFW, so this is what keeps Postgres
+  private), sshd settings, UFW active and allowing SSH;
+- photo bucket reachable, CORS for the web app; the add-ons' own checks while installed;
+- backup: the last good backup and the config copy in the photo bucket under 36 h old, the last good `verify` under 45 days, no
+  unfinished restore. A failed backup run alerts by itself, so `check` only looks at the age of the last success;
+- system: disk of `/` (WARN at 80%, FAIL at 90%), OOM kills in the last 24 h, a reboot pending for over a day (unattended-upgrades
+  reboots at 02:00).
 
 ## Monthly, automatic: `verify`
 
-`check` proves that backups ran and that object sizes match; `verify` proves the S3 backup can be restored. `backup-setup` installs
+`check` proves that backups ran; `verify` proves the backup can be restored. `backup-setup` installs
 `ente-verify.timer` (the 1st of each month, 04:30; a FAIL sends a Telegram alert if alerts are on). By hand: `sudo ./ente-ops.sh verify`.
 
-- photo bucket against the backup by checksum (objects without a common checksum, e.g. multipart uploads, are compared by size and counted in a WARN);
+- photo bucket against the backup by checksum (objects without a common checksum, e.g. multipart uploads, are compared by size; the
+  OK line counts them). Photos uploaded since the last backup started are not expected in the backup;
+- an INFO line on the backup bucket's growth: photos and their size, how many of them are no longer in the photo bucket (what the
+  clean-up in "Backups" would remove), dumps and their size;
 - the encrypted config backup and its copy in the photo bucket, downloaded, decrypted with the stored passphrase and compared byte for
-  byte with the local copies;
-- the newest dump from the backup restored into a scratch database (dropped afterwards) and compared with the live one: same number of
-  tables, and users/files not empty when the live ones are not;
-- the keys in the backed-up `museum.yaml` equal the live ones.
+  byte with the local copies (`museum.yaml` with the keys, compose files, image pins, dumps);
+- the newest dump (proven equal to the backed-up one by the step before) restored into a scratch database (dropped afterwards):
+  tables exist, and users/files are not empty when the live ones are not.
 
-It changes neither the backup nor the live database, and waits for a running backup. Photos uploaded since the last backup started are
-not expected in the backup (same in `check`).
-A full disaster-recovery drill (restore on a fresh server) is still worth doing once by hand.
+It changes neither the backup nor the live database, and waits for a running backup. It uses the passphrase and keys stored on the
+server, so it cannot prove that your own copies of them work: that is what the yearly restore drill below is for.
 
 ## Updates
 
 The Ente images (`ghcr.io/ente/server`, `ghcr.io/ente/web`) have no version tags, so the script pins the exact builds by digest in
 `/opt/my-ente/image-pins` (written into `compose.override.yaml`, carried by the backup). Nothing changes version by itself; `install`
-re-runs keep the pins, `restore` runs the builds that made the dump, and `check` shows them with their build dates.
+re-runs keep the pins, `restore` runs the builds that made the dump, and `check` shows their build dates (a WARN after 60 days).
 `postgres:15` is not pinned, so its minor fixes arrive with `update`.
 
 `sudo ./ente-setup.sh update`: runs a backup first (rollback point; aborts if it fails), moves the pins to the current `latest`,
@@ -189,6 +201,23 @@ If a pinned build is ever deleted from the registry, `install`/`restore` warn an
 
 Apps keep working because the hostnames do not change. To restore into a *new* photo bucket, set the new `S3_*` values:
 objects are copied from the backup bucket. After restoring from the photo bucket alone, `backup-setup` fills the new backup bucket.
+
+**Restore drill, once a year, from your PC** (read-only; the only test of the copies you keep off the server). `verify` uses the
+passphrase and keys stored on the server; this proves that yours open the backup. Needs rclone. Use the values from your password
+manager / offline `ente-setup.env` and `ente-setup.secrets`, not from the server:
+
+```
+export RCLONE_CONFIG_DRILL_TYPE=s3 RCLONE_CONFIG_DRILL_PROVIDER=<BACKUP_S3_PROVIDER, e.g. Other> RCLONE_CONFIG_DRILL_ENDPOINT=<BACKUP_S3_ENDPOINT> \
+  RCLONE_CONFIG_DRILL_REGION=<BACKUP_S3_REGION> RCLONE_CONFIG_DRILL_ACCESS_KEY_ID=<key id> RCLONE_CONFIG_DRILL_SECRET_ACCESS_KEY=<secret>
+export RCLONE_CONFIG_DRILLC_TYPE=crypt RCLONE_CONFIG_DRILLC_REMOTE=drill:<BACKUP_S3_BUCKET>/config
+export RCLONE_CONFIG_DRILLC_PASSWORD=$(rclone obscure -)   # type BACKUP_PASSPHRASE, Enter, Ctrl-D (stays out of the shell history)
+rclone lsf drillc:                                          # readable file names: key and passphrase are right
+rclone copy drillc: drill/ --include museum.yaml --include "$(rclone lsf drillc: --include 'ente_db-*.dump' | sort | tail -1)"
+rclone lsf -R --files-only drill:<BACKUP_S3_BUCKET>/objects | wc -l   # the photos
+```
+The dump and `museum.yaml` in `drill/` must decrypt (rclone checks every block) and the dump should be about the size of the
+server's. Repeat `lsf` with the photo bucket's key. Then delete `drill/`: it holds the server's keys. A full restore needs the
+same `DOMAIN`, so it is done for real only when moving servers (above).
 
 ## AmneziaWG VPN (`ente-vpn.sh`, optional, independent of Ente)
 
@@ -243,7 +272,8 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 | `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum, the bot against a fake Telegram |
 | `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, command lines |
 | `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the copy's exclusion, restore fetching only the newest dump, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
-| `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the backup never deletes in the backup bucket (photos or dumps gone from the server stay there), `verify` catching a bad dump, empty tables, a damaged photo, other keys or missing config files, and every FAIL in the backup part of `check` |
+| `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the backup never deletes in the backup bucket (photos or dumps gone from the server stay there), `verify` catching a bad dump, empty tables, a damaged photo or missing config files, its growth line, and every FAIL in the backup part of `check` |
+| `bash tests/test_check.sh` | anywhere (system tools stubbed) | the rest of `check`: services and image age, web and certificates, open ports, sshd/UFW, disk, OOM, pending reboot; each FAIL once, nothing on a healthy server |
 | `bash tests/test_quickstart.sh` | anywhere with network (fetches Ente's current quickstart; docker stubbed) | `install`'s edits against today's quickstart: ports on 127.0.0.1, URLs, the external bucket, keys kept, in place, idempotent; a changed layout is refused |
 | `bash tests/test_lockdown.sh` | anywhere (Postgres stubbed) | `lockdown`: oldest user becomes admin only after `y`, re-runs change nothing, install keeps the block, a hand-made `internal:` is refused, edited in place |
 | `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down |

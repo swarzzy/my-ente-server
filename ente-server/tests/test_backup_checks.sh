@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for the backup and its safety nets: it never deletes in the backup bucket, `verify` catches a
-# broken backup, and the backup part of `check` (check_backup) failing on a stale, failed or missing result.
+# broken backup and reports the backup bucket's growth, and the backup part of `check` (check_backup) failing on a stale or
+# missing result.
 # Local "buckets", the real backup script and stubs for docker, Postgres and systemd (see buckets_lib.sh): changes nothing
 # outside a temp dir. Needs bash, python3 and rclone (the server has them). Run: bash tests/test_backup_checks.sh
 set -uo pipefail
@@ -45,17 +46,23 @@ verify_run() {
     }
     vq() {
       case "$*" in
-        *"-d ente_db "*) echo "86 3 10" ;;
+        *"-d ente_db "*) echo "${LIVE_TABLES:-86} 3 10" ;;
         *"-d ente_verify "*) if grep -q EMPTY "$T/pg.dump"; then echo "86 0 0"; else echo "86 3 10"; fi ;;
       esac
     }
     cmd_verify' >"$T/out" 2>&1
 }
 fails() { grep -c '^  FAIL' "$T/out"; }
+echo "PGDMP older" >"$T/dumps/ente_db-2000-02-01.dump"; run_backup # an older dump on the server too: verify must take the newest
 verify_run; RC=$?
 check "a good backup (the backup bucket also holds old dumps the server no longer has): verify passes" \
   '((RC == 0)) && grep -q "^backup verified" "$T/out"' "$(cat "$T/out")"
 check "... and records it for check" '[[ -s $T/state/verify-ok ]]'
+check "... with the backup bucket's growth: 32 photos, the 30 gone from the photo bucket, 27 dumps" \
+  'grep -q "INFO  backup bucket: 32 photos (.*), 30 of them (.*) no longer in the photo bucket; 27 dumps" "$T/out"' "$(grep INFO "$T/out")"
+check "... and the newest local dump restored" 'grep -q "OK    ente_db-$(date +%F).dump restores: 86 tables, 3 users, 10 files" "$T/out"' "$(cat "$T/out")"
+LIVE_TABLES=87 verify_run; RC=$?
+check "an update added a table since the dump: no false FAIL" '((RC == 0))' "$(grep FAIL "$T/out")"
 vok=$(cat "$T/state/verify-ok")
 sleep 1
 FAKE_DUMP=CORRUPT run_backup; verify_run; RC=$?
@@ -68,10 +75,6 @@ echo photo-X >"$B/objects/1580559962386439/aaa" # same size as photo-a: only a c
 verify_run; RC=$?
 check "a photo damaged in the backup (same size): FAIL" '((RC != 0)) && [[ $(fails) -eq 1 ]] && grep -q "photo objects differ" "$T/out"' "$(grep FAIL "$T/out")"
 echo photo-a >"$B/objects/1580559962386439/aaa"
-sed -i 's/KEY-ONE/KEY-TWO/' "$T/ente/museum.yaml"
-verify_run; RC=$?
-check "backed-up keys differ from the live ones: FAIL" '((RC != 0)) && [[ $(fails) -eq 1 ]] && grep -q "keys differ" "$T/out"' "$(grep FAIL "$T/out")"
-sed -i 's/KEY-TWO/KEY-ONE/' "$T/ente/museum.yaml"
 rclone deletefile backup-crypt:compose.yaml
 verify_run; RC=$?
 check "a file missing from the config backup: FAIL" '((RC != 0)) && [[ $(fails) -eq 1 ]] && grep -q "config backup differs" "$T/out"' "$(grep FAIL "$T/out")"
@@ -83,56 +86,46 @@ run_backup; verify_run; RC=$?
 check "repaired by the next backup: verify passes again" '((RC == 0))' "$(grep FAIL "$T/out")"
 
 echo "== check: the backup part"
-# cb_run: check_backup with systemd stubbed: TS (last run's end; empty = no run since boot), RES (its result),
-# NO_BACKUP_TIMER / NO_VERIFY_TIMER (timer not enabled). HC_URL is set, Telegram alerts are off.
+# cb_run: check_backup with systemd stubbed: RUNNING (a backup is running now), NO_VERIFY_TIMER (timer not enabled);
+# Telegram alerts on unless NO_ALERTS.
 cb_run() {
   in_setup '
-    HC_URL=https://hc.example.org/ping TG_CHAT_ID=
+    TG_CHAT_ID=${NO_ALERTS--100123} HC_URL=
     systemctl() {
       case "$*" in
-        "is-enabled --quiet ente-backup.timer") [[ -z ${NO_BACKUP_TIMER:-} ]] ;;
         "is-enabled --quiet ente-verify.timer") [[ -z ${NO_VERIFY_TIMER:-} ]] ;;
-        *NextElapseUSecRealtime*) echo tomorrow ;;
-        *ExecMainExitTimestamp*) echo "${TS-}" ;;
-        *"-p Result "*) echo "${RES:-success}" ;;
-        *ActiveState*) echo inactive ;;
+        *ActiveState*) if [[ -n ${RUNNING:-} ]]; then echo activating; else echo inactive; fi ;;
       esac
     }
     check_backup' >"$T/out" 2>&1
 }
-fresh() { local f; for f in last-ok-s3 last-ok-photo-config verify-ok hc-ok; do date -Is >"$T/state/$f"; done; rm -f "$T/state/hc-fail"; }
+fresh() { local f; for f in last-ok-s3 last-ok-photo-config verify-ok; do date -Is >"$T/state/$f"; done; }
 ago() { date -Is -d "$1 ago"; }
 one_fail() { [[ $(fails) -eq 1 ]] && grep -q "^  FAIL.*$1" "$T/out"; }
-now=$(date -Is)
-fresh; TS=$now cb_run
-check "all fresh: no FAIL" '[[ $(fails) -eq 0 ]]' "$(cat "$T/out")"
-TS=$now RES=exit-code cb_run
-check "the last run failed: FAIL" 'one_fail "last backup run"' "$(grep FAIL "$T/out")"
-TS=$(ago '40 hours') cb_run
-check "the last run is 40 h old: FAIL" 'one_fail "older than 36 h"' "$(grep FAIL "$T/out")"
-TS= cb_run
-check "no run since boot, last good backup fresh: no FAIL" '[[ $(fails) -eq 0 ]] && grep -q "no run since boot" "$T/out"' "$(cat "$T/out")"
-ago '40 hours' >"$T/state/last-ok-s3"; TS= cb_run
-check "no run since boot, last good backup 40 h old: FAIL" 'one_fail "last good backup is older than 36 h"' "$(grep FAIL "$T/out")"
-fresh; rm "$T/state/last-ok-photo-config"; TS=$now cb_run
-check "no config copy in the photo bucket: FAIL" 'one_fail "no config copy in the photo bucket"' "$(grep FAIL "$T/out")"
-fresh; ago '40 hours' >"$T/state/last-ok-photo-config"; TS=$now cb_run
-check "the config copy is 40 h old: FAIL" 'one_fail "config copy in the photo bucket is older"' "$(grep FAIL "$T/out")"
-fresh; ago '50 days' >"$T/state/verify-ok"; TS=$now cb_run
+fresh; cb_run
+check "all fresh: no FAIL, no WARN" '[[ $(fails) -eq 0 ]] && ! grep -q WARN "$T/out"' "$(cat "$T/out")"
+ago '35 hours' >"$T/state/last-ok-s3"; cb_run
+check "the last good backup is 35 h old: no FAIL" '[[ $(fails) -eq 0 ]]' "$(cat "$T/out")"
+ago '40 hours' >"$T/state/last-ok-s3"; cb_run
+check "the last good backup is 40 h old: FAIL" 'one_fail "last good backup is older than 36 h"' "$(grep FAIL "$T/out")"
+RUNNING=1 cb_run
+check "... still a FAIL while a backup runs" 'one_fail "last good backup is older than 36 h" && grep -q "a backup is running now" "$T/out"' "$(cat "$T/out")"
+rm "$T/state/last-ok-s3" "$T/state/last-ok-photo-config"; cb_run
+check "never a good backup: FAIL for it and for the config copy" \
+  '[[ $(fails) -eq 2 ]] && grep -q "FAIL  last good backup: none yet" "$T/out" && grep -q "FAIL  config copy in the photo bucket: none yet" "$T/out"' "$(cat "$T/out")"
+RUNNING=1 cb_run
+check "... but while the first backup runs: only WARNs" '[[ $(fails) -eq 0 && $(grep -c "WARN.*the first backup is running" "$T/out") -eq 2 ]]' "$(cat "$T/out")"
+fresh; ago '40 hours' >"$T/state/last-ok-photo-config"; cb_run
+check "the config copy is 40 h old: FAIL" 'one_fail "config copy in the photo bucket is older than 36 h"' "$(grep FAIL "$T/out")"
+fresh; ago '50 days' >"$T/state/verify-ok"; cb_run
 check "the last good verify is 50 days old: FAIL" 'one_fail "verify is older than 45 days"' "$(grep FAIL "$T/out")"
-fresh; rm "$T/state/verify-ok"; TS=$now cb_run
+fresh; rm "$T/state/verify-ok"; cb_run
 check "verify has never passed: only a WARN" '[[ $(fails) -eq 0 ]] && grep -q "WARN  monthly verify has not passed" "$T/out"' "$(cat "$T/out")"
-fresh; TS=$now NO_VERIFY_TIMER=1 cb_run
+fresh; NO_VERIFY_TIMER=1 cb_run
 check "the verify timer is off: FAIL" 'one_fail "ente-verify.timer not enabled"' "$(grep FAIL "$T/out")"
-TS=$now NO_BACKUP_TIMER=1 cb_run
-check "the backup timer is off: FAIL" 'one_fail "ente-backup.timer not enabled"' "$(grep FAIL "$T/out")"
-date -Is >"$T/state/hc-fail"; TS=$now cb_run
-check "the heartbeat ping failed: FAIL" 'one_fail "heartbeat ping"' "$(grep FAIL "$T/out")"
-fresh; rm "$B/objects/1580559962386439/aaa"; TS=$now cb_run
-check "a photo missing from the backup: FAIL" 'one_fail "rclone check failed"' "$(grep FAIL "$T/out")"
-run_backup; fresh
-fresh
-touch "$T/ente/.restore-finishing"; TS=$now cb_run
+NO_ALERTS= cb_run
+check "neither Telegram nor a heartbeat: a WARN" '[[ $(fails) -eq 0 ]] && grep -q "WARN  no failure alerts" "$T/out"' "$(cat "$T/out")"
+touch "$T/ente/.restore-finishing"; cb_run
 check "an unfinished restore: FAIL" 'one_fail "a restore did not finish"' "$(grep FAIL "$T/out")"
 rm "$T/ente/.restore-finishing"
 
