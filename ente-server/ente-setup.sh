@@ -170,7 +170,8 @@ cmd_bootstrap() {
   getent hosts "$(hostname)" >/dev/null || { echo "127.0.1.1 $(hostname)" >>/etc/hosts; log "added $(hostname) to /etc/hosts"; }
   log "updating packages"
   apt_get update
-  apt_get -y -o Dpkg::Options::=--force-confold upgrade
+  # full-upgrade: a kernel update is a new package, which plain upgrade holds back
+  apt_get -y -o Dpkg::Options::=--force-confold full-upgrade
   apt_install sudo ufw curl ca-certificates gnupg unattended-upgrades python3-yaml unzip openssh-server
   local oldport
   oldport=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | head -1 || true)
@@ -205,15 +206,20 @@ EOF
   fi
   log "bootstrap done. Test a second login as $ADMIN_USER (ssh -p $SSH_PORT $ADMIN_USER@<ip>) before closing this session."
   [[ $SSH_PORT == 22 ]] || log "if your provider has its own firewall (security group), allow TCP $SSH_PORT there too."
+  local newest; newest=$(find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' | sed 's/^vmlinuz-//' | sort -V | tail -1)
+  [[ -z $newest || $newest == "$(uname -r)" ]] || log "kernel $newest was installed: reboot when deploy is done (ente-vpn.sh needs it)"
 }
 
 # ---------------------------------------------------------------- install helpers
 # Install Docker if missing, cap container log size, and require Compose >= 2.30.
 install_docker() {
-  local v
+  local v conf
   if ! command -v docker >/dev/null; then
     log "installing Docker via get.docker.com"
-    curl -fsSL https://get.docker.com | sh
+    # its apt-get does not wait for the dpkg lock (unattended-upgrades holds it right after bootstrap)
+    conf=$(mktemp); echo 'DPkg::Lock::Timeout "600";' >"$conf"
+    curl -fsSL https://get.docker.com | APT_CONFIG=$conf sh || { rm -f "$conf"; die "Docker install failed"; }
+    rm -f "$conf"
   fi
   if [[ ! -f /etc/docker/daemon.json ]]; then
     write_file /etc/docker/daemon.json <<'EOF'

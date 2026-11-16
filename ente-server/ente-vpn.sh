@@ -66,7 +66,7 @@ Architectures: amd64
 Signed-By: /etc/apt/keyrings/amnezia.asc
 EOF
   apt_get update
-  apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 || die "no headers for the running kernel $(uname -r); reboot into the newest kernel first"
+  apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 || die "no headers for the running kernel $(uname -r): apt-get full-upgrade, reboot, then run this again"
   pkgs="linux-headers-$(uname -r) linux-headers-$fl dkms amneziawg amneziawg-tools nftables"
   # shellcheck disable=SC2086
   ! apt_get -s install --no-install-recommends $pkgs | grep '^Remv' >/dev/null || die "installing AmneziaWG would remove packages; refusing"
