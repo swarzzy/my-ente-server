@@ -53,6 +53,14 @@ check_backup() {
   elif out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --size-only --checkers 4 --exclude-from "$ex" 2>&1); then ok "rclone check: photo bucket is in the backup"
   else bad "rclone check failed: $(echo "$out" | tail -3 | tr '\n' ' ')"; fi
   rm -f "$ex"
+  # the mirror deletes what is gone from the photo bucket: only the backup bucket's old versions keep it recoverable
+  read -r s ts <<<"$(backup_versions get 2>/dev/null | tail -1)"
+  if [[ $s != Enabled ]]; then bad "the backup bucket does not keep old versions (${s:-cannot read it}): photos deleted by mistake would be lost (run backup-setup)"
+  elif [[ $ts != "$BACKUP_KEEP_DELETED_DAYS" ]]; then warn "the backup bucket keeps old versions for ${ts} days, not $BACKUP_KEEP_DELETED_DAYS (run backup-setup)"
+  else ok "the backup bucket keeps deleted photos as old versions for $ts days"; fi
+  if read -r ts s <"$BACKUP_STATE/deletes-warn" 2>/dev/null && (($(date +%s) - $(date -d "$ts" +%s) <= 7 * 86400)); then
+    warn "$s photo files were deleted from the photo bucket before the backup of $ts (over $BACKUP_DELETE_WARN); fine after a cleanup in Ente"
+  fi
   s=$(cat "$BACKUP_STATE"/last-ok-photo-config 2>/dev/null || true)
   if [[ -z $s ]]; then bad "no config copy in the photo bucket yet (the next backup makes it)"
   elif (($(date +%s) - $(date -d "$s" +%s) > 36 * 3600)); then bad "config copy in the photo bucket is older than 36 h ($s)"

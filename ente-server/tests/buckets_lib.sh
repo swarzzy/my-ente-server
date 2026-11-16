@@ -1,6 +1,6 @@
 # buckets_lib.sh - shared setup for the tests that need the two "buckets" (source it): local folders behind rclone alias
 # remotes, a fake Ente dir, the real backup script generated into the temp dir with its fixed paths redirected, docker as a
-# stub (FAKE_DUMP sets the dump content). Gives T, check/pass/fail, in_setup, remotes, conf_get, backup_script, run_backup, summary.
+# stub (FAKE_DUMP sets the dump content), BACKUP_DELETE_WARN=5, the Telegram alert redirected to $T/bin/ente-alert. Gives T, check/pass/fail, in_setup, remotes, conf_get, backup_script, run_backup, summary.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 command -v rclone >/dev/null || { echo "rclone is not installed: run this on the server"; exit 1; }
@@ -19,6 +19,7 @@ S3_BUCKET=photo
 BACKUP_S3_ENDPOINT=b2.example.net
 BACKUP_S3_REGION=r2
 BACKUP_S3_BUCKET=bk
+BACKUP_DELETE_WARN=5
 X
 # in_setup CODE: source ente-ops.sh (and so ente-setup.sh) with that config and ENTE_DIR in the temp dir, load it, run CODE in a subshell
 in_setup() {
@@ -71,6 +72,7 @@ backup_script() {
     systemctl() { :; }
     ALERT_ONFAIL= SCRIPT_DIR=$T install_backup_units' >/dev/null 2>&1
   sed -e "s|/opt/my-ente|$T/ente|g; s|/var/backups/ente|$T/dumps|g; s|/var/lib/ente-backup|$T/state|g" \
+    -e "s|/usr/local/bin/ente-alert|$T/bin/ente-alert|g" \
     "$T/root/usr/local/bin/ente-backup.sh" >"$T/backup.sh"
 }
 run_backup() { ( set -a; . "$T/root/etc/ente-backup.env"; set +a; PATH=$T/bin:$PATH bash "$T/backup.sh" ) >"$T/out" 2>&1; }

@@ -15,12 +15,12 @@ Nov 16, 2026 · @Dmitrii
 ## Current state
 
 - **Production:** one Debian 13 VPS, reinstalled and deployed fresh on Nov 15 (`RESTORE=no`; both buckets were empty). It runs the scripts as of the latest commit on `master`.
-- **Working and tested on the server:** Ente, daily backups to the second bucket plus the encrypted config copy in the photo bucket, Telegram alerts, the Better Stack heartbeat, the monthly `verify`, the Telegram bot, the S3 proxy (installed, off) and the AmneziaWG VPN. All test suites pass there, including the browser end-to-end test.
+- **Working and tested on the server:** Ente, daily backups to the second bucket (a mirror; deleted photos stay there as old versions for 60 days, with a Telegram warning above 500 deletions) plus the encrypted config copy in the photo bucket, Telegram alerts, the Better Stack heartbeat, the monthly `verify`, the Telegram bot, the S3 proxy (installed, off) and the AmneziaWG VPN. All test suites pass there, including the browser end-to-end test.
 - **Waiting on the owner:** sign up at `https://web.<domain>`, then family, then `sudo ./ente-setup.sh lockdown`. Fetch the VPN client config `/root/awg-client.conf`, import it, then `shred -u` it on the server.
 
 ## Open items
 
-- Turn on Object Lock or versioning for the backup bucket, with a key that cannot delete. The server's key can delete backups today.
+- The backup bucket (B2) keeps deleted photos as old versions for 60 days (`backup-setup` sets the rule), and a large deletion only warns by Telegram. But the server's key can still delete old versions: set a default Object Lock retention on that bucket (Object Lock is on, with no retention), or use a key that cannot delete versions.
 - Do a full restore drill on a throwaway VPS, from each bucket alone. Restore is covered only by tests so far.
 - `restore` does not fall back to the other bucket when the newer dump is unreadable.
 - Add an HTTP monitor on `https://api.<domain>/ping`. The heartbeat only notices a down server after a missed backup, about a day later.

@@ -96,6 +96,7 @@ load_env() {
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
   AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; TG_CHAT_ID=${TG_CHAT_ID:-}
+  BACKUP_DELETE_WARN=${BACKUP_DELETE_WARN:-500}; BACKUP_KEEP_DELETED_DAYS=${BACKUP_KEEP_DELETED_DAYS:-60}
   [[ ${1:-} != vpn ]] || return 0 # ente-vpn.sh needs none of the Ente settings
   S3_ACCESS_KEY=${S3_ACCESS_KEY:-}; S3_SECRET_KEY=${S3_SECRET_KEY:-}
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
@@ -779,6 +780,8 @@ HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
 PHOTO_BUCKET="$S3_BUCKET"
 PHOTO_CFG_DIR="$PHOTO_CFG_DIR"
+BACKUP_DELETE_WARN="$BACKUP_DELETE_WARN"
+BACKUP_KEEP_DELETED_DAYS="$BACKUP_KEEP_DELETED_DAYS"
 EOF
   write_file /usr/local/bin/ente-backup.sh 755 <<'EOF'
 #!/usr/bin/env bash
@@ -797,31 +800,45 @@ mv "$dump.tmp" "$dump"
 find "$DUMPS" -name 'ente_db-*.dump' -mtime +6 -delete
 cp museum.yaml compose.yaml compose.override.yaml "$DUMPS/"
 [[ ! -f image-pins ]] || cp image-pins "$DUMPS/"
-# limit_deletes MAX SRC DST [FILTER...]: fail if a sync from SRC would delete more than MAX files from DST. rclone's own
-# --max-delete only stops AFTER deleting that many, so the limits are checked before each sync (--max-delete stays as a cap).
+# count_deletes SRC DST [FILTER...]: how many files a sync from SRC would delete from DST (in DST, not in SRC).
 # A SRC that cannot be listed fails; a DST that cannot be listed (first run) counts as empty.
-limit_deletes() {
-  local max=$1 src=$2 dst=$3 s d n; shift 3
+count_deletes() {
+  local src=$1 dst=$2 s d; shift 2
   s=$(rclone lsf -R --files-only "$@" "$src") || { echo "ERROR: cannot list $src" >&2; return 1; }
   d=$(rclone lsf -R --files-only "$@" "$dst" 2>/dev/null) || d=
-  n=$(LC_ALL=C comm -13 <(LC_ALL=C sort <<<"$s") <(LC_ALL=C sort <<<"$d") | grep -c . || true)
-  ((n <= max)) || { echo "ERROR: syncing would delete $n files from $dst (limit $max); nothing synced" >&2; return 1; }
+  LC_ALL=C comm -13 <(LC_ALL=C sort <<<"$s") <(LC_ALL=C sort <<<"$d") | grep -c . || true
 }
-# target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects, 60-day deleted/ retention.
-# Success leaves a per-target stamp for `check`:
-# the time the run STARTED, so that objects uploaded after it are not expected in the backup.
+# limit_deletes MAX SRC DST: fail if a sync would delete more than MAX files (the dumps have no other history). rclone's own
+# --max-delete only stops AFTER deleting that many, so the limit is checked before the sync (--max-delete stays as a cap).
+limit_deletes() {
+  local n; n=$(count_deletes "$2" "$3") || return 1
+  ((n <= $1)) || { echo "ERROR: syncing would delete $n files from $3 (limit $1); nothing synced" >&2; return 1; }
+}
+# warn_deletes N SINCE: many photo files are gone from the photo bucket. The sync goes ahead: the backup bucket keeps old
+# versions, so they stay recoverable for BACKUP_KEEP_DELETED_DAYS. Telegram warning (if alerts are on) and a stamp for check.
+warn_deletes() {
+  local n=$1 since=$2
+  echo "WARNING: $n photo files are gone from the photo bucket since the last backup (warning above $BACKUP_DELETE_WARN)" >&2
+  mkdir -p /var/lib/ente-backup; echo "$START $n" > /var/lib/ente-backup/deletes-warn
+  [[ -x /usr/local/bin/ente-alert ]] || return 0
+  printf '%s\n' "$n files disappeared from the photo bucket since the last backup (warning above $BACKUP_DELETE_WARN)." \
+    "The backup ran: they stay in the backup bucket as old versions for $BACKUP_KEEP_DELETED_DAYS days." \
+    "Fine after a big cleanup in Ente. If not, put them back as of the last backup:" \
+    "rclone copy --s3-version-at '$since' ${BACKUP_ROOT}objects ente-s3:$PHOTO_BUCKET" |
+    /usr/local/bin/ente-alert "⚠️ Ente backup: $n photo files deleted on $(hostname)" || echo "WARNING: the Telegram warning failed" >&2
+}
+# target NAME CRYPT ROOT: config + dumps to CRYPT, photo objects to ROOT/objects. Files gone from the photo bucket are deleted
+# from the mirror too; the backup bucket keeps them as old versions (see backup-setup). Success leaves a per-target stamp for
+# `check`: the time the run STARTED, so that objects uploaded after it are not expected in the backup.
 target() {
-  local name=$1 crypt=$2 root=$3 cutoff d
+  local name=$1 crypt=$2 root=$3 n since
   echo "== $name"
   limit_deletes 20 "$DUMPS" "$crypt:" || return 1
   rclone sync "$DUMPS" "$crypt:" --checkers 4 --max-delete 20 || return 1
-  limit_deletes 500 "ente-s3:$PHOTO_BUCKET" "${root}objects" --exclude "/$PHOTO_CFG_DIR/**" || return 1
-  rclone sync "ente-s3:$PHOTO_BUCKET" "${root}objects" --size-only "${OPTS[@]}" --exclude "/$PHOTO_CFG_DIR/**" \
-    --max-delete 500 --backup-dir "${root}deleted/$(date +%F)" || return 1
-  cutoff=$(date -d '60 days ago' +%F)
-  for d in $(rclone lsf --dirs-only "${root}deleted" 2>/dev/null || true); do
-    if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ && "${d%/}" < "$cutoff" ]]; then rclone purge "${root}deleted/${d%/}" || return 1; fi
-  done
+  n=$(count_deletes "ente-s3:$PHOTO_BUCKET" "${root}objects" --exclude "/$PHOTO_CFG_DIR/**") || return 1
+  since=$(cat "/var/lib/ente-backup/last-ok-$name" 2>/dev/null || echo "$START")
+  ((n <= BACKUP_DELETE_WARN)) || warn_deletes "$n" "$since"
+  rclone sync "ente-s3:$PHOTO_BUCKET" "${root}objects" --size-only "${OPTS[@]}" --exclude "/$PHOTO_CFG_DIR/**" || return 1
   mkdir -p /var/lib/ente-backup; echo "$START" > "/var/lib/ente-backup/last-ok-$name"
 }
 rc=0
@@ -984,6 +1001,58 @@ EOF
 }
 
 # backup-setup: rclone remotes, refuse a foreign backup, install the timer and start a first backup.
+# backup_versions get|set: the backup bucket keeps old versions, so files the mirror deletes stay recoverable. Prints
+# "<versioning status> <days old versions are kept, or none>"; set first turns versioning on and adds or updates a lifecycle
+# rule (all files: old versions expire after BACKUP_KEEP_DELETED_DAYS), keeping any other rules. Uses the backup remote's key.
+backup_versions() {
+  dpkg -s python3-boto3 >/dev/null 2>&1 || apt_install python3-boto3 >/dev/null
+  python3 -I - "$1" "$RCLONE_CONFIG" "$BACKUP_S3_BUCKET" "$BACKUP_KEEP_DELETED_DAYS" <<'PY'
+import configparser, sys, boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+mode, conf, bucket, days = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+c = configparser.RawConfigParser(); c.read(conf); r = c["backup"]
+s3 = boto3.client("s3", endpoint_url="https://" + r["endpoint"], region_name=r.get("region") or None,
+                  aws_access_key_id=r["access_key_id"], aws_secret_access_key=r["secret_access_key"],
+                  config=Config(s3={"addressing_style": "path"}))
+def rules():
+    try:
+        return s3.get_bucket_lifecycle_configuration(Bucket=bucket).get("Rules", [])
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchLifecycleConfiguration":
+            return []
+        raise
+def whole(x):  # an enabled rule for every file in the bucket
+    f = x.get("Filter", {})
+    return x.get("Status") == "Enabled" and f.get("Prefix", x.get("Prefix", "")) == "" and set(f) <= {"Prefix"}
+if mode == "set":
+    if s3.get_bucket_versioning(Bucket=bucket).get("Status") != "Enabled":
+        s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    rs = [x for x in rules() if not (whole(x) and "NoncurrentVersionExpiration" in x)]
+    rs.append({"ID": "ente-setup-keep-deleted", "Status": "Enabled", "Filter": {"Prefix": ""},
+               "NoncurrentVersionExpiration": {"NoncurrentDays": days}})
+    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": rs})
+status = s3.get_bucket_versioning(Bucket=bucket).get("Status") or "Off"
+keep = [x["NoncurrentVersionExpiration"]["NoncurrentDays"] for x in rules() if whole(x) and "NoncurrentVersionExpiration" in x]
+print(status, min(keep) if keep else "none")
+PY
+}
+
+# Make the backup bucket keep old versions for BACKUP_KEEP_DELETED_DAYS; without versions, the mirror's deletes would be final.
+setup_backup_versions() {
+  local out st days
+  out=$(backup_versions set 2>&1) || true
+  read -r st days <<<"$(tail -1 <<<"$out")"
+  if [[ $st == Enabled && $days == "$BACKUP_KEEP_DELETED_DAYS" ]]; then
+    log "backup bucket keeps old versions for $days days"
+  elif [[ $st == Enabled ]]; then
+    log "WARNING: could not set the backup bucket's lifecycle ($(tail -1 <<<"$out" | cut -c1-160)). Set it by hand: old (noncurrent)" \
+      "versions expire after $BACKUP_KEEP_DELETED_DAYS days (B2: Lifecycle Settings, keep prior versions for $BACKUP_KEEP_DELETED_DAYS days)"
+  else
+    die "the backup bucket does not keep old versions and versioning could not be turned on ($(tail -1 <<<"$out" | cut -c1-160)); deleted photos would be lost for good. Turn versioning on for $BACKUP_S3_BUCKET and re-run"
+  fi
+}
+
 cmd_backup_setup() {
   load_env
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
@@ -993,6 +1062,7 @@ cmd_backup_setup() {
   make_photo_crypt
   check_backup_owner
   check_backup_owner "$PHOTO_CFG_ROOT" photo-crypt "the photo bucket's $PHOTO_CFG_DIR/"
+  setup_backup_versions
   setup_alerts
   install_backup_units
   systemctl start --no-block ente-backup.service

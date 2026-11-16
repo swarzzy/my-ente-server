@@ -35,10 +35,10 @@ check "both stamps are written (s3, photo-config)" '[[ -s $T/state/last-ok-s3 &&
 rm "$T/s3/photo/1580559962386439/bbb"
 run_backup; RC=$?
 check "a second run succeeds" '((RC == 0))' "$(tail -5 "$T/out")"
-check "a deleted photo moves to deleted/<date>/ in the backup" '[[ -f $T/b2/bk/deleted/$(date +%F)/1580559962386439/bbb && ! -e $T/b2/bk/objects/1580559962386439/bbb ]]'
+check "a deleted photo is deleted from the mirror too (its history is the backup bucket's old versions)" '[[ ! -e $T/b2/bk/objects/1580559962386439/bbb && -f $T/b2/bk/objects/1580559962386439/aaa ]]'
 check "with the copy present, it is still not mirrored into objects/ (the exclusion, not luck)" \
   '[[ -d $T/s3/photo/ente-backup-config && ! -e $T/b2/bk/objects/ente-backup-config ]]' "$(find "$T/b2/bk/objects" | head)"
-check "nothing of the config copy appears under deleted/" '! find "$T/b2/bk/deleted" | grep ente-backup-config >/dev/null'
+check "no deleted/ folder is made" '[[ ! -e $T/b2/bk/deleted ]]'
 check "the config copy is still in the photo bucket" 'rclone lsf photo-crypt: 2>/dev/null | grep -x museum.yaml >/dev/null'
 chmod 000 "$T/s3/photo/ente-backup-config"
 run_backup; RC=$?
