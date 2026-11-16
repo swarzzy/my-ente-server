@@ -35,9 +35,11 @@ them) and stops naming any that a command needs but is missing; it never logs th
 2. **DNS.** A (and AAAA) records for `api.`, `web.` and `albums.` under your domain → the VPS, TTL 300.
 3. **Config.** Copy `ente-server/` to the VPS, create `ente-setup.env` and `ente-setup.secrets` from the examples.
    `BACKUP_PASSPHRASE` encrypts the config backup: keep it in a password manager, without it the backup is unreadable.
-4. **As root:** `./ente-setup.sh deploy` = `bootstrap` + `install` + `backup-setup`. About 5 minutes.
+4. **As root:** `./ente-setup.sh deploy` = `bootstrap` + `install` + `backup-setup`. About 5 minutes. Run it in `tmux` (or `nohup`):
+   bootstrap moves sshd, and a dropped SSH session would stop it half-way (re-running it is safe).
    - `bootstrap`: updates, `ADMIN_USER` (sudo, key only), sshd hardening (no passwords, no root login, port `SSH_PORT`, default 22), UFW `SSH_PORT`/80/443,
-     unattended upgrades (reboot 02:00 only when needed), 2 GB swap, fail2ban.
+     unattended upgrades (reboot 02:00 only when needed), 2 GB swap, fail2ban. A full upgrade: if it installs a new kernel it says so;
+     reboot once deploy is done (`ente-vpn.sh` needs the running kernel's headers).
      The admin key is validated first (a placeholder or truncated key is refused, since it would lock you out).
      **Open a second terminal and log in as `ADMIN_USER` before closing the root session** (root login is now off).
      `MaxAuthTries 3`: if your ssh-agent holds many keys use `ssh -o IdentitiesOnly=yes -i KEY`.
@@ -180,7 +182,7 @@ objects are copied from the backup bucket. After restoring from the photo bucket
 
 ## AmneziaWG VPN (`ente-vpn.sh`, optional, independent of Ente)
 
-Needs only `bootstrap` and `AWG_PORT` (UDP, 1024-65535) in `ente-setup.env`; open that UDP port in your provider's firewall too.
+Needs only `bootstrap` (and the reboot it asks for after a kernel update) and `AWG_PORT` (UDP, 1024-65535) in `ente-setup.env`; open that UDP port in your provider's firewall too.
 `sudo ./ente-vpn.sh install` installs AmneziaWG 3.1 from Amnezia's PPA (pinned key, DKMS module), generates keys and random
 obfuscation parameters, writes `/etc/amnezia/amneziawg/awg0.conf` and one shared client config `/root/awg-client.conf`
 (one device at a time), allows the port and the tunnel's forwarding in UFW, NATs the tunnel (`nft` table `ip awg_nat`, set up and
@@ -230,7 +232,7 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 | --- | --- | --- |
 | `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum, the bot against a fake Telegram |
 | `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, command lines |
-| `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the mirror's exclusion, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase |
+| `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the mirror's exclusion, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
 | `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev` |
 | `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
