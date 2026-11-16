@@ -167,10 +167,10 @@ class RewriterTest(unittest.TestCase):
         self.assertEqual(r.status, 307)
         self.assertEqual(r.getheader("Location"), url(host=PROXY))
 
-    def test_gzip_json_is_decoded_rewritten_and_sent_plain(self):
+    def test_compressed_json_passes_through_untouched(self):
         r, data = self.req("GET", "/gzip", headers={"Accept-Encoding": "gzip"})
-        self.assertIsNone(r.getheader("Content-Encoding"))
-        self.assertEqual(json.loads(data)["url"], url(host=PROXY))
+        self.assertEqual(r.getheader("Content-Encoding"), "gzip")
+        self.assertEqual(json.loads(gzip.decompress(data))["url"], url())
 
     def test_error_responses_are_rewritten_and_keep_their_status(self):
         r, data = self.req("GET", "/error")

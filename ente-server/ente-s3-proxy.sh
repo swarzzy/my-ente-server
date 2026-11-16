@@ -5,7 +5,8 @@
 #   on | off   switch museum's bucket links to https://$S3_PROXY_HOST/<bucket>/ or back to the bucket (installs if needed)
 #   status     the state and the checks          check   the checks only (ente-ops.sh check runs this)
 #   uninstall  remove everything; links point at the bucket again
-# Config: S3_PROXY_HOST in ente-setup.env (its DNS record pointing here); everything else comes from ente-setup.sh's config.
+# Config: S3_PROXY_HOST in ente-setup.env (its DNS record pointing here); the bucket's endpoint and name come from museum.yaml
+# (what museum signs its links for), the rest from ente-setup.sh's config.
 # Needs ente-setup.sh (and ente_s3_rewrite.py) next to it, and `ente-setup.sh install` done.
 #
 # How: while on, API traffic goes through ente-s3-rewrite (ente_s3_rewrite.py), which rewrites museum's pre-signed links;
@@ -20,12 +21,17 @@ REWRITE_PY=/usr/local/lib/ente-setup/ente_s3_rewrite.py
 REWRITE_UNIT=/etc/systemd/system/ente-s3-rewrite.service
 REWRITE_PORT=8081
 
-# proxy_load_env: ente-setup.sh's config plus S3_PROXY_HOST (a host name of its own).
+# proxy_load_env: ente-setup.sh's config plus S3_PROXY_HOST (a host name of its own), and LINK_ENDPOINT / LINK_BUCKET: the
+# bucket museum signs its links for, read from museum.yaml (the source of truth after install), so proxy and links never differ.
 proxy_load_env() {
   load_env
   [[ -n $S3_PROXY_HOST ]] || die "S3_PROXY_HOST is not set in $ENV_FILE (e.g. s3.$DOMAIN, with its DNS record pointing here)"
+  [[ -f $ENTE_DIR/museum.yaml ]] || die "run ente-setup.sh install first"
+  local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
+  eval "$(museum_s3)"
+  LINK_ENDPOINT=$M_ENDPOINT LINK_BUCKET=$M_BUCKET
   case $S3_PROXY_HOST in
-    "api.$DOMAIN" | "web.$DOMAIN" | "albums.$DOMAIN" | "$S3_ENDPOINT") die "S3_PROXY_HOST must be a host name of its own, not $S3_PROXY_HOST" ;;
+    "api.$DOMAIN" | "web.$DOMAIN" | "albums.$DOMAIN" | "$LINK_ENDPOINT") die "S3_PROXY_HOST must be a host name of its own, not $S3_PROXY_HOST" ;;
   esac
 }
 
@@ -61,12 +67,12 @@ render_proxy_site() {
 $S3_PROXY_HOST {
 	import sec
 	@bucket {
-		path /$S3_BUCKET/*
+		path /$LINK_BUCKET/*
 		method GET HEAD PUT POST OPTIONS
 	}
 	handle @bucket {
-		reverse_proxy https://$S3_ENDPOINT {
-			header_up Host $S3_ENDPOINT
+		reverse_proxy https://$LINK_ENDPOINT {
+			header_up Host $LINK_ENDPOINT
 			header_up -X-Forwarded-For
 			header_up -X-Forwarded-Proto
 			header_up -X-Forwarded-Host
@@ -84,11 +90,11 @@ EOF
 rewrite_unit() {
   cat <<EOF
 [Unit]
-Description=Ente S3 link rewriter (pre-signed bucket links -> https://$S3_PROXY_HOST/$S3_BUCKET/)
+Description=Ente S3 link rewriter (pre-signed bucket links -> https://$S3_PROXY_HOST/$LINK_BUCKET/)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 $REWRITE_PY --listen 127.0.0.1:$REWRITE_PORT --upstream 127.0.0.1:8080 --from-host $S3_ENDPOINT --to-host $S3_PROXY_HOST --bucket $S3_BUCKET
+ExecStart=/usr/bin/python3 $REWRITE_PY --listen 127.0.0.1:$REWRITE_PORT --upstream 127.0.0.1:8080 --from-host $LINK_ENDPOINT --to-host $S3_PROXY_HOST --bucket $LINK_BUCKET
 DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -121,20 +127,12 @@ install_rewriter() {
 }
 
 # apply_caddy: write the proxy site and the API upstream for the current state, validate the whole Caddy config and reload.
-# An invalid result puts the previous files back.
+# Runs under with_rollback, which puts the previous files back when it fails.
 apply_caddy() {
-  local bak; bak=$(mktemp -d)
-  cp -p "$CADDY_API_UPSTREAM" "$bak/up" 2>/dev/null || true
-  cp -p "$PROXY_SITE" "$bak/site" 2>/dev/null || true
   render_proxy_site | write_file "$PROXY_SITE"
   render_api_upstream "$(proxy_state)" | write_file "$CADDY_API_UPSTREAM"
-  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
-    if [[ -e $bak/up ]]; then cp -p "$bak/up" "$CADDY_API_UPSTREAM"; else render_api_upstream off >"$CADDY_API_UPSTREAM"; fi
-    if [[ -e $bak/site ]]; then cp -p "$bak/site" "$PROXY_SITE"; else rm -f "$PROXY_SITE"; fi
-    rm -rf "$bak"
-    die "the Caddy config with the proxy is invalid (caddy validate --config $CADDYFILE); previous files restored"
-  fi
-  rm -rf "$bak"
+  caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 ||
+    die "the Caddy config with the proxy is invalid (caddy validate --config $CADDYFILE)"
   systemctl reload-or-restart caddy
 }
 
@@ -169,10 +167,10 @@ proxy_checks_base() {
     [[ $out != *NoSuchKey* ]] || break
     sleep 3
   done
-  if [[ $out == *NoSuchKey* ]]; then ok "https://$S3_PROXY_HOST forwards signed links to $S3_ENDPOINT"
+  if [[ $out == *NoSuchKey* ]]; then ok "https://$S3_PROXY_HOST forwards signed links to $LINK_ENDPOINT"
   else bad "https://$S3_PROXY_HOST does not forward signed links: $(head -c 160 <<<"$out" | tr '\n' ' ')"; fi
   out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT" \
-    "https://$S3_PROXY_HOST/$S3_BUCKET/ente-check" 2>&1 || true)
+    "https://$S3_PROXY_HOST/$LINK_BUCKET/ente-check" 2>&1 || true)
   if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight through the proxy allowed for https://web.$DOMAIN"
   else bad "CORS preflight through the proxy not allowed (web uploads through the proxy will fail)"; fi
   st=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$S3_PROXY_HOST/" 2>&1 || true)
@@ -188,27 +186,17 @@ proxy_check_state() {
     else bad "proxy is on but the API does not go through the link rewriter (falling back to museum?)"; fi
   else
     if grep -qi '^x-ente-link-rewrite' <<<"$out"; then bad "proxy is off but the API still goes through the link rewriter"
-    else ok "proxy OFF: bucket links point at $S3_ENDPOINT"; fi
+    else ok "proxy OFF: bucket links point at $LINK_ENDPOINT"; fi
   fi
 }
 
 # ---------------------------------------------------------------- commands
-cmd_install() {
-  proxy_load_env
-  [[ -f $ENTE_DIR/museum.yaml ]] || die "run ente-setup.sh install first"
-  grep -qF "import $CADDY_API_UPSTREAM" "$CADDYFILE" 2>/dev/null ||
-    die "$CADDYFILE has no add-on hooks: re-run ente-setup.sh install (a newer version) first"
-  install_rewriter
-  [[ -e $PROXY_STATE ]] || set_proxy_state off
-  apply_caddy
-  log "S3 proxy installed for https://$S3_PROXY_HOST ($(proxy_state))"
-}
-
-# The add-on's files, for rolling back a failed switch (snapshot_proxy DIR / restore_proxy DIR).
+# The add-on's files, for rolling back a failed install or switch (snapshot_proxy DIR / restore_proxy DIR). The unit comes first.
 proxy_files() { echo "$REWRITE_UNIT" "$REWRITE_PY" "$PROXY_SITE" "$CADDY_API_UPSTREAM" "$PROXY_STATE"; }
 snapshot_proxy() { local f i=0; for f in $(proxy_files); do i=$((i + 1)); [[ ! -e $f ]] || cp -p "$f" "$1/$i"; done; }
 restore_proxy() {
   local f i=0
+  [[ -e $1/1 ]] || systemctl disable --now ente-s3-rewrite.service >/dev/null 2>&1 || true # there was no rewriter before
   for f in $(proxy_files); do i=$((i + 1)); if [[ -e $1/$i ]]; then cp -p "$1/$i" "$f"; else rm -f "$f"; fi; done
   [[ -e $CADDY_API_UPSTREAM ]] || render_api_upstream off >"$CADDY_API_UPSTREAM"
   systemctl daemon-reload
@@ -216,10 +204,35 @@ restore_proxy() {
   systemctl reload-or-restart caddy || true
 }
 
+# with_rollback WHAT FUNC [ARGS]: run FUNC in a subshell; if it fails, put the add-on's files and state back and die.
+with_rollback() {
+  local what=$1 snap; shift
+  snap=$(mktemp -d); snapshot_proxy "$snap"
+  if ! ("$@"); then
+    restore_proxy "$snap"; rm -rf "$snap"
+    die "$what; everything is back as it was"
+  fi
+  rm -rf "$snap"
+}
+
+# do_install: the rewriter, the state (off at first) and the Caddy files.
+do_install() {
+  grep -qF "import $CADDY_API_UPSTREAM" "$CADDYFILE" 2>/dev/null ||
+    die "$CADDYFILE has no add-on hooks: re-run ente-setup.sh install (a newer version) first"
+  install_rewriter
+  [[ -e $PROXY_STATE ]] || set_proxy_state off
+  apply_caddy
+}
+cmd_install() {
+  proxy_load_env
+  with_rollback "S3 proxy not installed" do_install
+  log "S3 proxy installed for https://$S3_PROXY_HOST ($(proxy_state))"
+}
+
 # do_switch on|off: install if needed; before `on` goes live, test everything that works in both states; then switch.
 do_switch() {
   local want=$1 f0
-  cmd_install
+  do_install
   if [[ $want == on ]]; then
     f0=$FAILS; proxy_checks_base 20
     ((FAILS == f0)) || die "proxy self-test failed before switching"
@@ -232,15 +245,10 @@ do_switch() {
 
 # switch on|off: do_switch; any failure puts the add-on's files and state back as they were.
 cmd_switch() {
-  local want=$1 was snap
+  local want=$1 was
   proxy_load_env
   was=$(proxy_state)
-  snap=$(mktemp -d); snapshot_proxy "$snap"
-  if ! (do_switch "$want"); then
-    restore_proxy "$snap"; rm -rf "$snap"
-    die "S3 proxy not switched $want; everything is back as it was ($was)"
-  fi
-  rm -rf "$snap"
+  with_rollback "S3 proxy not switched $want (still $was)" do_switch "$want"
   log "S3 proxy $want (was $was)"
 }
 

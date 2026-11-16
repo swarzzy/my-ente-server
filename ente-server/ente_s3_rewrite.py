@@ -9,11 +9,9 @@ host, path and query only, so the links stay valid. Photo data never passes thro
 Usage: ente-s3-rewrite --listen 127.0.0.1:8081 --upstream 127.0.0.1:8080 --from-host s3.real.example --to-host s3.my.domain --bucket b
 """
 import argparse
-import gzip
 import http.client
 import re
 import sys
-import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
@@ -151,7 +149,9 @@ def make_handler(cfg):
             ctype = (r.getheader("Content-Type") or "").lower()
             clen = r.getheader("Content-Length")
             no_body = self.command == "HEAD" or r.status in (204, 304) or 100 <= r.status < 200
-            rewritable = "json" in ctype and not no_body and (clen is None or int(clen) <= MAX_REWRITE)
+            # museum is asked for identity: a compressed body (never seen) passes untouched, its links then pointing at the bucket
+            plain = (r.getheader("Content-Encoding") or "identity").lower() == "identity"
+            rewritable = "json" in ctype and plain and not no_body and (clen is None or int(clen) <= MAX_REWRITE)
             headers = []
             for k, v in r.getheaders():
                 kl = k.lower()
@@ -160,16 +160,10 @@ def make_handler(cfg):
                 if kl == "location":
                     v = rewrite(v.encode("latin-1")).decode("latin-1")
                 if rewritable and kl in ("content-length", "content-encoding"):
-                    continue
+                    continue  # length recomputed; an identity encoding header is dropped
                 headers.append((k, v))
             if rewritable:
-                data = r.read()
-                enc = (r.getheader("Content-Encoding") or "").lower()
-                if enc == "gzip":
-                    data = gzip.decompress(data)
-                elif enc == "deflate":
-                    data = zlib.decompress(data)
-                data = rewrite(data)
+                data = rewrite(r.read())
                 headers.append(("Content-Length", str(len(data))))
             self.send_response(r.status, r.reason)
             for k, v in headers:

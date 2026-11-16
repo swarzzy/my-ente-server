@@ -108,11 +108,17 @@ rmobj
 
 echo "== uninstall"
 prx uninstall; check "uninstall succeeds" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
+REWRITE_UNIT_FILE=/etc/systemd/system/ente-s3-rewrite.service
 check "rewriter service is removed" '! systemctl cat ente-s3-rewrite.service >/dev/null 2>&1 && [[ ! -e /usr/local/lib/ente-setup/ente_s3_rewrite.py ]]'
 check "proxy site and state are removed, API goes to museum" '[[ ! -e $SITE && ! -e $STATE ]] && ! api_rewrites && [[ $(cat /etc/caddy/ente.d/api-upstream.caddy) == "reverse_proxy 127.0.0.1:8080" ]]'
 check "the API still answers" '[[ $(api_code "https://api.$DOMAIN/ping") == 200 ]]'
 ops check; check "ente-ops.sh check passes without the proxy and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "s3 proxy" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
 prx uninstall; check "uninstall again is harmless" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
+sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=bad{host.$DOMAIN/" ente-setup.env >"$T/brk.env"
+ENV_FILE=$T/brk.env "$PROXYSH" install </dev/null >"$T/out" 2>&1; RC=$?
+check "a first install that fails says so" '[[ $RC -ne 0 ]] && grep -q "S3 proxy not installed; everything is back as it was" "$T/out"' "$(tail -5 "$T/out")"
+check "... and leaves nothing behind (no rewriter, no site, the API on museum)" \
+  '! systemctl is-enabled --quiet ente-s3-rewrite.service 2>/dev/null && ! systemctl is-active --quiet ente-s3-rewrite.service && [[ ! -e $SITE && ! -e $REWRITE_UNIT_FILE && ! -e /usr/local/lib/ente-setup/ente_s3_rewrite.py ]] && ! api_rewrites && [[ $(api_code "https://api.$DOMAIN/ping") == 200 ]]'
 prx on; check "on installs it again (and turns it on)" '[[ $RC -eq 0 ]] && caddy_has_s3 && api_rewrites' "$(cat "$T/out")"
 sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=/" ente-setup.env >"$T/none.env"
 ENV_FILE=$T/none.env "$PROXYSH" on </dev/null >"$T/out" 2>&1; RC=$?

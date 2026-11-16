@@ -25,13 +25,20 @@ BACKUP_S3_REGION=us-east-005
 BACKUP_S3_BUCKET=ente-backup
 X
 }
-# in_proxy ENV_EXTRA CODE: source ente-s3-proxy.sh (which sources ente-setup.sh) with base_env + ENV_EXTRA and a private
-# Caddy directory, then run CODE in a subshell
+# museum_yaml ENDPOINT BUCKET: the fake museum.yaml's bucket (the proxy reads the bucket from there)
+museum_yaml() {
+  mkdir -p "$T/ente"
+  printf 's3:\n  b2-eu-cen:\n    key: k\n    secret: s\n    endpoint: %s\n    region: eu-west-4\n    bucket: %s\n' "$1" "$2" >"$T/ente/museum.yaml"
+}
+museum_yaml s3.eu-west-4.idrivee2.com ente-dev
+# in_proxy ENV_EXTRA CODE: source ente-s3-proxy.sh (which sources ente-setup.sh) with base_env + ENV_EXTRA, a private
+# Caddy directory and the fake museum.yaml, then run CODE in a subshell
 in_proxy() {
   base_env >"$T/env"; printf '%s\n' "$1" >>"$T/env"
   ( ENV_FILE=$T/env SECRETS_FILE=$T/none PROXY_STATE=$T/state CADDY_DIR=$T/caddy CMD=test
     # shellcheck source=/dev/null
     . "$HERE/../ente-s3-proxy.sh"
+    ENTE_DIR=$T/ente
     set +e
     eval "$2" )
 }
@@ -55,6 +62,9 @@ for bad in "S3_PROXY_HOST=" "S3_PROXY_HOST=api.photos.example.org" "S3_PROXY_HOS
   out=$(in_proxy "$bad" 'proxy_load_env && echo LOADED' 2>&1); check "rejects $bad" '[[ $out != *LOADED* && $out == *S3_PROXY_HOST* ]]' "$out"
 done
 out=$(in_setup "S3_PROXY_HOST=whatever" 'load_env && echo LOADED' 2>&1); check "ente-setup.sh itself does not validate the proxy's setting" '[[ $out == *LOADED* ]]' "$out"
+mv "$T/ente/museum.yaml" "$T/m.bak"
+out=$(in_proxy "$P" 'proxy_load_env && echo LOADED' 2>&1); check "without museum.yaml: refuses (install first)" '[[ $out != *LOADED* && $out == *"install first"* ]]' "$out"
+mv "$T/m.bak" "$T/ente/museum.yaml"
 
 echo "== state file"
 rm -f "$T/state"
@@ -94,13 +104,18 @@ check "proxy site upstream is the real endpoint over https" 'grep -q "reverse_pr
 check "proxy site streams (no buffering)" 'grep -q "flush_interval -1" "$T/site.caddy"'
 check "anything else on the proxy site gets 404" 'grep -q "respond 404" "$T/site.caddy"'
 check "proxy site uses the main file's security headers" 'grep -q "^	import sec$" "$T/site.caddy"'
+museum_yaml s3.other.example b2 # museum signs links for another bucket than ente-setup.env names
+in_proxy "$P" 'proxy_load_env; render_proxy_site; rewrite_unit' >"$T/drift"
+check "site and rewriter follow museum.yaml, not ente-setup.env (they must match the signed links)" \
+  'grep -q "path /b2/\*" "$T/drift" && grep -q "header_up Host s3.other.example" "$T/drift" && grep -q -- "--from-host s3.other.example --to-host s3.photos.example.org --bucket b2" "$T/drift" && ! grep -q "ente-dev\|idrivee2" "$T/drift"' "$(cat "$T/drift")"
+museum_yaml s3.eu-west-4.idrivee2.com ente-dev
 
 if command -v caddy >/dev/null; then
   # assemble the real layout for each state and let caddy validate it
   assemble() { # assemble NAME STATE (none|off|on)
     local d=$T/$1; rm -rf "$d"
     ( ENV_FILE=$T/env SECRETS_FILE=$T/none PROXY_STATE=$T/state CADDY_DIR=$d CMD=test
-      . "$HERE/../ente-s3-proxy.sh"; set +e
+      . "$HERE/../ente-s3-proxy.sh"; ENTE_DIR=$T/ente; set +e
       proxy_load_env; ensure_caddy_hooks; render_caddyfile >"$d/Caddyfile"
       if [[ $2 != none ]]; then render_proxy_site >"$d/ente.d/sites/s3-proxy.caddy"; render_api_upstream "$2" >"$d/ente.d/api-upstream.caddy"; fi )
   }
