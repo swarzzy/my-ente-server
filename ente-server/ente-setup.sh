@@ -645,10 +645,10 @@ cmd_update() {
     if [[ $ref != "$old" ]]; then changed=1; log "$svc: ${old##*@sha256:} -> ${ref##*@sha256:}"; fi
     new+="$svc $ref"$'\n'
   done
+  dc pull -q postgres || die "cannot pull postgres" # every download before anything changes
   if ((changed)); then cp -p "$PINS" "$PINS.prev"; fi # the rollback point: only replaced when a build really changes
   printf '%s' "$new" | write_file "$PINS" 600
   write_override
-  dc pull -q postgres
   dc up -d
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping fails after the update; the previous versions are in $PINS.prev (README: Updates)"
