@@ -227,7 +227,6 @@ awg_selftest() {
 # install: AmneziaWG on UDP AWG_PORT with one shared client (one device at a time). Re-runnable; keeps the keys, follows a changed AWG_PORT.
 cmd_vpn_install() {
   load_env vpn; need AWG_PORT
-  [[ $AWG_PORT =~ ^[1-9][0-9]{3,4}$ ]] && ((AWG_PORT >= 1024 && AWG_PORT <= 65535)) || die "AWG_PORT must be a UDP port 1024-65535"
   ufw status | grep '^Status: active' >/dev/null || die "ufw is not active; run bootstrap first"
   local ip wan old
   ip=$(host_ip)

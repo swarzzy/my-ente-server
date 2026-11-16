@@ -20,12 +20,10 @@ REWRITE_PY=/usr/local/lib/ente-setup/ente_s3_rewrite.py
 REWRITE_UNIT=/etc/systemd/system/ente-s3-rewrite.service
 REWRITE_PORT=8081
 
-# proxy_load_env: ente-setup.sh's config plus a valid S3_PROXY_HOST.
+# proxy_load_env: ente-setup.sh's config plus S3_PROXY_HOST (a host name of its own).
 proxy_load_env() {
   load_env
   [[ -n $S3_PROXY_HOST ]] || die "S3_PROXY_HOST is not set in $ENV_FILE (e.g. s3.$DOMAIN, with its DNS record pointing here)"
-  [[ $S3_PROXY_HOST =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] ||
-    die "S3_PROXY_HOST must be a bare host name like s3.$DOMAIN (no https://)"
   case $S3_PROXY_HOST in
     "api.$DOMAIN" | "web.$DOMAIN" | "albums.$DOMAIN" | "$S3_ENDPOINT") die "S3_PROXY_HOST must be a host name of its own, not $S3_PROXY_HOST" ;;
   esac

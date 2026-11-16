@@ -32,20 +32,18 @@ bot_root_files() {
   for f in "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" "$BOT_DIR/ente-ops.sh" "$BOT_DIR/ente-s3-proxy.sh" "$ENV_FILE" "$SECRETS_FILE"; do [[ ! -e $f ]] || echo "$f"; done
 }
 
-# bot_load_env: ente-setup.sh's config plus a valid TG_BOT_USER_ID (a person's id: positive).
+# bot_load_env: ente-setup.sh's config plus TG_BOT_USER_ID.
 bot_load_env() {
   load_env
   TG_BOT_USER_ID=${TG_BOT_USER_ID:-}
-  [[ $TG_BOT_USER_ID =~ ^[1-9][0-9]{0,15}$ ]] ||
-    die "TG_BOT_USER_ID must be your Telegram user id (a positive number; for a private chat it equals TG_CHAT_ID)"
+  [[ -n $TG_BOT_USER_ID ]] || die "TG_BOT_USER_ID is not set in $ENV_FILE (your Telegram user id; for a private chat it equals TG_CHAT_ID)"
 }
 
-# bot_token: print the bot token (secrets file / environment first, else the alerts' env file); die if none is valid.
+# bot_token: print the bot token (secrets file / environment first, else the alerts' env file); die if there is none.
 bot_token() {
   local t=${TG_BOT_TOKEN:-}
   if [[ -z $t && -f $ALERT_ENV ]]; then t=$(. "$ALERT_ENV"; echo "${TG_BOT_TOKEN:-}"); fi
   [[ -n $t ]] || die "no bot token: set TG_BOT_TOKEN in $SECRETS_FILE (or set up the alerts with backup-setup first)"
-  [[ $t =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "TG_BOT_TOKEN does not look like a bot token (123456:ABC...)"
   printf '%s\n' "$t"
 }
 

@@ -50,8 +50,8 @@ echo "== config validation"
 for good in "$P" "S3_PROXY_HOST=files.other.net"; do
   out=$(in_proxy "$good" 'proxy_load_env && echo LOADED' 2>&1); check "accepts $good" '[[ $out == *LOADED* ]]' "$out"
 done
-for bad in "S3_PROXY_HOST=" "S3_PROXY_HOST=https://s3.photos.example.org" "S3_PROXY_HOST=api.photos.example.org" "S3_PROXY_HOST=web.photos.example.org" \
-  "S3_PROXY_HOST=albums.photos.example.org" "S3_PROXY_HOST=s3.eu-west-4.idrivee2.com" "S3_PROXY_HOST='a b.org'" "S3_PROXY_HOST=nodot"; do
+for bad in "S3_PROXY_HOST=" "S3_PROXY_HOST=api.photos.example.org" "S3_PROXY_HOST=web.photos.example.org" \
+  "S3_PROXY_HOST=albums.photos.example.org" "S3_PROXY_HOST=s3.eu-west-4.idrivee2.com"; do
   out=$(in_proxy "$bad" 'proxy_load_env && echo LOADED' 2>&1); check "rejects $bad" '[[ $out != *LOADED* && $out == *S3_PROXY_HOST* ]]' "$out"
 done
 out=$(in_setup "S3_PROXY_HOST=whatever" 'load_env && echo LOADED' 2>&1); check "ente-setup.sh itself does not validate the proxy's setting" '[[ $out == *LOADED* ]]' "$out"

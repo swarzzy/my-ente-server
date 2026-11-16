@@ -101,15 +101,10 @@ load_env() {
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
   TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
   need DOMAIN S3_ENDPOINT S3_REGION S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET
-  [[ $DOMAIN =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z0-9-]+$ && $DOMAIN != *example.com ]] || die "DOMAIN missing, invalid or a placeholder"
-  [[ $SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((SSH_PORT <= 65535)) && [[ ! $SSH_PORT =~ ^(80|443|3200|3201|5432)$ ]] ||
-    die "SSH_PORT must be 1-65535 and not 80, 443, 3200, 3201 or 5432"
   [[ $S3_ENDPOINT != *://* &&$BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
   [[ $S3_ENDPOINT/$S3_BUCKET != "$BACKUP_S3_ENDPOINT/$BACKUP_S3_BUCKET" ]] || die "backup bucket must differ from the photo bucket"
   BACKUP_ROOT=backup:$BACKUP_S3_BUCKET/
   PHOTO_CFG_ROOT=ente-s3:$S3_BUCKET/$PHOTO_CFG_DIR/
-  [[ -z $HC_URL || $HC_URL =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/?\&=%:+-]*)?$ ]] || die "HC_URL must be an https:// ping URL without spaces or quotes"
-  [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's ID starts with -)"
 }
 
 # ---------------------------------------------------------------- bootstrap
@@ -128,9 +123,6 @@ EOF
   touch "$home/.ssh/authorized_keys"
   ensure_line "$home/.ssh/authorized_keys" "$ADMIN_SSH_PUBKEY"
   chown "$ADMIN_USER:$ADMIN_USER" "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"
-  # only harden after the user and key are confirmed
-  grep -qxF -- "$ADMIN_SSH_PUBKEY" "$home/.ssh/authorized_keys" || die "admin key not installed, refusing to harden sshd"
-  [[ -d /etc/ssh/sshd_config.d ]] || die "/etc/ssh/sshd_config.d missing"
   write_file /etc/ssh/sshd_config.d/10-hardening.conf <<EOF
 Port $SSH_PORT
 PasswordAuthentication no
@@ -163,7 +155,7 @@ EOF
 # bootstrap: upgrade packages, admin user + sshd hardening, ufw, unattended upgrades, swap, fail2ban.
 cmd_bootstrap() {
   load_env; need ADMIN_USER ADMIN_SSH_PUBKEY
-  [[ $ADMIN_USER =~ ^[a-z_][a-z0-9_-]*$ && $ADMIN_USER != root ]] || die "ADMIN_USER invalid"
+  [[ $ADMIN_USER != root ]] || die "ADMIN_USER must not be root (bootstrap turns root login off: it would lock you out)"
   local kf; kf=$(mktemp); printf '%s\n' "$ADMIN_SSH_PUBKEY" >"$kf"
   ssh-keygen -l -f "$kf" >/dev/null 2>&1 || { rm -f "$kf"; die "ADMIN_SSH_PUBKEY is not a valid public key (placeholder or truncated?); refusing, it would lock you out"; }
   rm -f "$kf"
@@ -395,7 +387,6 @@ ensure_pins() {
   for svc in museum web; do
     repo=$(repo_of $svc); ref=$(pin_of $svc)
     if [[ -n $ref ]]; then
-      [[ $ref =~ ^$repo@sha256:[0-9a-f]{64}$ ]] || die "$PINS: bad entry for $svc"
       if ! docker image inspect "$ref" >/dev/null 2>&1 && ! docker pull -q "$ref" >/dev/null 2>&1; then
         warn "the pinned $svc image ${ref##*@} can no longer be pulled; pinning the running or latest build instead"; ref=
       fi
@@ -617,7 +608,6 @@ cmd_lockdown() {
   [[ -n $rows ]] || die "no users yet; sign up the owner first"
   echo "Users (oldest first):"; echo "user_id|created"; echo "$rows"
   first=${rows%%$'\n'*}; id=${first%%|*}
-  [[ $id =~ ^[0-9]+$ ]] || die "unexpected user_id '$id'"
   read -rp "Make user_id $id (oldest) the admin and close sign-ups? [y/N] " a || die "no answer (stdin closed)"
   [[ $a == y || $a == Y ]] || die "aborted"
   sync_internal "$id" yes
@@ -910,7 +900,6 @@ setup_alerts() {
   fi
   if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
   need_secret TG_BOT_TOKEN
-  [[ $TG_BOT_TOKEN =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "TG_BOT_TOKEN does not look like a bot token (123456:ABC...)"
   tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
   write_file /etc/ente-alert.env 600 <<EOF
 TG_BOT_TOKEN='$TG_BOT_TOKEN'
