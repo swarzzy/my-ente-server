@@ -57,6 +57,22 @@ out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$T/open/ente-set
 check "backup-setup refuses a script folder others can write (root's timers run it)" \
   '((rc != 0)) && [[ $out == *"root'"'"'s timers run the scripts in $T/open"* ]]' "$out"
 
+echo "== the photo bucket: museum.yaml once it has one, else the env file"
+# bucket_run CODE: load_env with the base config (S3_ENDPOINT=s3.example.net, S3_BUCKET=photo) and $T/mb/museum.yaml, then CODE
+bucket_run() { ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; ENTE_DIR=$T/mb; set +e; load_env; eval "$1" ) 2>&1; }
+mkdir -p "$T/mb"; rm -f "$T/mb/museum.yaml"
+out=$(bucket_run 'echo "$PHOTO_ENDPOINT/$PHOTO_BUCKET $PHOTO_CFG_ROOT"')
+check "no museum.yaml yet (before install, early in restore): the env file's" '[[ $out == "s3.example.net/photo ente-s3:photo/ente-backup-config/" ]]' "$out"
+printf 'key:\n  encryption: x\n' >"$T/mb/museum.yaml"
+out=$(bucket_run 'echo "$PHOTO_ENDPOINT/$PHOTO_BUCKET"'); check "museum.yaml without a bucket: the env file's" '[[ $out == "s3.example.net/photo" ]]' "$out"
+printf 's3:\n  b2-eu-cen:\n    key: k\n    secret: s\n    endpoint: s3.museum.net\n    region: r\n    bucket: museum-bucket\n' >"$T/mb/museum.yaml"
+out=$(bucket_run 'echo "$PHOTO_ENDPOINT/$PHOTO_BUCKET $PHOTO_CFG_ROOT"')
+check "museum.yaml names another bucket (S3_* edited, install not re-run): museum's" \
+  '[[ $out == "s3.museum.net/museum-bucket ente-s3:museum-bucket/ente-backup-config/" ]]' "$out"
+out=$(bucket_run 'write_file() { cat >"$T/mb/$(basename "$1")"; }; systemctl() { :; }; SCRIPT_DIR=$HERE/..; install_backup_units; cat "$T/mb/ente-backup.env"')
+check "... and the backup gets museum's bucket" 'grep -qx "PHOTO_BUCKET=\"museum-bucket\"" <<<"$out"' "$out"
+out=$(bucket_run 'echo "M_KEY=[${M_KEY:-}]"'); check "... without leaving museum's keys in the shell" '[[ $out == "M_KEY=[]" ]]' "$out"
+
 echo "== ente-ops.sh"
 for c in check verify; do check "$c is a known command" 'asks_root ente-ops.sh $c'; done
 check "no command: usage error" 'usage_error ente-ops.sh'

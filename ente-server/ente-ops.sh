@@ -15,7 +15,7 @@ new_uploads() {
   local s f; f=$(mktemp)
   echo "/$PHOTO_CFG_DIR/**" >"$f" # the config copy, not a photo
   if s=$(cat "$BACKUP_STATE/last-ok-$1" 2>/dev/null); then
-    rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$S3_BUCKET" \
+    rclone lsf -R --files-only --use-server-modtime --max-age "$(($(date +%s) - $(date -d "$s" +%s) + 60))s" "ente-s3:$PHOTO_BUCKET" \
       --exclude "/$PHOTO_CFG_DIR/**" 2>/dev/null |
       sed 's/[][*?{}\\]/\\&/g; s|^|/|' >>"$f" || true
   fi
@@ -118,9 +118,12 @@ check_security() {
 check_bucket() {
   local out
   echo "== photo bucket"
-  if out=$(rclone lsf "ente-s3:$S3_BUCKET" --max-depth 1 2>&1 >/dev/null); then ok "bucket $S3_BUCKET reachable"; else bad "bucket $S3_BUCKET: $out"; fi
+  if [[ $PHOTO_ENDPOINT/$PHOTO_BUCKET != "$S3_ENDPOINT/$S3_BUCKET" ]]; then
+    warn "ente-setup.env names $S3_ENDPOINT/$S3_BUCKET but museum uses $PHOTO_ENDPOINT/$PHOTO_BUCKET: re-run install to switch"
+  fi
+  if out=$(rclone lsf "ente-s3:$PHOTO_BUCKET" --max-depth 1 2>&1 >/dev/null); then ok "bucket $PHOTO_BUCKET reachable"; else bad "bucket $PHOTO_BUCKET: $out"; fi
   out=$(curl -sS -m 10 -o /dev/null -D - -X OPTIONS -H "Origin: https://web.$DOMAIN" -H "Access-Control-Request-Method: PUT" \
-    "https://$S3_ENDPOINT/$S3_BUCKET/ente-check" 2>&1 || true)
+    "https://$PHOTO_ENDPOINT/$PHOTO_BUCKET/ente-check" 2>&1 || true)
   if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight from https://web.$DOMAIN allowed"; else bad "CORS preflight from https://web.$DOMAIN not allowed (web uploads will fail)"; fi
 }
 
@@ -209,7 +212,7 @@ info() { printf '  INFO  %s\n' "$*"; }
 # remove) and dumps. Information only.
 backup_growth() {
   local d out n b gn gb dn db; d=$(mktemp -d)
-  if rclone lsf -R --files-only "ente-s3:$S3_BUCKET" --exclude "/$PHOTO_CFG_DIR/**" >"$d/src" 2>/dev/null &&
+  if rclone lsf -R --files-only "ente-s3:$PHOTO_BUCKET" --exclude "/$PHOTO_CFG_DIR/**" >"$d/src" 2>/dev/null &&
     rclone lsf -R --files-only --format ps --separator $'\t' "${BACKUP_ROOT}objects" >"$d/dst" 2>/dev/null &&
     rclone lsf --files-only --format ps --separator $'\t' --include 'ente_db-*.dump' backup-crypt: >"$d/dumps" 2>/dev/null; then
     out=$(awk -F'\t' 'FILENAME == ARGV[1] {src[$0]; next}
@@ -236,7 +239,7 @@ cmd_verify() {
 
   echo "== photo objects (checksums)"
   ex=$(new_uploads s3)
-  if out=$(rclone check "ente-s3:$S3_BUCKET" "${BACKUP_ROOT}objects" --one-way --checkers 4 --exclude-from "$ex" 2>&1); then
+  if out=$(rclone check "ente-s3:$PHOTO_BUCKET" "${BACKUP_ROOT}objects" --one-way --checkers 4 --exclude-from "$ex" 2>&1); then
     n=$(grep -oE '[0-9]+ matching files' <<<"$out" | tail -1 || true)
     h=$(grep -oE '[0-9]+ hashes could not be checked' <<<"$out" | tail -1 | grep -oE '^[0-9]+' || true)
     ok "photo bucket is in the backup (${n:-0 matching files}${h:+, $h of them by size: no common checksum, e.g. multipart uploads}; $(($(wc -l <"$ex") - 1)) uploaded after the last backup started, not compared)"

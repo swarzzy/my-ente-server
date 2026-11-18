@@ -138,6 +138,13 @@ check "bucket not reachable: one FAIL with rclone's error" 'one_fail "bucket pho
 run 'rclone() { :; }; curl() { echo "HTTP/1.1 403"; }; check_bucket'
 check "no CORS answer: one FAIL (web uploads would fail)" 'one_fail "CORS preflight .* not allowed"' "$(cat "$T/out")"
 
+cp "$T/ente/museum.yaml" "$T/m.bak"
+printf 's3:\n  b2-eu-cen:\n    key: k\n    secret: s\n    endpoint: s3.museum.net\n    region: r\n    bucket: museum-bucket\n' >>"$T/ente/museum.yaml"
+run 'rclone() { echo "rclone $*" >"$T/rclone.args"; }; curl() { echo "curl $*" >"$T/curl.args"; echo "access-control-allow-origin: *"; }; check_bucket'
+check "museum.yaml names another bucket than the env file: checks museum's, WARNs to re-run install" \
+  '[[ $(fails) -eq 0 ]] && grep -q "WARN  ente-setup.env names s3.example.net/photo but museum uses s3.museum.net/museum-bucket" "$T/out" && grep -q "ente-s3:museum-bucket" "$T/rclone.args" && grep -q "https://s3.museum.net/museum-bucket/" "$T/curl.args"' "$(cat "$T/out")"
+mv "$T/m.bak" "$T/ente/museum.yaml"
+
 echo "== add-ons"
 mkdir -p "$T/addons" "$T/sites"
 addons() { run 'SCRIPT_DIR=$T/addons CADDY_SITES=$T/sites BOT_UNIT_FILE=$T/bot.service; check_addons; echo "FAILS=$FAILS"'; }

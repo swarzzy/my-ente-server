@@ -156,7 +156,8 @@ Every FAIL is something that can break by itself and that nothing else reports:
 - web: Caddy running, `api./ping`, `web.` and `albums.` answer, their certificates valid for at least 20 more days (Caddy renews at 30);
 - security: nothing reachable over TCP from outside but SSH, 80 and 443 (Docker bypasses UFW, so this is what keeps Postgres
   private), sshd settings, UFW active and allowing SSH;
-- photo bucket reachable, CORS for the web app; the add-ons' own checks while installed;
+- photo bucket reachable, CORS for the web app (the bucket museum uses, from `museum.yaml`; a WARN if `ente-setup.env` names
+  another one, i.e. `S3_*` was edited without re-running `install`); the add-ons' own checks while installed;
 - backup: the last good backup and the config copy in the photo bucket under 36 h old, the last good `verify` under 45 days, no
   unfinished restore. A failed backup run alerts by itself, so `check` only looks at the age of the last success;
 - system: disk of `/` (WARN at 80%, FAIL at 90%), OOM kills in the last 24 h, a reboot pending for over a day (unattended-upgrades

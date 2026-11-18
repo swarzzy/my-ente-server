@@ -114,7 +114,8 @@ load_env() {
   [[ $S3_ENDPOINT != *://* && $BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
   [[ $S3_ENDPOINT/$S3_BUCKET != "$BACKUP_S3_ENDPOINT/$BACKUP_S3_BUCKET" ]] || die "backup bucket must differ from the photo bucket"
   BACKUP_ROOT=backup:$BACKUP_S3_BUCKET/
-  PHOTO_CFG_ROOT=ente-s3:$S3_BUCKET/$PHOTO_CFG_DIR/
+  photo_bucket
+  PHOTO_CFG_ROOT=ente-s3:$PHOTO_BUCKET/$PHOTO_CFG_DIR/
 }
 
 # plain_values VAR...: die if a value holds a space, quote, $, backtick or backslash. These values are written into generated
@@ -356,6 +357,17 @@ assert d["are_local_buckets"] is False and d["use_path_style_urls"] is True
 assert [k for k in d if isinstance(d[k], dict)] == ["b2-eu-cen"], list(d)
 assert {k: d["b2-eu-cen"][k] for k in vals} == vals
 PY
+}
+
+# photo_bucket: PHOTO_ENDPOINT and PHOTO_BUCKET, the photo bucket museum really uses: from museum.yaml once install has
+# written it there (so a later edit of S3_ENDPOINT / S3_BUCKET without re-running install changes nothing), else from the
+# env file (before install, and during restore until museum.yaml is back). The backup, check, verify and restore use these.
+photo_bucket() {
+  local out M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
+  PHOTO_ENDPOINT=$S3_ENDPOINT PHOTO_BUCKET=$S3_BUCKET
+  [[ -f $ENTE_DIR/museum.yaml ]] && out=$(museum_s3 2>/dev/null) || return 0 # no museum.yaml, or no bucket in it yet
+  eval "$out"
+  PHOTO_ENDPOINT=$M_ENDPOINT PHOTO_BUCKET=$M_BUCKET
 }
 
 # museum_s3: eval "$(museum_s3)" sets M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET from museum.yaml (the source of truth after install).
@@ -813,7 +825,7 @@ install_backup_units() {
   write_file /etc/ente-backup.env 600 <<EOF
 HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
-PHOTO_BUCKET="$S3_BUCKET"
+PHOTO_BUCKET="$PHOTO_BUCKET"
 PHOTO_CFG_DIR="$PHOTO_CFG_DIR"
 EOF
   # the backup run itself is ente-backup.sh (standalone; this only installs it)
@@ -1066,7 +1078,7 @@ cmd_restore() {
 restore_finish() {
   if [[ -n $(rclone lsf --max-depth 1 "${BACKUP_ROOT}objects" 2>/dev/null | head -1) ]]; then
     log "copying objects missing from the photo bucket back from the backup (never deletes; can take long on a new bucket)"
-    rclone copy "${BACKUP_ROOT}objects" "ente-s3:$S3_BUCKET" --size-only --checkers 4 --transfers 4
+    rclone copy "${BACKUP_ROOT}objects" "ente-s3:$PHOTO_BUCKET" --size-only --checkers 4 --transfers 4
   else warn "no photo objects in the backup bucket: using the photo bucket as it is"; fi
   dc up -d
   wait_healthy museum

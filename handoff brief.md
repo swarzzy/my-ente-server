@@ -26,7 +26,6 @@ Nov 16, 2026 · @Dmitrii
 - `restore` does not fall back to the other bucket when the newer dump is unreadable.
 - Add an HTTP monitor on `https://api.<domain>/ping`. The heartbeat only notices a down server after a missed backup, about a day later.
 - `ente-setup.env` is sourced as root. Values that reach generated files are now checked (no quotes, `$`, spaces...), but parsing the file as plain `KEY=value` would be safer still.
-- The photo bucket's name is read from `ente-setup.env` by the backup, `check` and `restore`, while its endpoint and keys come from `museum.yaml`. They only differ if `S3_BUCKET` is edited without re-running `install`.
 - The bash test harnesses run the code under test with `set +e`, unlike production (`set -e`). An abort that only happens under `set -e` would not show up; the proxy's rollback and the in-place write have their own tests for this.
 - The installers (get.docker.com, Ente's quickstart from `main`) are not pinned.
 - There is no strength check on `BACKUP_PASSPHRASE`. The photo bucket's config copy allows offline guessing.
