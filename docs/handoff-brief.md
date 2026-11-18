@@ -10,7 +10,7 @@ Nov 16, 2026 · @Dmitrii
 - `ente-ops.sh` runs it: `check` (daily; every FAIL is something nothing else reports) and `verify` (monthly; also reports the backup bucket's growth).
 - Add-ons: `ente-s3-proxy.sh`, `ente-tg-bot.sh`, `ente-vpn.sh`.
 
-`ente-server/README.md` is the runbook and the source of truth for how everything works. Read it first.
+[`ente-server/README.md`](../ente-server/README.md) is the runbook and the source of truth for how everything works. Read it first. [`functions-and-tests.md`](functions-and-tests.md) is the one-page overview of every function and what must be tested.
 
 ## Current state
 
@@ -30,7 +30,7 @@ Nov 16, 2026 · @Dmitrii
 - The installers (get.docker.com, Ente's quickstart from `main`) are not pinned.
 - There is no strength check on `BACKUP_PASSPHRASE`. The photo bucket's config copy allows offline guessing.
 - Unattended upgrades do not cover the Amnezia packages.
-- There is no CI and no shellcheck. The tests run by hand on the server.
+- There is no CI and no shellcheck. The tests run by hand on the server: `sudo bash tests/run_all.sh --server`.
 - Optional simplifications not done: `apply_edits` checks each edit three ways, the `sshd -T` count plus the Ubuntu socket branch, and `lockdown`'s y/N prompt.
 
 ## Ground rules

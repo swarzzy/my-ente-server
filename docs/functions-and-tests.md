@@ -2,7 +2,7 @@
 
 As of 2026-11-18.
 
-Scripts in `ente-server/` turn a Debian VPS into a self-hosted Ente Photos server with photos in an S3 bucket, nightly encrypted backups to a second bucket, health checks, Telegram alerts and three optional add-ons. Each section lists what a function does and what a tester must prove. The README is the runbook; this is the overview.
+Scripts in `ente-server/` turn a Debian VPS into a self-hosted Ente Photos server with photos in an S3 bucket, nightly encrypted backups to a second bucket, health checks, Telegram alerts and three optional add-ons. Each section lists what a function does and what a tester must prove. The runbook is [`ente-server/README.md`](../ente-server/README.md); this is the overview.
 
 ## How it fits together
 
@@ -105,7 +105,7 @@ All three are optional and installed separately; each has `install`, `uninstall`
 
 ## Tests
 
-All suites live in `ente-server/tests/` and must pass on the server before a commit; there is no CI. Counts are from the last full run on the server.
+All suites live in `ente-server/tests/` and must pass on the server before a commit; there is no CI. `bash tests/run_all.sh` runs every suite that can run where it is; `sudo bash tests/run_all.sh --server` on the server adds the VPN and end-to-end suites. Counts are from the last full run on the server.
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |

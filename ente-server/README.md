@@ -23,8 +23,8 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
 | `ente-vpn.sh` | optional, independent of Ente: an AmneziaWG VPN (see "AmneziaWG VPN") |
 | `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
-| `tests/` | tests (see "Tests") |
-| `FUNCTIONS-AND-TESTS.md` | overview for others: every function, what it does and what must be tested |
+| `tests/` | tests; `run_all.sh` runs them (see "Tests") |
+| `../docs/functions-and-tests.md` | overview for others: every function, what it does and what must be tested (not needed on the server) |
 
 Both copies are git-ignored. The script reads secrets only from the secrets file (or the environment, if the file does not set
 them) and stops naming any that a command needs but is missing; it never logs them or stores them in the env file.
@@ -274,6 +274,10 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 - After changing the photo bucket (`S3_ENDPOINT`/`S3_BUCKET`), run `ente-s3-proxy.sh install` again.
 
 ## Tests
+
+`bash tests/run_all.sh` runs every suite that changes nothing (the two bucket suites only where rclone is) and prints one line
+per suite; on the live server `sudo bash tests/run_all.sh --server` adds the VPN config test and the end-to-end tests.
+Each suite also runs on its own:
 
 | Command | Where | What |
 | --- | --- | --- |
