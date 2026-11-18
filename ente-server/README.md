@@ -24,6 +24,7 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 | `ente-vpn.sh` | optional, independent of Ente: an AmneziaWG VPN (see "AmneziaWG VPN") |
 | `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
 | `tests/` | tests (see "Tests") |
+| `FUNCTIONS-AND-TESTS.md` | overview for others: every function, what it does and what must be tested |
 
 Both copies are git-ignored. The script reads secrets only from the secrets file (or the environment, if the file does not set
 them) and stops naming any that a command needs but is missing; it never logs them or stores them in the env file.
