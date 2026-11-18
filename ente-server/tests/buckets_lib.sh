@@ -1,15 +1,10 @@
 # buckets_lib.sh - shared setup for the tests that need the two "buckets" (source it): local folders behind rclone alias
 # remotes, a fake Ente dir, the real ente-backup.sh with its paths in the temp dir, docker as a
 # stub (FAKE_DUMP sets the dump content). Gives T, check/pass/fail, in_setup, remotes, conf_get, backup_script, run_backup, summary.
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 command -v rclone >/dev/null || { echo "rclone is not installed: run this on the server"; exit 1; }
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 export RCLONE_CONFIG=$T/rclone.conf
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
 
 cat >"$T/env" <<'X'
 DOMAIN=photos.example.org
@@ -75,4 +70,3 @@ backup_script() {
 BACKUP_ENV=(ENTE_DIR="$T/ente" DUMP_DIR="$T/dumps" BACKUP_STATE="$T/state" RCLONE_CONFIG="$RCLONE_CONFIG")
 # run_backup: one run of the repo's ente-backup.sh with the installed env file, as ente-backup.service runs it
 run_backup() { ( set -a; . "$T/root/etc/ente-backup.env"; set +a; env "${BACKUP_ENV[@]}" PATH="$T/bin:$PATH" bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; }
-summary() { echo; echo "$PASS passed, $FAIL failed"; ((FAIL == 0)); }

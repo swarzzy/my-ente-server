@@ -21,15 +21,21 @@ BOT_SUDOERS=/etc/sudoers.d/ente-tg-bot
 BOT_HELPER=/usr/local/sbin/ente-tg-action
 BOT_SCRIPT=${BOT_SCRIPT:-$BOT_DIR/ente-tg-bot.sh}
 ALERT_ENV=${ALERT_ENV:-/etc/ente-alert.env}
+PROXY_STATE=${PROXY_STATE:-/var/lib/ente-setup/s3-proxy} # ente-s3-proxy.sh's state file (on|off)
+REBOOT_FLAG=/var/run/reboot-required
 BOT_ACTIONS="status check backup proxy-on proxy-off proxy-status"
 # How the helper starts an action: as a transient unit of its own, so it gets a clean environment and working directory
 # (nothing of the bot user's reaches root), survives a restart of the bot, and is stopped after 6 hours.
 BOT_RUN=${BOT_RUN:-systemd-run --quiet --wait --pipe --collect -p RuntimeMaxSec=21600}
 
-# bot_root_files: everything the actions run or source as root.
+# bot_root_files: everything the actions run or source as root, and the link rewriter that /proxy on installs in front of the
+# API (it sees every request): anyone who could change one of these could act as root or read the apps' traffic.
 bot_root_files() {
   local f
-  for f in "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" "$BOT_DIR/ente-ops.sh" "$BOT_DIR/ente-s3-proxy.sh" "$ENV_FILE" "$SECRETS_FILE"; do [[ ! -e $f ]] || echo "$f"; done
+  for f in "$BOT_SCRIPT" "$BOT_DIR/ente-setup.sh" "$BOT_DIR/ente-ops.sh" "$BOT_DIR/ente-s3-proxy.sh" "$BOT_DIR/ente_s3_rewrite.py" \
+    "$ENV_FILE" "$SECRETS_FILE"; do
+    [[ ! -e $f ]] || echo "$f"
+  done
 }
 
 # bot_load_env: ente-setup.sh's config plus TG_BOT_USER_ID.
@@ -37,6 +43,7 @@ bot_load_env() {
   load_env
   TG_BOT_USER_ID=${TG_BOT_USER_ID:-}
   [[ -n $TG_BOT_USER_ID ]] || die "TG_BOT_USER_ID is not set in $ENV_FILE (your Telegram user id; for a private chat it equals TG_CHAT_ID)"
+  [[ $TG_BOT_USER_ID =~ ^[1-9][0-9]*$ ]] || die "TG_BOT_USER_ID must be your Telegram user id (a positive number), not $TG_BOT_USER_ID"
 }
 
 # bot_token: print the bot token (secrets file / environment first, else the alerts' env file); die if there is none.
@@ -45,24 +52,6 @@ bot_token() {
   if [[ -z $t && -f $ALERT_ENV ]]; then t=$(. "$ALERT_ENV"; echo "${TG_BOT_TOKEN:-}"); fi
   [[ -n $t ]] || die "no bot token: set TG_BOT_TOKEN in $SECRETS_FILE (or set up the alerts with backup-setup first)"
   printf '%s\n' "$t"
-}
-
-# root_only_writable PATH...: true if each path and every directory above it is owned by root and not group/world-writable.
-# The helper runs ente-tg-bot.sh, ente-setup.sh and ente-ops.sh as root: anyone who could change them could run anything as root.
-root_only_writable() {
-  local p d
-  for p in "$@"; do
-    d=$(readlink -f "$p") || return 1
-    while :; do
-      [[ $(stat -c %u "$d") == 0 ]] || { echo "not owned by root: $d" >&2; return 1; }
-      # a writable directory is fine only if root's and sticky (like /tmp): others cannot rename or replace root's entries
-      if (( (8#$(stat -c %a "$d") & 8#022) != 0 )) && ! [[ -d $d && $(stat -c %u "$d") == 0 && -k $d && $d != "$(readlink -f "$p")" ]]; then
-        echo "group/world-writable: $d" >&2; return 1
-      fi
-      [[ $d != / ]] || break
-      d=$(dirname "$d")
-    done
-  done
 }
 
 # bot_unit: the systemd unit. No filesystem sandboxing (ProtectSystem etc.): the actions run under sudo as children of the
@@ -129,70 +118,90 @@ bot_checks() {
 }
 
 # ---------------------------------------------------------------- actions (run as root by the helper)
-ago() { # ago TIMESTAMP: "3 h ago" etc.
-  local s; s=$(($(date +%s) - $(date -d "$1" +%s 2>/dev/null || date +%s)))
-  if ((s < 120)); then echo "${s} s ago"; elif ((s < 7200)); then echo "$((s / 60)) min ago"
-  elif ((s < 172800)); then echo "$((s / 3600)) h ago"; else echo "$((s / 86400)) days ago"; fi
+# dur SECONDS: "45 s", "12 min", "5 h", "3 days". ago TIMESTAMP: the same, since then, plus " ago".
+dur() {
+  local s=$1
+  if ((s < 120)); then echo "$s s"; elif ((s < 7200)); then echo "$((s / 60)) min"
+  elif ((s < 172800)); then echo "$((s / 3600)) h"; else echo "$((s / 86400)) days"; fi
 }
+ago() { echo "$(dur $(($(date +%s) - $(date -d "$1" +%s 2>/dev/null || date +%s)))) ago"; }
 
+# act_status: five short lines: services, backup, checks, system, proxy. ⚠️/❌ mark what needs a look.
 act_status() {
-  local s cid st c='' res ts f
+  local s cid st down='' a b last line ts res nxt
+  local state=$BACKUP_STATE
   load_env
-  echo "📊 Ente on $(hostname) - $(date '+%F %H:%M')"
   for s in museum web postgres; do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
     st=$([[ -n $cid ]] && docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo "not running")
-    if [[ $st == healthy || $st == running ]]; then c+="$s ✓  "; else c+="$s ✗ ($st)  "; fi
+    [[ $st == healthy || $st == running ]] || down+="${down:+, }$s ($st)"
   done
-  echo "Containers: $c"
-  res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null)
-  ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null)
-  if [[ -n $ts ]]; then echo "Last backup: $res, $(ago "$ts")"; else echo "Last backup: no run since boot"; fi
-  for f in /var/lib/ente-backup/last-ok-*; do
-    [[ -e $f ]] && echo "  ${f##*last-ok-}: last good $(ago "$(cat "$f")")"
-  done
-  echo "  next: $(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value 2>/dev/null)"
-  ts=$(systemctl show ente-check.service -p ExecMainExitTimestamp --value 2>/dev/null)
-  [[ -z $ts ]] || echo "Daily check: $(systemctl show ente-check.service -p Result --value | sed 's/^success$/passed/; s/^exit-code$/FAILED/'), $(ago "$ts")"
-  [[ ! -e /var/lib/ente-backup/verify-ok ]] || echo "Monthly verify: passed $(ago "$(cat /var/lib/ente-backup/verify-ok)")"
-  if [[ -e /var/lib/ente-backup/hc-fail ]]; then echo "Heartbeat: last ping FAILED"; elif [[ -e /var/lib/ente-backup/hc-ok ]]; then echo "Heartbeat: pinged $(ago "$(cat /var/lib/ente-backup/hc-ok)")"; fi
-  if [[ -e $CADDY_SITES/s3-proxy.caddy ]]; then echo "S3 proxy: $([[ $(cat /var/lib/ente-setup/s3-proxy 2>/dev/null) == on ]] && echo ON || echo off)"; fi
-  echo "Disk: $(df -h / | awk 'NR == 2 {print $5 " used, " $4 " free"}'); memory: $(free -m | awk '/^Mem:/ {print $7 " MB available"}')"
-  echo "Up $(uptime -p | sed 's/^up //')$([[ -e /var/run/reboot-required ]] && echo '; reboot pending')"
+  if [[ -z $down ]]; then echo "✅ Ente is up (museum, web, postgres)"; else echo "❌ Down: $down"; fi
+  # the last fully good backup: the older of its two parts (backup bucket, config copy in the photo bucket)
+  a=$(cat "$state/last-ok-s3" 2>/dev/null || true); b=$(cat "$state/last-ok-photo-config" 2>/dev/null || true)
+  if [[ -z $a || -z $b ]]; then line="⚠️ Backup: no good backup yet"
+  else
+    last=$a; [[ $(date -d "$b" +%s) -ge $(date -d "$a" +%s) ]] || last=$b
+    if (($(date +%s) - $(date -d "$last" +%s) > 36 * 3600)); then line="⚠️ Backup: last good $(ago "$last")"; else line="💾 Backup: last good $(ago "$last")"; fi
+  fi
+  res=$(systemctl show ente-backup.service -p Result --value 2>/dev/null || true)
+  ts=$(systemctl show ente-backup.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
+  [[ -z $ts || $res == success ]] || line+=", the last run failed"
+  nxt=$(systemctl show ente-backup.timer -p NextElapseUSecRealtime --value 2>/dev/null || true)
+  [[ -z $nxt ]] || line+=" · next $(date -d "$nxt" '+%a %H:%M' 2>/dev/null || echo "$nxt")"
+  [[ ! -e $state/hc-fail ]] || line+=" · heartbeat ping failed"
+  echo "$line"
+  ts=$(systemctl show ente-check.service -p ExecMainExitTimestamp --value 2>/dev/null || true)
+  res=$(systemctl show ente-check.service -p Result --value 2>/dev/null || true)
+  if [[ -z $ts ]]; then line="🩺 Check: not run since boot"
+  elif [[ $res == success ]]; then line="🩺 Check: passed $(ago "$ts")"
+  else line="⚠️ Check: found problems $(ago "$ts") (/check)"; fi
+  if [[ -e $state/verify-ok ]]; then line+=" · verify: passed $(ago "$(cat "$state/verify-ok")")"; else line+=" · verify: not passed yet"; fi
+  echo "$line"
+  echo "🖥 Disk $(df -h / | awk 'NR == 2 {print $5 " used (" $4 " free)"}') · RAM $(free -m | awk '/^Mem:/ {print $7}') MB free · up $(dur "$(cut -d. -f1 /proc/uptime)")$([[ -e $REBOOT_FLAG ]] && echo ' · reboot pending')"
+  [[ ! -e $CADDY_SITES/s3-proxy.caddy ]] || echo "🔀 S3 proxy: $([[ $(cat "$PROXY_STATE" 2>/dev/null) == on ]] && echo on || echo off)"
 }
 
+# act_check: the check's problems as ❌/⚠️ lines and a count of the rest; the bot's title says passed or not.
 act_check() {
   local out rc
   out=$(bash "$BOT_DIR/ente-ops.sh" check 2>&1) && rc=0 || rc=$?
-  grep -E '^  (FAIL|WARN)' <<<"$out" | grep -v "check storage usage of both buckets" || true
-  echo "$(grep -c '^  OK' <<<"$out") OK"
-  tail -1 <<<"$out"
-  return $rc
+  if ! grep -qE '^  (OK|FAIL|WARN)' <<<"$out"; then tail -3 <<<"$out"; return "$rc"; fi # it did not run
+  sed -n 's/^  FAIL  /❌ /p' <<<"$out"   # failures first, then warnings
+  sed -n 's/^  WARN  /⚠️ /p' <<<"$out"
+  echo "$(grep -c '^  OK' <<<"$out") checks OK"
+  return "$rc"
 }
 
+# act_backup: run a backup and wait for it; the time it took, and on failure the lines that say why.
 act_backup() {
-  local t0 res id rc=0
+  local t0 id why rc=0
   t0=$SECONDS
   systemctl start ente-backup.service || rc=$?
-  res=$(systemctl show ente-backup.service -p Result --value)
   id=$(systemctl show ente-backup.service -p InvocationID --value)
-  echo "Result: $res after $(((SECONDS - t0) / 60)) min $(((SECONDS - t0) % 60)) s"
-  [[ -z $id ]] || journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$id" | grep -E '^== |ERROR|WARNING' | tail -15 || true
-  if [[ -e /var/lib/ente-backup/hc-fail ]]; then echo "Heartbeat ping failed"; elif [[ -e /var/lib/ente-backup/hc-ok ]]; then echo "Heartbeat pinged"; fi
-  return $rc
+  if ((rc == 0)); then echo "Took $(dur $((SECONDS - t0)))."
+  else
+    echo "Stopped after $(dur $((SECONDS - t0))):"
+    why=$([[ -z $id ]] || journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$id")
+    if grep -q ERROR <<<"$why"; then grep ERROR <<<"$why" | tail -10; else tail -5 <<<"$why"; fi
+  fi
+  [[ ! -e $BACKUP_STATE/hc-fail ]] || echo "⚠️ The heartbeat ping failed (the backup itself is fine)."
+  return "$rc"
 }
 
-act_proxy() { # act_proxy on|off|status
+# act_proxy on|off|status: what ente-s3-proxy.sh says, without timestamps and with its OK lines counted.
+act_proxy() {
   local out rc
   if [[ ! -f $BOT_DIR/ente-s3-proxy.sh || ! -e $CADDY_SITES/s3-proxy.caddy ]]; then
     echo "The S3 proxy is not installed (ente-s3-proxy.sh install)."; return 1
   fi
   out=$(bash "$BOT_DIR/ente-s3-proxy.sh" "$1" 2>&1) && rc=0 || rc=$?
-  grep -vE '\] wrote |^\s*$' <<<"$out" | sed -E 's/^[0-9-]+ [0-9:]+ \[s3-proxy [a-z]+\] //' || true
-  return $rc
+  grep -vE '\] wrote |^\s*$|^  OK  ' <<<"$out" | sed -E 's/^[0-9-]+ [0-9:]+ \[s3-proxy [a-z]+\] //; s/^ERROR: /❌ /; s/^  FAIL  /❌ /' || true
+  ! grep -q '^  OK  ' <<<"$out" || echo "$(grep -c '^  OK  ' <<<"$out") checks OK"
+  return "$rc"
 }
 
-cmd_action() {
+bot_cmd_action() {
   case $1 in
     status) act_status ;;
     check) act_check ;;
@@ -204,7 +213,7 @@ cmd_action() {
 }
 
 # ---------------------------------------------------------------- commands
-cmd_install() {
+bot_cmd_install() {
   local token h0 h1 tmp
   bot_load_env
   token=$(bot_token)
@@ -234,7 +243,7 @@ cmd_install() {
   log "telegram bot installed: send /status to it from your Telegram account (user $TG_BOT_USER_ID)"
 }
 
-cmd_uninstall() {
+bot_cmd_uninstall() {
   load_env
   if systemctl cat ente-tg-bot.service >/dev/null 2>&1; then systemctl disable --now ente-tg-bot.service >/dev/null 2>&1 || true; fi
   rm -f "$BOT_UNIT" "$BOT_PY" "$BOT_SUDOERS" "$BOT_HELPER"
@@ -249,7 +258,7 @@ cmd_uninstall() {
   log "telegram bot uninstalled"
 }
 
-cmd_status() {
+bot_cmd_status() {
   bot_load_env
   [[ -e $BOT_UNIT ]] || { echo "the telegram bot is not installed ($0 install)"; return 1; }
   bot_checks
@@ -258,7 +267,7 @@ cmd_status() {
 }
 
 # check: only the OK/FAIL lines (for ente-ops.sh check); exit 1 on any FAIL.
-cmd_check() {
+bot_cmd_check() {
   bot_load_env
   [[ -e $BOT_UNIT ]] || { bad "telegram bot is not installed"; return 1; }
   bot_checks
@@ -277,14 +286,14 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }
   CMD="tg-bot $1"
   case $1 in
-    check) cmd_check; exit ;;           # quiet, not logged: run by ente-ops.sh check
-    action) cmd_action "$2"; exit ;;    # its output is the bot's reply
+    check) bot_cmd_check; exit ;;           # quiet, not logged: run by ente-ops.sh check
+    action) bot_cmd_action "$2"; exit ;;    # its output is the bot's reply
   esac
   touch "$LOG"; chmod 600 "$LOG"
   case $1 in
-    install) cmd_install ;;
-    uninstall) cmd_uninstall ;;
-    status) cmd_status ;;
+    install) bot_cmd_install ;;
+    uninstall) bot_cmd_uninstall ;;
+    status) bot_cmd_status ;;
   esac 2>&1 | tee -a "$LOG"
   exit "${PIPESTATUS[0]}"
 fi

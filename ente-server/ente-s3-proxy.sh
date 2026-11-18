@@ -26,6 +26,7 @@ REWRITE_PORT=8081
 proxy_load_env() {
   load_env
   [[ -n $S3_PROXY_HOST ]] || die "S3_PROXY_HOST is not set in $ENV_FILE (e.g. s3.$DOMAIN, with its DNS record pointing here)"
+  [[ $S3_PROXY_HOST =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "S3_PROXY_HOST must be a bare host name, not $S3_PROXY_HOST"
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run ente-setup.sh install first"
   local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
   eval "$(museum_s3)"
@@ -152,8 +153,8 @@ print(u.replace("https://%s/" % e["M_ENDPOINT"], "https://%s/" % e["P"], 1))
 PY
 }
 
-# proxy_checks [TRIES]: OK/FAIL lines (counted in FAILS): the parts that work in both states, then the state itself.
-proxy_checks() { proxy_checks_base "${1:-1}"; proxy_check_state; }
+# proxy_checks: OK/FAIL lines (counted in FAILS): the parts that work in both states, then the state itself.
+proxy_checks() { proxy_checks_base; proxy_check_state; }
 
 # proxy_checks_base [TRIES]: rewriter, signed link through the proxy host, CORS, 404. TRIES x 3 s to wait for a new certificate.
 proxy_checks_base() {
@@ -204,11 +205,14 @@ restore_proxy() {
   systemctl reload-or-restart caddy || true
 }
 
-# with_rollback WHAT FUNC [ARGS]: run FUNC in a subshell; if it fails, put the add-on's files and state back and die.
+# with_rollback WHAT FUNC [ARGS]: run FUNC in a subshell; if any step fails, put the add-on's files and state back and die.
 with_rollback() {
-  local what=$1 snap; shift
+  local what=$1 snap rc errexit=$-; shift
   snap=$(mktemp -d); snapshot_proxy "$snap"
-  if ! ("$@"); then
+  # not `if ! (...)`: bash ignores set -e in a condition, so a failing step would not stop FUNC
+  set +e; (set -e; "$@"); rc=$?
+  [[ $errexit != *e* ]] || set -e
+  if ((rc != 0)); then
     restore_proxy "$snap"; rm -rf "$snap"
     die "$what; everything is back as it was"
   fi
@@ -223,7 +227,7 @@ do_install() {
   [[ -e $PROXY_STATE ]] || set_proxy_state off
   apply_caddy
 }
-cmd_install() {
+proxy_cmd_install() {
   proxy_load_env
   with_rollback "S3 proxy not installed" do_install
   log "S3 proxy installed for https://$S3_PROXY_HOST ($(proxy_state))"
@@ -244,7 +248,7 @@ do_switch() {
 }
 
 # switch on|off: do_switch; any failure puts the add-on's files and state back as they were.
-cmd_switch() {
+proxy_cmd_switch() {
   local want=$1 was
   proxy_load_env
   was=$(proxy_state)
@@ -252,7 +256,7 @@ cmd_switch() {
   log "S3 proxy $want (was $was)"
 }
 
-cmd_status() {
+proxy_cmd_status() {
   proxy_load_env
   [[ -e $PROXY_SITE ]] || { echo "S3 proxy is not installed ($0 install)"; return 1; }
   echo "S3 proxy is $(proxy_state)"
@@ -261,14 +265,14 @@ cmd_status() {
 }
 
 # check: only the OK/FAIL lines (for ente-ops.sh check); exit 1 on any FAIL.
-cmd_check() {
+proxy_cmd_check() {
   proxy_load_env
   [[ -e $PROXY_SITE ]] || { bad "S3 proxy is not installed"; return 1; }
   proxy_checks
   ((FAILS == 0))
 }
 
-cmd_uninstall() {
+proxy_cmd_uninstall() {
   load_env
   command -v caddy >/dev/null || die "caddy is not installed"
   if systemctl cat ente-s3-rewrite.service >/dev/null 2>&1; then systemctl disable --now ente-s3-rewrite.service >/dev/null 2>&1 || true; fi
@@ -285,11 +289,11 @@ proxy_usage() { echo "usage: $0 {install|on|off|status|check|uninstall}" >&2; ex
 
 proxy_main() {
   case $1 in
-    install) cmd_install ;;
-    on | off) cmd_switch "$1" ;;
-    status) cmd_status ;;
-    check) cmd_check ;;
-    uninstall) cmd_uninstall ;;
+    install) proxy_cmd_install ;;
+    on | off) proxy_cmd_switch "$1" ;;
+    status) proxy_cmd_status ;;
+    check) proxy_cmd_check ;;
+    uninstall) proxy_cmd_uninstall ;;
     *) proxy_usage ;;
   esac
 }

@@ -4,14 +4,9 @@
 # existing configs, and that it refuses a port already in use. It tries the parameters on a throwaway interface (awgtst0),
 # so it needs root and AmneziaWG: the server after `ente-vpn.sh install`. The live tunnel and its files are not touched.
 # Run: sudo bash tests/test_vpn_config.sh
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 [[ $EUID -eq 0 ]] && command -v awg >/dev/null || { echo "needs root and AmneziaWG (run it on the server after ente-vpn.sh install)"; exit 1; }
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
 
 port=27000; while [[ -n $(ss -Hlun "sport = :$port") ]]; do port=$((port + 1)); done
 # gen DIR PORT: awg_genconf for 203.0.113.7 with its files in DIR
@@ -77,6 +72,4 @@ kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
 check "a port already in use: refused, nothing written" \
   '((RC != 0)) && grep -q "already listens on UDP/$port" "$T/busy/out" && [[ ! -e $T/busy/server.conf && ! -e $T/busy/client.conf ]]' "$(tail -2 "$T/busy/out")"
 
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary

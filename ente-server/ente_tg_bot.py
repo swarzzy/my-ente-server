@@ -26,10 +26,24 @@ import urllib.error
 import urllib.request
 
 ACTIONS = ("status", "check", "backup", "proxy-on", "proxy-off", "proxy-status")
-COMMANDS = [("status", "Short server summary"), ("check", "Run the full health check"),
-            ("backup", "Run a backup now"), ("proxy", "S3 proxy: state, or /proxy on | /proxy off")]
-HELP = ("Commands:\n/status - short server summary\n/check - full health check\n/backup - run a backup now\n"
-        "/proxy - S3 proxy state;  /proxy on  |  /proxy off - switch it")
+COMMANDS = [("status", "Quick overview"), ("check", "Full health check"),
+            ("backup", "Back up now"), ("proxy", "S3 proxy: state, /proxy on, /proxy off")]
+HELP = ("What I can do:\n/status – quick overview\n/check – full health check (about 30 s)\n/backup – back up now\n"
+        "/proxy – S3 proxy state; /proxy on or /proxy off to switch it")
+# the first line of a finished action's reply: (when it worked, when it did not)
+TITLES = {"backup": ("✅ Backup done", "❌ Backup failed"),
+          "check": ("✅ Check passed", "❌ Check found problems"),
+          "proxy-on": ("✅ S3 proxy is on", "❌ Could not turn the S3 proxy on"),
+          "proxy-off": ("✅ S3 proxy is off", "❌ Could not turn the S3 proxy off"),
+          "proxy-status": ("🔀 S3 proxy", "❌ S3 proxy has problems")}
+STARTED = {"backup": "⏳ Backing up… I'll send the result when it's done.",
+           "check": "⏳ Checking (about 30 s)…",
+           "proxy-on": "⏳ Turning the S3 proxy on (with a self-test)…",
+           "proxy-off": "⏳ Turning the S3 proxy off…",
+           "proxy-status": "⏳ Checking the S3 proxy…"}
+BUSY = {"backup": "⏳ A backup is already running. I'll send its result.",
+        "check": "⏳ A check is already running.",
+        "proxy": "⏳ Busy: the last /proxy command hasn't finished yet."}
 MAX_TEXT = 4000      # Telegram allows 4096 characters
 MAX_AGE = 60         # seconds; older commands are not run (e.g. queued while the bot was down)
 NOTICE_EVERY = 3600  # at most one notice per stranger per hour
@@ -91,7 +105,8 @@ class Bot:
         self.api, self.user_id, self.runner, self.max_age, self._log = api, int(user_id), runner, max_age, log
         self.offset_file = os.path.join(state_dir, "offset")
         try:
-            self.offset = int(open(self.offset_file).read().strip())
+            with open(self.offset_file) as f:
+                self.offset = int(f.read().strip())
         except (OSError, ValueError):
             self.offset = 0
         self.locks = {k: threading.Lock() for k in ("check", "backup", "proxy")}
@@ -161,7 +176,8 @@ class Bot:
         age = time.time() - int(m.get("date") or 0)
         if age > self.max_age:
             self.log("ignored %r: too old (%d s)" % (text[:40], age))
-            self.send("Not run: %s is too old (sent %d s ago). Send it again." % (text[:40] or "the message", age))
+            self.send("⏰ Skipped %s: it was sent %d s ago, while I was offline. Send it again if you still want it."
+                      % (text[:40] or "your message", age))
             return
         self.command(text)
 
@@ -174,8 +190,8 @@ class Bot:
             return
         self.noticed[sid] = now
         name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-        self.send("🚫 Ignored a message from someone else: id %s%s%s: %r" % (
-            sid, " @%s" % sender["username"] if sender.get("username") else "", " (%s)" % name if name else "", text[:60]))
+        self.send("🚫 Someone else wrote to me, I ignored it: %s%s (id %s): %r" % (
+            name or "no name", " @%s" % sender["username"] if sender.get("username") else "", sid, text[:60]))
 
     def command(self, text):
         words = text.split()
@@ -183,43 +199,36 @@ class Bot:
             self.send(HELP)
             return
         cmd, args = words[0][1:].split("@", 1)[0].lower(), [a.lower() for a in words[1:]]
-        if cmd in ("start", "help") or cmd not in ("status", "check", "backup", "proxy"):
+        if cmd not in ("status", "check", "backup", "proxy"):  # also /start and /help
             self.send(HELP)
             return
         if cmd == "proxy":
             if len(args) > 1 or (args and args[0] not in ("on", "off", "status")):
-                self.send("Usage: /proxy  |  /proxy on  |  /proxy off")
+                self.send("Send /proxy, /proxy on or /proxy off.")
                 return
             action = "proxy-" + (args[0] if args else "status")
         else:
             if args:
-                self.send("/%s takes no arguments." % cmd)
+                self.send("/%s takes nothing after it. Just send /%s." % (cmd, cmd))
                 return
             action = cmd
         self.log("accepted /%s%s" % (cmd, " " + " ".join(args) if args else ""))
         if action == "status":
             rc, out = self.runner(action)
-            self.send(out if rc == 0 else "❌ status failed (exit %d)\n\n%s" % (rc, out))
+            self.send(out if rc == 0 else "❌ Could not get the status:\n%s" % out)
             return
-        lock = self.locks[action.split("-")[0]]
+        group = action.split("-")[0]
+        lock = self.locks[group]
         if not lock.acquire(blocking=False):
-            self.send({"backup": "A backup is already running; you will get its result.",
-                       "check": "A check is already running.",
-                       "proxy": "Busy: a proxy command is still running."}[action.split("-")[0]])
+            self.send(BUSY[group])
             return
-        self.send({"backup": "⏳ Backup started. The result follows when it is done.",
-                   "check": "⏳ Running the check (about half a minute)…",
-                   "proxy-on": "⏳ Turning the S3 proxy on (self-test included)…",
-                   "proxy-off": "⏳ Turning the S3 proxy off…",
-                   "proxy-status": "⏳ Checking the S3 proxy…"}[action])
+        self.send(STARTED[action])
         threading.Thread(target=self._run_async, args=(action, lock), daemon=True).start()
 
     def _run_async(self, action, lock):
         try:
             rc, out = self.runner(action)
-            title = {"backup": "Backup", "check": "Check", "proxy-on": "Proxy on", "proxy-off": "Proxy off",
-                     "proxy-status": "Proxy"}[action]
-            self.send("%s %s%s\n\n%s" % ("✅" if rc == 0 else "❌", title, "" if rc == 0 else " failed (exit %d)" % rc, out))
+            self.send("%s\n%s" % (TITLES[action][rc != 0], out) if out else TITLES[action][rc != 0])
             self.log("%s finished, exit %d" % (action, rc))
         finally:
             lock.release()
@@ -236,7 +245,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.user_id <= 0:
         p.error("--user-id must be a person's id (a positive number)")
-    token = open(a.token_file).read().strip()
+    with open(a.token_file) as f:
+        token = f.read().strip()
     bot = Bot(TelegramAPI(a.api_base, token, a.poll_timeout), a.user_id, CommandRunner(shlex.split(a.action_cmd)), a.state_dir)
     bot.log("ente-tg-bot started for user %d" % a.user_id)
     def register():  # in the background: the bot must answer at once, whatever setMyCommands does

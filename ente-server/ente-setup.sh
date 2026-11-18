@@ -76,6 +76,13 @@ write_file() {
   log "wrote $f"
 }
 
+# overwrite_in_place NEW FILE: put NEW's content into FILE without replacing the file itself (a bind mount keeps pointing at
+# it), then remove NEW. If the write fails (disk full), die and keep NEW: the content is never lost.
+overwrite_in_place() {
+  { cat "$1" >"$2" && cmp -s "$1" "$2"; } || die "could not write $2 (disk full?): its new content is in $1"
+  rm -f "$1"
+}
+
 # need_secret VAR...: die unless every named secret is set (secrets file or environment). Secrets are never logged.
 need_secret() { local v; for v in "$@"; do [[ -n ${!v:-} ]] || die "$v is not set: put it in $SECRETS_FILE"; done; }
 
@@ -101,16 +108,46 @@ load_env() {
   BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}; BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}; BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
   TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
   need DOMAIN S3_ENDPOINT S3_REGION S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET
-  [[ $S3_ENDPOINT != *://* &&$BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
+  plain_values DOMAIN S3_ENDPOINT S3_REGION S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_REGION BACKUP_S3_BUCKET HC_URL TG_CHAT_ID S3_PROXY_HOST
+  [[ -z $TG_CHAT_ID || $TG_CHAT_ID =~ ^-?[0-9]+$ ]] || die "TG_CHAT_ID must be a number (a group's starts with -)"
+  [[ -z $TG_BOT_TOKEN || $TG_BOT_TOKEN =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "TG_BOT_TOKEN does not look like a bot token (123456:ABC...)"
+  [[ $S3_ENDPOINT != *://* && $BACKUP_S3_ENDPOINT != *://* ]] || die "S3 endpoints must be bare hostnames, without https://"
   [[ $S3_ENDPOINT/$S3_BUCKET != "$BACKUP_S3_ENDPOINT/$BACKUP_S3_BUCKET" ]] || die "backup bucket must differ from the photo bucket"
   BACKUP_ROOT=backup:$BACKUP_S3_BUCKET/
   PHOTO_CFG_ROOT=ente-s3:$S3_BUCKET/$PHOTO_CFG_DIR/
 }
 
+# plain_values VAR...: die if a value holds a space, quote, $, backtick or backslash. These values are written into generated
+# env files, unit lines and the Caddyfile, where such characters would break the file or run as code.
+plain_values() {
+  local v bad=$'[[:space:]"\'$`\\]'
+  for v in "$@"; do [[ ! ${!v} =~ $bad ]] || die "$v must not contain spaces, quotes, \$, \` or backslashes"; done
+}
+
+# root_only_writable PATH...: true if each path and every directory above it is owned by root and not group/world-writable.
+# Scripts that root runs from timers or through the bot's sudo rule: anyone who could change them could run anything as root.
+root_only_writable() {
+  local p real d
+  for p in "$@"; do
+    real=$(readlink -f "$p") || return 1
+    d=$real
+    while :; do
+      [[ $(stat -c %u "$d") == 0 ]] || { echo "not owned by root: $d" >&2; return 1; }
+      if (((8#$(stat -c %a "$d") & 8#022) != 0)) && ! sticky_dir "$d" "$real"; then
+        echo "group/world-writable: $d" >&2; return 1
+      fi
+      [[ $d != / ]] || break
+      d=$(dirname "$d")
+    done
+  done
+}
+# sticky_dir DIR TARGET: DIR is a sticky directory above TARGET (like /tmp): others cannot rename or replace root's entries in it
+sticky_dir() { [[ -d $1 && -k $1 && $1 != "$2" ]]; }
+
 # ---------------------------------------------------------------- bootstrap
 # Create the passwordless-sudo admin user with its key, then harden sshd (key-only, no root) and verify it took effect.
 setup_ssh() {
-  local home n
+  local home n i
   id "$ADMIN_USER" >/dev/null 2>&1 || adduser --disabled-password --gecos '' "$ADMIN_USER"
   usermod -aG sudo "$ADMIN_USER"
   # key-only user has no password, so sudo must not ask for one
@@ -144,9 +181,9 @@ EOF
   else
     systemctl reload ssh
   fi
-  for n in $(seq 1 10); do
+  for i in $(seq 1 10); do
     [[ -z $(ss -Htln "sport = :$SSH_PORT") ]] || break
-    ((n < 10)) || die "sshd is not listening on port $SSH_PORT"
+    ((i < 10)) || die "sshd is not listening on port $SSH_PORT"
     sleep 1
   done
   log "sshd hardened on port $SSH_PORT. TEST A SECOND LOGIN as $ADMIN_USER before closing this session!"
@@ -280,7 +317,7 @@ PY
   grep -q '^ *ENTE_API_ORIGIN:' "$c" || die "compose.yaml: ENTE_API_ORIGIN not found"
   sed -Ei "s|^( *ENTE_API_ORIGIN:).*|\1 https://api.$DOMAIN|" "$c"
   grep -qE "^ *ENTE_API_ORIGIN: https://api\.${DOMAIN//./\\.}\$" "$c" || die "compose.yaml: ENTE_API_ORIGIN edit failed"
-  sed -E "s|^( *public-albums:).*|\1 https://albums.$DOMAIN|" "$m" >"$m.new"; cat "$m.new" >"$m"; rm -f "$m.new" # in place: keep the inode for the bind mount
+  sed -E "s|^( *public-albums:).*|\1 https://albums.$DOMAIN|" "$m" >"$m.new"; overwrite_in_place "$m.new" "$m"
   grep -Fq "public-albums: https://albums.$DOMAIN" "$m" || die "museum.yaml: public-albums edit failed"
   if [[ -z $S3_ACCESS_KEY || -z $S3_SECRET_KEY ]] && museum_s3_configured; then
     local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
@@ -451,8 +488,8 @@ sync_internal() {
       echo "$INT_END"
     } >>"$tmp"
   fi
-  if ! cmp -s "$tmp" "$m"; then cat "$tmp" >"$m"; MUSEUM_CFG_CHANGED=1; log "updated internal block in museum.yaml"; fi # in place: keep inode for the bind mount
-  rm -f "$tmp"
+  if ! cmp -s "$tmp" "$m"; then overwrite_in_place "$tmp" "$m"; MUSEUM_CFG_CHANGED=1; log "updated internal block in museum.yaml"
+  else rm -f "$tmp"; fi
   yaml_ok "$m"
 }
 
@@ -846,14 +883,20 @@ tg_api() { # tg_api METHOD [curl args...]: call the Bot API with TG_BOT_TOKEN
   local m=$1; shift
   curl -fsS -m 20 --retry 3 -o /dev/null -K - "$@" <<<"url = \"https://api.telegram.org/bot$TG_BOT_TOKEN/$m\""
 }
+# the files setup_alerts installs, removed again when TG_CHAT_ID is emptied
+ALERT_FILES=(/etc/systemd/system/ente-check.timer /etc/systemd/system/ente-check.service /etc/systemd/system/ente-alert@.service
+  /etc/ente-alert.env /usr/local/bin/ente-alert /usr/local/bin/ente-alert-unit)
 setup_alerts() {
+  local f
   if [[ -z $TG_CHAT_ID ]]; then
     ALERT_ONFAIL=
-    if [[ -e /etc/systemd/system/ente-check.timer ]]; then
+    for f in "${ALERT_FILES[@]}"; do
+      [[ -e $f ]] || continue
       systemctl disable --now ente-check.timer >/dev/null 2>&1 || true
-      rm -f /etc/systemd/system/ente-check.{timer,service} /etc/systemd/system/ente-alert@.service /etc/ente-alert.env
+      rm -f "${ALERT_FILES[@]}"
       systemctl daemon-reload; log "telegram alerts removed (TG_CHAT_ID empty)"
-    fi
+      break
+    done
     return 0
   fi
   if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
@@ -879,19 +922,21 @@ curl -fsS -m 20 --retry 3 -o /dev/null -K - --data-urlencode "chat_id=$TG_CHAT_I
 EOF
   write_file /usr/local/bin/ente-alert-unit 755 <<'EOF'
 #!/usr/bin/env bash
-# Managed by ente-setup.sh. ente-alert-unit UNIT: send the output of UNIT's last run (FAIL lines for the check) to Telegram.
+# Managed by ente-setup.sh. ente-alert-unit UNIT: tell Telegram that UNIT's last run failed, with the lines that say why.
 set -euo pipefail
 u=$1 h=$(hostname)
 id=$(systemctl show -p InvocationID --value "$u" 2>/dev/null || true)
 if [[ -n $id ]]; then out=$(journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$id" || true)
 else out=$(journalctl -q -o cat --no-pager -u "$u" -n 40 || true); fi
-if [[ $u == ente-check.service || $u == ente-verify.service ]]; then
-  n=${u#ente-}; title="⚠️ Ente ${n%.service} found problems on $h"
-  out=$(grep -aE 'FAIL|ERROR' <<<"$out" || tail -n 30 <<<"$out") # -a: a stray non-UTF-8 byte must not make it "binary"
-else
-  title="❌ $u failed on $h"
-  out=$(tail -n 30 <<<"$out")
-fi
+case $u in
+  ente-check.service) title="⚠️ Daily check found problems on $h"; why='^  FAIL|ERROR' ;;
+  ente-verify.service) title="⚠️ Monthly backup verify found problems on $h"; why='^  FAIL|ERROR' ;;
+  ente-backup.service) title="❌ Backup failed on $h"; why='ERROR|WARNING' ;;
+  *) title="❌ $u failed on $h"; why='ERROR' ;;
+esac
+# the lines that say why (FAIL lines as "❌ ..."), else the end of the log. -a: a stray non-UTF-8 byte must not make it "binary"
+if grep -aqE "$why" <<<"$out"; then out=$(grep -aE "$why" <<<"$out" | sed -E 's/^  FAIL  /❌ /' | tail -n 30)
+else out=$(tail -n 15 <<<"$out"); fi
 printf '%s\n' "$out" | /usr/local/bin/ente-alert "$title"
 EOF
   write_file /etc/systemd/system/ente-alert@.service <<'EOF'
@@ -934,6 +979,9 @@ EOF
 cmd_backup_setup() {
   load_env
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
+  # the verify timer (and the daily check, with alerts on) runs ente-ops.sh from this folder as root
+  root_only_writable "$SCRIPT_DIR/ente-ops.sh" "$SCRIPT_DIR/ente-setup.sh" "$ENV_FILE" ||
+    die "root's timers run the scripts in $SCRIPT_DIR: they must be root's alone (chown -R root: $SCRIPT_DIR; chmod -R go-w $SCRIPT_DIR)"
   install_rclone
   make_backup_remotes
   make_photo_remote
@@ -966,7 +1014,7 @@ restore_source() {
 # A server without a marker is never touched (restore is for a fresh server).
 cmd_restore() {
   load_env
-  local tmp dump src
+  local tmp dump src newest
   if [[ -e $ENTE_DIR/.restore-finishing ]]; then
     log "the database is already restored; doing the remaining steps (nothing is wiped)"
     restore_finish; return
@@ -986,13 +1034,14 @@ cmd_restore() {
   make_photo_remote_env
   make_photo_crypt
   src=$(restore_source) || die "no readable backup in either bucket (wrong passphrase, wrong buckets or keys?)"
-  log "restoring config and database from ${src%%:*} ($(restore_newest "$src"))"
+  newest=$(restore_newest "$src")
+  log "restoring config and database from ${src%%:*} ($newest)"
   tmp=$(mktemp -d /root/ente-restore.XXXXXX)
   # shellcheck disable=SC2064 # expand now: $tmp is local to this function
   trap "rm -rf '$tmp'" EXIT
   log "fetching config backup"
   # only the newest dump: the backup bucket keeps every dump ever made
-  rclone copy "$src" "$tmp" --checkers 4 --filter "+ $(restore_newest "$src")" --filter '- ente_db-*.dump'
+  rclone copy "$src" "$tmp" --checkers 4 --filter "+ $newest" --filter '- ente_db-*.dump'
   dump=$(find "$tmp" -maxdepth 1 -name 'ente_db-*.dump' | sort | tail -1)
   [[ -n $dump && -f $tmp/compose.yaml && -f $tmp/museum.yaml ]] || die "backup incomplete (wrong passphrase?): need ente_db-*.dump, compose.yaml, museum.yaml"
   install -d -m 700 "$DUMP_DIR"
@@ -1051,7 +1100,6 @@ cmd_deploy() {
 COMMANDS="deploy bootstrap install codes lockdown backup-setup restore update"
 usage() {
   echo "usage: $0 {${COMMANDS// /|}}" >&2
-  [[ " check verify " != *" ${1:-} "* ]] || echo "$1 is now: $SCRIPT_DIR/ente-ops.sh $1" >&2
   exit 2
 }
 main() { CMD=$1; "cmd_${CMD//-/_}"; }

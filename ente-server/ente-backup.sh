@@ -6,7 +6,8 @@
 #      It never deletes anything in the backup bucket: deleted photos and old dumps stay there until you clean up by hand;
 #   3. syncs the same encrypted config into the photo bucket (photo-crypt:; the last 7 days of dumps), so either bucket
 #      alone restores everything;
-#   4. after a fully good run, pings HC_URL. Each step leaves a stamp in BACKUP_STATE for `ente-ops.sh check`.
+#   4. after a fully good run, pings HC_URL. Each step leaves a stamp in BACKUP_STATE: last-ok-* for `ente-ops.sh check`,
+#      hc-ok / hc-fail for the bot's /status.
 # Installed by `ente-setup.sh backup-setup` as /usr/local/bin/ente-backup.sh and run by ente-backup.service (daily, 03:00).
 # By hand: sudo systemctl start ente-backup.service (or run the installed script as root). Exit 1 on any failed step.
 #
@@ -52,7 +53,7 @@ if rclone sync "$DUMPS" photo-crypt: --checkers 4; then
 else echo "ERROR: config copy to the photo bucket failed" >&2; rc=1; fi
 ((rc == 0)) || exit 1
 # heartbeat (healthchecks.io, Better Stack, ...): only after a fully good run. A failed ping does not fail the backup
-# (that would send a false "backup failed"); `check` reports it instead.
+# (that would send a false "backup failed"); the heartbeat service notices the missing ping and alerts by itself.
 if [[ -n $HC_URL ]]; then
   if curl -fsS -m 15 --retry 3 --retry-all-errors -o /dev/null "$HC_URL"; then date -Is > "$STATE/hc-ok"; rm -f "$STATE/hc-fail"
   else echo "WARNING: heartbeat ping to HC_URL failed; the backup itself succeeded" >&2; date -Is > "$STATE/hc-fail"; fi

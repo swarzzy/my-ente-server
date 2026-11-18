@@ -3,13 +3,8 @@
 # a temp dir with docker stubbed, then apply_edits. Fails when the quickstart's output changed in a way the edits do not
 # expect, before a real install does. Needs network (raw.githubusercontent.com), python3 with yaml, base64. Changes nothing
 # outside a temp dir. Run: bash tests/test_quickstart.sh
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 printf '%s\n' DOMAIN=photos.example.org S3_ENDPOINT=s3.example.net S3_REGION=r1 S3_BUCKET=photos \
   BACKUP_S3_ENDPOINT=b2.example.net BACKUP_S3_REGION=r2 BACKUP_S3_BUCKET=bk >"$T/env"
@@ -71,6 +66,4 @@ cp "$T/compose.good" "$C"
 in_setup 'run_quickstart' >"$T/out" 2>&1; RC=$?
 check "run_quickstart on an existing install: skipped" '((RC == 0)) && grep -q "skipping quickstart" "$T/out"' "$(tail -3 "$T/out")"
 
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary

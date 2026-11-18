@@ -175,7 +175,8 @@ class BotTest(unittest.TestCase):
         self.msg("/backup", age=120)
         self.poll()
         self.assertEqual(self.runner.calls, [])
-        self.assertTrue(any("too old" in t for t in self.texts()))
+        self.assertEqual(len(self.texts()), 1)
+        self.assertTrue(self.texts()[0].startswith("⏰ Skipped /backup"), self.texts())
 
     # ---- commands
     def test_help_and_unknown_commands_list_the_commands(self):
@@ -218,14 +219,14 @@ class BotTest(unittest.TestCase):
         self.msg("/backup")
         self.poll()
         self.wait_sent(1)
-        self.assertIn("started", self.texts()[0].lower())
+        self.assertTrue(self.texts()[0].startswith("⏳ Backing up"), self.texts())
         self.msg("/status")  # the bot keeps answering while the backup runs
         self.poll()
         self.wait_sent(2)
         self.assertEqual(self.texts()[1], "output of status")
         self.runner.gates["backup"].set()
         self.wait_sent(3)
-        self.assertIn("backup ok", self.texts()[2])
+        self.assertEqual(self.texts()[2], "✅ Backup done\nbackup ok")
 
     def test_a_second_backup_while_one_runs_is_refused(self):
         self.runner.gates["backup"] = threading.Event()
@@ -255,8 +256,27 @@ class BotTest(unittest.TestCase):
         self.poll()
         self.wait_sent(2)
         final = self.texts()[-1]
+        self.assertTrue(final.startswith("❌ Check found problems\n"), final)
         self.assertIn("something broke", final)
-        self.assertIn("❌", final)
+        self.assertNotIn("exit", final)  # no exit codes in replies
+
+    def test_each_action_has_a_title_for_success_and_failure(self):
+        self.assertEqual(set(tb.TITLES), set(tb.ACTIONS) - {"status"})
+        self.assertEqual(set(tb.STARTED), set(tb.ACTIONS) - {"status"})
+        for ok, bad in tb.TITLES.values():
+            self.assertTrue(ok[0] in "✅🔀" and bad.startswith("❌"), (ok, bad))
+
+    def test_an_action_without_output_gets_only_its_title(self):
+        self.runner.out["proxy-off"] = (0, "")
+        self.msg("/proxy off")
+        self.poll()
+        self.wait_sent(2)
+        self.assertEqual(self.texts()[-1], "✅ S3 proxy is off")
+
+    def test_a_stranger_notice_names_them(self):
+        self.msg("hi there", sender=STRANGER)
+        self.poll()
+        self.assertEqual(self.texts(), ["🚫 Someone else wrote to me, I ignored it: Someone @someone (id %d): 'hi there'" % STRANGER])
 
     def test_long_output_is_cut_to_fit_a_message(self):
         self.runner.out["status"] = (0, "x" * 10000 + "THE END")

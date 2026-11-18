@@ -4,13 +4,8 @@
 # its own internal: section is refused, and the file is edited in place (museum bind-mounts it). Postgres and docker are
 # stubs, so this runs anywhere bash and python3 with yaml are, and changes nothing outside a temp dir.
 # Run: bash tests/test_lockdown.sh
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 printf '%s\n' DOMAIN=photos.example.org S3_ENDPOINT=s3.example.net S3_REGION=r1 S3_BUCKET=photos \
   BACKUP_S3_ENDPOINT=b2.example.net BACKUP_S3_REGION=r2 BACKUP_S3_BUCKET=bk >"$T/env"
@@ -80,6 +75,4 @@ in_setup 'sync_internal 7 yes'; RC=$?
 check "museum.yaml with its own internal: section: refused, unchanged" \
   '((RC != 0)) && grep -q "its own internal: section" "$T/out" && cmp -s "$M" "$T/before"' "$(cat "$T/out")"
 
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary

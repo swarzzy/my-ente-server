@@ -62,6 +62,17 @@ class FakeMuseum(BaseHTTPRequestHandler):
         if self.command != "HEAD" and status not in (204, 304):
             self.wfile.write(body)
 
+    def _send_chunked(self, body, ctype):
+        """Like museum (Go) for a response over about 2 KB: no Content-Length, chunked."""
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for i in range(0, len(body), 1000):
+            part = body[i:i + 1000]
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+        self.wfile.write(b"0\r\n\r\n")
+
     def _handle(self):
         body = self._body()
         FakeMuseum.seen.append({"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body})
@@ -82,7 +93,12 @@ class FakeMuseum(BaseHTTPRequestHandler):
         elif p == "/gzip":
             self._send(200, gzip.compress(json.dumps({"url": url()}).encode()), extra={"Content-Encoding": "gzip"})
         elif p == "/binary":
-            self._send(200, os.urandom(1) * 0 + bytes(range(256)) * 20000 + url().encode(), ctype="application/octet-stream")
+            self._send(200, bytes(range(256)) * 20000 + url().encode(), ctype="application/octet-stream")
+        elif p == "/chunked-json":
+            self._send_chunked(json.dumps({"files": [{"id": i, "url": url(key="k%d" % i)} for i in range(200)]}).encode(),
+                               "application/json; charset=utf-8")
+        elif p == "/chunked-binary":
+            self._send_chunked(bytes(range(256)) * 400 + url().encode(), "application/octet-stream")
         elif p == "/text":
             self._send(200, ("see " + url()).encode(), ctype="text/plain")
         elif p == "/error":
@@ -177,6 +193,18 @@ class RewriterTest(unittest.TestCase):
         self.assertEqual(r.status, 401)
         self.assertEqual(json.loads(data)["hint"], url(host=PROXY))
 
+    def test_chunked_json_without_a_length_is_rewritten(self):
+        r, data = self.req("GET", "/chunked-json")
+        files = json.loads(data)["files"]
+        self.assertEqual(len(files), 200)
+        self.assertEqual(files[7]["url"], url(host=PROXY, key="k7"))
+        self.assertEqual(r.getheader("Content-Length"), str(len(data)))
+
+    def test_chunked_binary_streams_through_untouched(self):
+        r, data = self.req("GET", "/chunked-binary")
+        self.assertEqual(data, bytes(range(256)) * 400 + url().encode())
+        self.assertEqual(r.getheader("Transfer-Encoding"), "chunked")
+
     def test_non_json_bodies_pass_through_untouched(self):
         r, data = self.req("GET", "/binary")
         self.assertEqual(data, bytes(range(256)) * 20000 + url().encode())
@@ -249,8 +277,21 @@ class RewriterTest(unittest.TestCase):
         finally:
             rw.MAX_BODY = old
 
-    def test_handler_has_a_socket_timeout(self):
-        self.assertTrue(0 < rw.make_handler(self.proxy.RequestHandlerClass.__mro__ and rw.Config(("127.0.0.1", 0), ("127.0.0.1", 1), REAL, PROXY, BUCKET)).timeout <= 300)
+    def test_a_stalled_client_is_dropped(self):
+        self.assertLessEqual(self.proxy.RequestHandlerClass.timeout, 300)
+        fast = type("Fast", (self.proxy.RequestHandlerClass,), {"timeout": 1})  # the same handler, a short timeout
+        srv = rw.Server(("127.0.0.1", 0), fast)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            s = socket.create_connection(srv.server_address, timeout=10)
+            s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly part")  # never finishes
+            t0 = time.time()
+            self.assertEqual(s.recv(100), b"")  # the server closed it
+            self.assertLess(time.time() - t0, 5)
+            s.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_parallel_requests(self):
         # a burst of simultaneous connections (the app loads many thumbnails at once) must not be refused
@@ -277,8 +318,8 @@ class RewriterTest(unittest.TestCase):
 
 class UpstreamDownTest(unittest.TestCase):
     def test_502_when_museum_is_unreachable(self):
-        cfg = rw.Config(listen=("127.0.0.1", 0), upstream=("127.0.0.1", free_port()), from_host=REAL, to_host=PROXY, bucket=BUCKET)
-        cfg.quiet = True
+        cfg = rw.Config(listen=("127.0.0.1", 0), upstream=("127.0.0.1", free_port()), from_host=REAL, to_host=PROXY, bucket=BUCKET,
+                        quiet=True)
         srv = rw.make_server(cfg)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:

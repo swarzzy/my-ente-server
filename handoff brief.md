@@ -14,9 +14,10 @@ Nov 16, 2026 · @Dmitrii
 
 ## Current state
 
-- **Production:** one Debian 13 VPS, reinstalled and deployed fresh on Nov 15 (`RESTORE=no`; both buckets were empty). It runs the scripts as of the latest commit on `master`.
+- **Production:** one Debian 13 VPS, reinstalled on Nov 16 and restored from the backup bucket with `deploy` (`RESTORE=yes`): the real disaster-recovery path, about a minute for the small library. The saved Let's Encrypt certificates were put back into Caddy's storage first, so none was reissued. It runs the scripts as of the latest commit on `master`.
 - **Working and tested on the server:** Ente, daily backups to the second bucket (copy only: nothing is ever deleted there; the owner cleans it up by hand) plus the encrypted config copy in the photo bucket, Telegram alerts, the Better Stack heartbeat, the monthly `verify`, the Telegram bot, the S3 proxy (installed, off) and the AmneziaWG VPN. All test suites pass there, including the browser end-to-end test.
-- **Waiting on the owner:** sign up at `https://web.<domain>`, then family, then `sudo ./ente-setup.sh lockdown`. Fetch the VPN client config `/root/awg-client.conf`, import it, then `shred -u` it on the server.
+- **Waiting on the owner:** sign up at `https://web.<domain>`, then family, then `sudo ./ente-setup.sh lockdown`. Fetch the NEW VPN client config `/root/awg-client.conf` (the reinstall made new keys), import it, then `shred -u` it on the server.
+- **Server access:** only the admin key in `ente-setup.env` (`ADMIN_SSH_PUBKEY`) can log in, as `ops` on port 42876. Root and passwords are off.
 
 ## Open items
 
@@ -24,7 +25,9 @@ Nov 16, 2026 · @Dmitrii
 - Do the yearly read-only restore drill from the PC (README, "Moving to a new VPS"): it proves the offline copies of the keys and `BACKUP_PASSPHRASE` open the backup. A full `restore` needs the same domain, so it is tested for real only by tests and the next server move.
 - `restore` does not fall back to the other bucket when the newer dump is unreadable.
 - Add an HTTP monitor on `https://api.<domain>/ping`. The heartbeat only notices a down server after a missed backup, about a day later.
-- `ente-setup.env` is sourced as root. Parsing it as plain `KEY=value` would be safer and would turn quoting mistakes into clear errors.
+- `ente-setup.env` is sourced as root. Values that reach generated files are now checked (no quotes, `$`, spaces...), but parsing the file as plain `KEY=value` would be safer still.
+- The photo bucket's name is read from `ente-setup.env` by the backup, `check` and `restore`, while its endpoint and keys come from `museum.yaml`. They only differ if `S3_BUCKET` is edited without re-running `install`.
+- The bash test harnesses run the code under test with `set +e`, unlike production (`set -e`). An abort that only happens under `set -e` would not show up; the proxy's rollback and the in-place write have their own tests for this.
 - The installers (get.docker.com, Ente's quickstart from `main`) are not pinned.
 - There is no strength check on `BACKUP_PASSPHRASE`. The photo bucket's config copy allows offline guessing.
 - Unattended upgrades do not cover the Amnezia packages.

@@ -3,15 +3,10 @@
 # dir and pointed at a fake Telegram (tests/fake_telegram.py) on 127.0.0.1, with systemctl and journalctl stubbed. Checks
 # what a failed check, verify or backup sends, the length limit, broken UTF-8, and where the token and chat id go.
 # Changes nothing outside a temp dir. Needs bash, python3, curl and iconv. Run: bash tests/test_alerts.sh
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-T=$(mktemp -d)
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 FAKE=
 trap '[[ -z $FAKE ]] || kill "$FAKE" 2>/dev/null; rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
 
 TOKEN=123456789:AAH-test_token-abcdefghijklmnopqrstuv CHAT=-1001234567
 printf '%s\n' DOMAIN=photos.example.org S3_ENDPOINT=s3.example.net S3_REGION=r1 S3_BUCKET=photos \
@@ -45,6 +40,22 @@ check "the token is in no other file" '[[ $(grep -rlF -- "${TOKEN#*:}" "$R") == 
 check "the check unit alerts on failure and runs ente-ops.sh check" \
   'grep -qx "OnFailure=ente-alert@%n.service" "$R/etc/systemd/system/ente-check.service" && grep -q "ente-ops.sh\" check$" "$R/etc/systemd/system/ente-check.service"'
 
+echo "== emptying TG_CHAT_ID removes the alerts"
+mkdir -p "$T/off"; for f in timer service alert-unit env alert alert-script; do echo x >"$T/off/$f"; done
+out=$( ( ENV_FILE=$T/env SECRETS_FILE=$T/secrets CMD=test
+  # shellcheck source=/dev/null
+  . "$HERE/../ente-setup.sh"
+  set +e
+  load_env; TG_CHAT_ID=
+  ALERT_FILES=("$T"/off/*)
+  systemctl() { echo "systemctl $*" >>"$T/off.log"; }
+  ALERT_ONFAIL=x; setup_alerts; echo "onfail=[$ALERT_ONFAIL]" ) 2>&1 )
+check "all six files are removed, the timer stopped, OnFailure dropped" \
+  '[[ -z $(ls "$T/off") && $(cat "$T/off.log") == *"disable --now ente-check.timer"* && $out == *"onfail=[]"* && $out == *"alerts removed"* ]]' "$out"
+out=$( ( ENV_FILE=$T/env SECRETS_FILE=$T/secrets CMD=test; . "$HERE/../ente-setup.sh"; set +e; load_env; TG_CHAT_ID=
+  ALERT_FILES=("$T/off/none"); systemctl() { echo "systemctl $*"; }; setup_alerts ) 2>&1 )
+check "... and with nothing installed it does nothing" '[[ -z $out ]]' "$out"
+
 python3 "$HERE/fake_telegram.py" "$T/port" & FAKE=$!
 for _ in $(seq 50); do [[ -s $T/port ]] && break; sleep 0.1; done
 PORT=$(cat "$T/port")
@@ -70,20 +81,26 @@ printf '%s\n' "== containers" "  OK    museum healthy" "  WARN  sign-ups are ope
 alert ente-check.service; RC=$?
 check "a failed check sends a message" '((RC == 0)) && [[ $(sent) -eq 1 ]]' "$(cat "$T/out")"
 check "... to the configured chat" '[[ $(last chat_id) == "$CHAT" ]]'
-check "... titled 'Ente check found problems on <host>'" '[[ $(last text | head -1) == "⚠️ Ente check found problems on $(hostname)" ]]' "$(last text)"
-check "... with only the FAIL lines (no OK or WARN noise)" \
-  '[[ $(last text | tail -n +3) == "$(printf "  FAIL  web exited\n  FAIL  last backup is older than 36 h\n2 check(s) FAILED")" ]]' "$(last text)"
+check "... titled 'Daily check found problems on <host>'" '[[ $(last text | head -1) == "⚠️ Daily check found problems on $(hostname)" ]]' "$(last text)"
+check "... with only the FAIL lines, as ❌ lines (no OK, WARN or verdict noise)" \
+  '[[ $(last text | tail -n +3) == "$(printf "❌ web exited\n❌ last backup is older than 36 h")" ]]' "$(last text)"
 check "... sent with the configured token" \
   '[[ $(curl -fsS "http://127.0.0.1:$PORT/control/tokens") == "[\"$(printf %s "$TOKEN" | sha256sum | cut -d" " -f1)\"]" ]]'
 printf '%s\n' "== database dump" "  OK    restores" "  FAIL  restored dump looks incomplete" "" "1 verify check(s) FAILED" >"$T/journal"
 alert ente-verify.service
-check "a failed verify: 'Ente verify found problems', FAIL lines only" \
-  '[[ $(last text | head -1) == "⚠️ Ente verify found problems on $(hostname)" && $(last text | grep -c OK) -eq 0 && $(last text) == *"looks incomplete"* ]]' "$(last text)"
+check "a failed verify: 'Monthly backup verify found problems', FAIL lines only" \
+  '[[ $(last text | head -1) == "⚠️ Monthly backup verify found problems on $(hostname)" && $(last text | tail -n +3) == "❌ restored dump looks incomplete" ]]' "$(last text)"
+{ seq -f "backup line %g" 1 20; echo "ERROR: backup to the S3 bucket failed"; seq -f "backup line %g" 21 40; } >"$T/journal"
+alert ente-backup.service
+check "a failed backup: 'Backup failed on <host>' with its ERROR line only" \
+  '[[ $(last text | head -1) == "❌ Backup failed on $(hostname)" && $(last text | tail -n +3) == "ERROR: backup to the S3 bucket failed" ]]' "$(last text)"
 seq -f "backup line %g" 1 40 >"$T/journal"
 alert ente-backup.service
-check "a failed backup: '<unit> failed' with the last 30 log lines" \
-  '[[ $(last text | head -1) == "❌ ente-backup.service failed on $(hostname)" && $(last text | sed -n 3p) == "backup line 11" && $(last text | tail -1) == "backup line 40" ]]' \
-  "$(last text | head -4)"
+check "... and without an ERROR line, the last 15 log lines" \
+  '[[ $(last text | sed -n 3p) == "backup line 26" && $(last text | tail -1) == "backup line 40" ]]' "$(last text | head -4)"
+printf '%s\n' "something" "ERROR: it broke" >"$T/journal"
+alert ente-other.service
+check "another unit: '<unit> failed on <host>'" '[[ $(last text | head -1) == "❌ ente-other.service failed on $(hostname)" && $(last text) == *"it broke" ]]' "$(last text)"
 
 echo "== limits"
 seq -f "  FAIL  a very long failure line number %g ........................................" 1 200 >"$T/journal"
@@ -95,11 +112,9 @@ alert ente-check.service; RC=$?
 check "broken UTF-8 in the log does not stop the alert" '((RC == 0)) && [[ $(last text) == *"broken  utf-8 here"* ]]' "$(cat "$T/out"; last text)"
 : >"$T/journal"
 alert ente-backup.service; RC=$?
-check "an empty log still sends the title" '((RC == 0)) && [[ $(last text) == "❌ ente-backup.service failed on $(hostname)" ]]' "$(last text)"
+check "an empty log still sends the title" '((RC == 0)) && [[ $(last text) == "❌ Backup failed on $(hostname)" ]]' "$(last text)"
 kill "$FAKE"; wait "$FAKE" 2>/dev/null; FAKE=
 alert ente-check.service; RC=$?
 check "Telegram unreachable: the alert fails (the unit shows failed)" '((RC != 0))'
 
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary

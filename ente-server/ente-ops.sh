@@ -32,9 +32,14 @@ REBOOT_FLAG=/var/run/reboot-required
 CERT_MIN_DAYS=20 # Caddy renews at 30 days left: fewer means renewal is failing
 IMAGE_MAX_DAYS=60
 DISK_WARN=80 DISK_FAIL=90
+BOT_UNIT_FILE=/etc/systemd/system/ente-tg-bot.service # the telegram bot add-on is installed when this exists
 
 # hours_since STAMP: whole hours since the date in STAMP
 hours_since() { echo $((($(date +%s) - $(date -d "$1" +%s)) / 3600)); }
+
+# container_state ID: healthy/unhealthy/starting for a container with a health check, else running/exited/...; "gone" if it
+# disappeared meanwhile (a FAIL line, not an aborted check)
+container_state() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo gone; }
 
 check_services() {
   local s cid st i img days
@@ -42,11 +47,11 @@ check_services() {
   for s in museum web postgres; do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
     if [[ -z $cid ]]; then bad "$s not running"; continue; fi
-    st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")
+    st=$(container_state "$cid")
     for ((i = 0; i < 20; i++)); do # just restarted (lockdown, update, reboot): give it a minute instead of a false alarm
       [[ $st == starting || $st == restarting ]] || break
       sleep 3
-      st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")
+      st=$(container_state "$cid")
     done
     if [[ $st != healthy && $st != running ]]; then bad "$s $st"; continue; fi
     img=$(docker image inspect -f '{{.Created}}' "$(docker inspect -f '{{.Image}}' "$cid")" 2>/dev/null || true)
@@ -119,19 +124,18 @@ check_bucket() {
   if grep -qi '^access-control-allow-origin:' <<<"$out"; then ok "CORS preflight from https://web.$DOMAIN allowed"; else bad "CORS preflight from https://web.$DOMAIN not allowed (web uploads will fail)"; fi
 }
 
-# check_addons: the add-ons' own checks while installed (name, script, the file that marks it installed)
+# check_addons: each installed add-on's own check (name, script, the file that marks it installed); its FAIL lines count here
 check_addons() {
-  local addon name script marker out i
-  for addon in "s3 proxy|ente-s3-proxy.sh|$CADDY_SITES/s3-proxy.caddy" "telegram bot|ente-tg-bot.sh|/etc/systemd/system/ente-tg-bot.service"; do
+  local addon name script marker out rc
+  for addon in "s3 proxy|ente-s3-proxy.sh|$CADDY_SITES/s3-proxy.caddy" "telegram bot|ente-tg-bot.sh|$BOT_UNIT_FILE"; do
     IFS='|' read -r name script marker <<<"$addon"
     [[ -e $marker ]] || continue
     echo "== $name"
-    if [[ -f $SCRIPT_DIR/$script ]]; then
-      out=$(bash "$SCRIPT_DIR/$script" check 2>&1) && i=0 || i=$?
-      printf '%s\n' "$out"
-      FAILS=$((FAILS + $(grep -c '^  FAIL' <<<"$out" || true)))
-      if ((i != 0)) && ! grep -q '^  FAIL' <<<"$out"; then bad "the $name check did not run (exit $i): $(tail -1 <<<"$out" | cut -c1-160)"; fi
-    else bad "the $name is installed but $script is not next to $0"; fi
+    if [[ ! -f $SCRIPT_DIR/$script ]]; then bad "the $name is installed but $script is not next to $0"; continue; fi
+    out=$(bash "$SCRIPT_DIR/$script" check 2>&1) && rc=0 || rc=$?
+    printf '%s\n' "$out"
+    FAILS=$((FAILS + $(grep -c '^  FAIL' <<<"$out" || true)))
+    if ((rc != 0)) && ! grep -q '^  FAIL' <<<"$out"; then bad "the $name check did not run (exit $rc): $(tail -1 <<<"$out" | cut -c1-160)"; fi
   done
 }
 
@@ -219,7 +223,7 @@ backup_growth() {
 }
 cmd_verify() {
   load_env
-  local out dump n h i live rest lt lu lf rt ru rf ex
+  local out dump n h i live rest lt lu lf rt ru rf ex counts_sql
   rclone listremotes | grep -x 'backup-crypt:' >/dev/null || die "run backup-setup first"
   rclone listremotes | grep -x 'photo-crypt:' >/dev/null || die "run backup-setup first (no config copy in the photo bucket)"
   for ((i = 0; i < 720; i++)); do # a backup that is still running would show false differences: wait for it, up to 6 h
@@ -251,13 +255,13 @@ cmd_verify() {
   # the local newest dump: the step above proved the backed-up copies equal to the local files
   echo "== database dump (test restore into a scratch database)"
   dump=$(cd "$DUMP_DIR" 2>/dev/null && ls ente_db-*.dump 2>/dev/null | sort | tail -1 || true)
-  n="SELECT (SELECT count(*) FROM pg_tables WHERE schemaname = 'public'), (SELECT count(*) FROM users), (SELECT count(*) FROM files)"
+  counts_sql="SELECT (SELECT count(*) FROM pg_tables WHERE schemaname = 'public'), (SELECT count(*) FROM users), (SELECT count(*) FROM files)"
   if [[ -z $dump ]]; then bad "no database dump in $DUMP_DIR"
   elif ! vq -d postgres -qc 'DROP DATABASE IF EXISTS ente_verify' -c 'CREATE DATABASE ente_verify' >/dev/null 2>&1 ||
     ! dc cp "$DUMP_DIR/$dump" postgres:/tmp/ente-verify.dump </dev/null >/dev/null 2>&1; then bad "cannot prepare the scratch database"
   elif ! out=$(dc exec -T postgres pg_restore -U pguser -d ente_verify --no-owner --exit-on-error /tmp/ente-verify.dump </dev/null 2>&1); then
     bad "$dump does not restore: $(tail -2 <<<"$out" | tr '\n' ' ')"
-  elif ! live=$(vq -d ente_db -c "$n") || ! rest=$(vq -d ente_verify -c "$n"); then bad "cannot count rows after the test restore"
+  elif ! live=$(vq -d ente_db -c "$counts_sql") || ! rest=$(vq -d ente_verify -c "$counts_sql"); then bad "cannot count rows after the test restore"
   else
     read -r lt lu lf <<<"$live"; read -r rt ru rf <<<"$rest"
     # the dump is older than the live data (an update since may even have added tables), so counts may differ; an empty

@@ -3,13 +3,8 @@
 # hooks, the files the proxy script owns (API upstream, proxy site), the rewriter's unit and the command lines. Runs anywhere
 # bash and python3 are; where caddy is installed (the server) the assembled configs are also validated and inspected.
 # Run: bash tests/test_proxy_config.sh
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 base_env() {
   cat <<'X'
@@ -58,7 +53,8 @@ for good in "$P" "S3_PROXY_HOST=files.other.net"; do
   out=$(in_proxy "$good" 'proxy_load_env && echo LOADED' 2>&1); check "accepts $good" '[[ $out == *LOADED* ]]' "$out"
 done
 for bad in "S3_PROXY_HOST=" "S3_PROXY_HOST=api.photos.example.org" "S3_PROXY_HOST=web.photos.example.org" \
-  "S3_PROXY_HOST=albums.photos.example.org" "S3_PROXY_HOST=s3.eu-west-4.idrivee2.com"; do
+  "S3_PROXY_HOST=albums.photos.example.org" "S3_PROXY_HOST=s3.eu-west-4.idrivee2.com" "S3_PROXY_HOST=s3.x.org/evil" \
+  "S3_PROXY_HOST=s3.x.org{" "S3_PROXY_HOST=-x.org"; do
   out=$(in_proxy "$bad" 'proxy_load_env && echo LOADED' 2>&1); check "rejects $bad" '[[ $out != *LOADED* && $out == *S3_PROXY_HOST* ]]' "$out"
 done
 out=$(in_setup "S3_PROXY_HOST=whatever" 'load_env && echo LOADED' 2>&1); check "ente-setup.sh itself does not validate the proxy's setting" '[[ $out == *LOADED* ]]' "$out"
@@ -110,7 +106,27 @@ check "site and rewriter follow museum.yaml, not ente-setup.env (they must match
   'grep -q "path /b2/\*" "$T/drift" && grep -q "header_up Host s3.other.example" "$T/drift" && grep -q -- "--from-host s3.other.example --to-host s3.photos.example.org --bucket b2" "$T/drift" && ! grep -q "ente-dev\|idrivee2" "$T/drift"' "$(cat "$T/drift")"
 museum_yaml s3.eu-west-4.idrivee2.com ente-dev
 
+echo "== a failed install or switch is undone (with_rollback)"
+# rb CODE: with_rollback on the add-on's files in $T/rb, systemd stubbed; prints the files' contents afterwards
+rb() {
+  rm -rf "$T/rb"; mkdir -p "$T/rb/caddy/ente.d/sites"
+  echo old-unit >"$T/rb/unit"; echo old-up >"$T/rb/caddy/ente.d/api-upstream.caddy"; echo off >"$T/rb/state"
+  in_proxy "$P" '
+    REWRITE_UNIT=$T/rb/unit REWRITE_PY=$T/rb/py PROXY_SITE=$T/rb/caddy/ente.d/sites/s3-proxy.caddy
+    CADDY_API_UPSTREAM=$T/rb/caddy/ente.d/api-upstream.caddy PROXY_STATE=$T/rb/state
+    systemctl() { echo "systemctl $*" >>"$T/rb/calls"; }
+    step() { echo new >"$PROXY_STATE"; echo new-site >"$PROXY_SITE"; '"$1"'; echo "after the failed step" >"$T/rb/after"; }
+    with_rollback "test not done" step; echo "rc=$?"' 2>&1
+  printf 'files: %s\n' "$(cat "$T/rb/unit" "$T/rb/caddy/ente.d/api-upstream.caddy" "$T/rb/state" "$T/rb/caddy/ente.d/sites/s3-proxy.caddy" 2>/dev/null | tr '\n' ' ')"
+}
+out=$(rb false)
+check "a failing step stops the rest (set -e holds inside the rollback)" '[[ ! -e $T/rb/after ]]' "$out"
+check "... everything is put back and it dies saying so" '[[ $out == *"test not done; everything is back as it was"* && $out != *"rc=0"* && $out == *"files: old-unit old-up off "* ]]' "$out"
+out=$(rb true)
+check "a step that works keeps its changes" '[[ $out == *"rc=0"* && -e $T/rb/after && $out == *"files: old-unit old-up new new-site "* ]]' "$out"
+
 if command -v caddy >/dev/null; then
+  export HOME=${HOME:-$T} # without one (a systemd unit) caddy warns about its config directory, which is not what we look for
   # assemble the real layout for each state and let caddy validate it
   assemble() { # assemble NAME STATE (none|off|on)
     local d=$T/$1; rm -rf "$d"
@@ -178,25 +194,5 @@ for c in install on off status check uninstall; do
   out=$(asuser bash "$CLI/ente-s3-proxy.sh" "$c" 2>&1); rc=$?
   check "ente-s3-proxy.sh $c is a known command (asks for root here)" '[[ $out == *"run as root"* ]]' "$out"
 done
-out=$(asuser bash "$CLI/ente-setup.sh" proxy 2>&1); rc=$?
-check "ente-setup.sh no longer has a proxy command" '[[ $rc -eq 2 && $out == *usage* ]] && ! grep -q "proxy" <<<"$out"' "$out"
-out=$(asuser bash "$CLI/ente-setup.sh" nonsense 2>&1); rc=$?
-check "ente-setup.sh rejects unknown commands before asking for root" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
-out=$(asuser bash "$CLI/ente-setup.sh" install extra 2>&1); check "ente-setup.sh commands take no argument" '[[ $out == *usage* ]]' "$out"
-out=$(asuser bash "$CLI/ente-setup.sh" install 2>&1); check "ente-setup.sh install asks for root" '[[ $out == *"run as root"* ]]' "$out"
-for c in alert-test speedtest; do
-  out=$(asuser bash "$CLI/ente-ops.sh" "$c" 2>&1); rc=$?
-  check "ente-ops.sh no longer has $c" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
-done
-for c in check verify; do
-  out=$(asuser bash "$CLI/ente-setup.sh" "$c" 2>&1); rc=$?
-  check "ente-setup.sh no longer has $c (moved to ente-ops.sh)" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
-  out=$(asuser bash "$CLI/ente-ops.sh" "$c" 2>&1); check "ente-ops.sh $c is a known command (asks for root here)" '[[ $out == *"run as root"* ]]' "$out"
-done
-out=$(asuser bash "$CLI/ente-ops.sh" install 2>&1); rc=$?
-check "ente-ops.sh has no setup commands" '[[ $rc -eq 2 && $out == *usage* && $out != *install* ]]' "$out"
-out=$(asuser bash "$CLI/ente-ops.sh" check extra 2>&1); check "ente-ops.sh commands take no argument" '[[ $out == *usage* ]]' "$out"
 
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary

@@ -3,13 +3,8 @@
 # certificates, open ports, sshd/UFW, disk, OOM kills, a pending reboot. docker, ss, sshd, ufw, curl, df, journalctl and
 # `openssl s_client` are stubbed, so each section sees a server in a chosen state. Each fault must give exactly one FAIL (or the
 # expected WARN), a healthy server none. Changes nothing outside a temp dir. Needs bash and openssl. Run: bash tests/test_check.sh
-set -uo pipefail
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | head -20; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 printf '%s\n' DOMAIN=photos.example.org S3_ENDPOINT=s3.example.net S3_REGION=r1 S3_BUCKET=photo BACKUP_S3_ENDPOINT=b2.example.net \
   BACKUP_S3_REGION=r2 BACKUP_S3_BUCKET=bk SSH_PORT=42876 ADMIN_USER=ops >"$T/env"
@@ -135,10 +130,33 @@ touch -d '30 hours ago' "$T/reboot-required"; run check_system
 check "a reboot pending for 30 h: WARN" '[[ $(fails) -eq 0 ]] && grep -q "WARN  reboot pending for over a day" "$T/out"' "$(cat "$T/out")"
 rm "$T/reboot-required"
 
+echo "== photo bucket"
+run 'rclone() { [[ -z ${BUCKET_DOWN:-} ]] || { echo "AccessDenied" >&2; return 1; }; }; curl() { [[ -n ${NO_CORS:-} ]] || echo "access-control-allow-origin: *"; }; check_bucket'
+check "reachable, CORS allowed: no FAIL" '[[ $(fails) -eq 0 && $(grep -c "^  OK" "$T/out") -eq 2 ]]' "$(cat "$T/out")"
+BUCKET_DOWN=1 run 'rclone() { echo "AccessDenied" >&2; return 1; }; curl() { echo "access-control-allow-origin: *"; }; check_bucket'
+check "bucket not reachable: one FAIL with rclone's error" 'one_fail "bucket photo: AccessDenied"' "$(cat "$T/out")"
+run 'rclone() { :; }; curl() { echo "HTTP/1.1 403"; }; check_bucket'
+check "no CORS answer: one FAIL (web uploads would fail)" 'one_fail "CORS preflight .* not allowed"' "$(cat "$T/out")"
+
+echo "== add-ons"
+mkdir -p "$T/addons" "$T/sites"
+addons() { run 'SCRIPT_DIR=$T/addons CADDY_SITES=$T/sites BOT_UNIT_FILE=$T/bot.service; check_addons; echo "FAILS=$FAILS"'; }
+rm -f "$T/sites/s3-proxy.caddy" "$T/bot.service"; addons
+check "none installed: nothing shown" '[[ $(cat "$T/out") == "FAILS=0" ]]' "$(cat "$T/out")"
+touch "$T/sites/s3-proxy.caddy" "$T/bot.service"
+printf '#!/bin/bash\necho "  OK    proxy fine"\n' >"$T/addons/ente-s3-proxy.sh"
+printf '#!/bin/bash\necho "  OK    bot fine"; echo "  FAIL  bot not running"; echo "  FAIL  bot token"; exit 1\n' >"$T/addons/ente-tg-bot.sh"
+addons
+check "both installed: their sections, the bot's two FAIL lines counted" \
+  '[[ $(fails) -eq 2 ]] && grep -qx "FAILS=2" "$T/out" && grep -q "^== s3 proxy" "$T/out" && grep -q "^== telegram bot" "$T/out" && grep -q "proxy fine" "$T/out"' "$(cat "$T/out")"
+printf '#!/bin/bash\necho "S3_PROXY_HOST is not set"; exit 1\n' >"$T/addons/ente-s3-proxy.sh"; rm "$T/addons/ente-tg-bot.sh"; addons
+check "a check that did not run, a script that is missing: one FAIL each" \
+  '[[ $(fails) -eq 2 ]] && grep -q "FAIL  the s3 proxy check did not run (exit 1): S3_PROXY_HOST is not set" "$T/out" && grep -q "FAIL  the telegram bot is installed but ente-tg-bot.sh is not next to" "$T/out"' "$(cat "$T/out")"
+
 echo "== check runs every section and fails on any FAIL"
 run 'for f in check_services check_web check_security check_bucket check_addons check_backup check_system; do eval "$f() { echo $f; }"; done
   check_web() { echo check_web; bad x; }; cmd_check'
 check "all seven sections, in order; one FAIL makes it fail" \
   '[[ $(grep -c "^check_" "$T/out") -eq 7 ]] && grep -q "1 check(s) FAILED" "$T/out"' "$(cat "$T/out")"
 
-echo; echo "$PASS passed, $FAIL failed"; ((FAIL == 0))
+summary

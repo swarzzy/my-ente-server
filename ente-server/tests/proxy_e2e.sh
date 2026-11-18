@@ -2,7 +2,8 @@
 # End-to-end tests of ente-s3-proxy.sh on a deployed server, as root. Needs S3_PROXY_HOST in ente-setup.env and its DNS
 # record. Touches only the proxy (Caddy reloads, the rewriter service) and leaves it as it found it (installed or not, on/off).
 # Run: sudo bash tests/proxy_e2e.sh
-set -uo pipefail
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 SETUP=./ente-setup.sh OPS=./ente-ops.sh PROXYSH=./ente-s3-proxy.sh STATE=/var/lib/ente-setup/s3-proxy SITE=/etc/caddy/ente.d/sites/s3-proxy.caddy
@@ -11,11 +12,6 @@ PROXY=$(sed -n 's/^S3_PROXY_HOST=\([^ #]*\).*/\1/p' ente-setup.env)
 [[ -n $PROXY ]] || { echo "S3_PROXY_HOST is not set in ente-setup.env" >&2; exit 1; }
 ORIG=$(cat "$STATE" 2>/dev/null || echo off)
 WAS_INSTALLED=no; [[ -e $SITE ]] && WAS_INSTALLED=yes
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | tail -15; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
 run() { "$SETUP" "$@" </dev/null >"$T/out" 2>&1; RC=$?; }  # RC: exit code of the last run
 ops() { "$OPS" "$@" </dev/null >"$T/out" 2>&1; RC=$?; }
 prx() { "$PROXYSH" "$@" </dev/null >"$T/out" 2>&1; RC=$?; }
@@ -114,9 +110,9 @@ check "proxy site and state are removed, API goes to museum" '[[ ! -e $SITE && !
 check "the API still answers" '[[ $(api_code "https://api.$DOMAIN/ping") == 200 ]]'
 ops check; check "ente-ops.sh check passes without the proxy and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "s3 proxy" "$T/out"' "$(grep -E "FAIL|proxy" "$T/out")"
 prx uninstall; check "uninstall again is harmless" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
-sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=bad{host.$DOMAIN/" ente-setup.env >"$T/brk.env"
-ENV_FILE=$T/brk.env "$PROXYSH" install </dev/null >"$T/out" 2>&1; RC=$?
-check "a first install that fails says so" '[[ $RC -ne 0 ]] && grep -q "S3 proxy not installed; everything is back as it was" "$T/out"' "$(tail -5 "$T/out")"
+# a step in the middle fails (the state file cannot be written): the rest must not go on, and everything is undone
+PROXY_STATE=/proc/ente-e2e/state "$PROXYSH" install </dev/null >"$T/out" 2>&1; RC=$?
+check "a first install whose step fails stops and says so" '[[ $RC -ne 0 ]] && grep -q "S3 proxy not installed; everything is back as it was" "$T/out"' "$(tail -5 "$T/out")"
 check "... and leaves nothing behind (no rewriter, no site, the API on museum)" \
   '! systemctl is-enabled --quiet ente-s3-rewrite.service 2>/dev/null && ! systemctl is-active --quiet ente-s3-rewrite.service && [[ ! -e $SITE && ! -e $REWRITE_UNIT_FILE && ! -e /usr/local/lib/ente-setup/ente_s3_rewrite.py ]] && ! api_rewrites && [[ $(api_code "https://api.$DOMAIN/ping") == 200 ]]'
 prx on; check "on installs it again (and turns it on)" '[[ $RC -eq 0 ]] && caddy_has_s3 && api_rewrites' "$(cat "$T/out")"
@@ -134,6 +130,4 @@ if [[ $WAS_INSTALLED == yes ]]; then
 else
   prx uninstall; check "proxy uninstalled again" '[[ $RC -eq 0 && ! -e $SITE ]]' "$(cat "$T/out")"
 fi
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary

@@ -101,9 +101,9 @@ What survives what (you also need each provider's account to create new keys, an
 ## Telegram alerts (optional)
 
 With `TG_CHAT_ID` set, `backup-setup` installs alerts that need no other service:
-- a failed backup sends "❌ ente-backup.service failed" with the last 30 log lines;
-- `check` runs daily at 09:00 (`ente-check.timer`) and sends its FAIL lines if anything fails
-  (stale or failed backup, a container down, missing headers, ...).
+- a failed backup sends "❌ Backup failed on <host>" with its ERROR lines (or the last 15 log lines);
+- `check` runs daily at 09:00 (`ente-check.timer`) and sends "⚠️ Daily check found problems on <host>" with one ❌ line per
+  problem (a stale backup, a container down, the disk nearly full, ...); the monthly `verify` does the same.
 
 Nothing is sent while all is well. Not covered: the VPS itself being down (only an outside monitor such as `HC_URL` sees that).
 
@@ -114,7 +114,10 @@ Nothing is sent while all is well. Not covered: the VPS itself being down (only 
    `sudo ./ente-setup.sh backup-setup`. It sends a test message to the chat and stops with an error if that fails
    (re-run it to test again).
 
-The daily check runs the script from where `backup-setup` was run: keep the folder there (or re-run `backup-setup` after moving it).
+The daily check and the monthly verify run the scripts from where `backup-setup` was run, as root: keep the folder there (or
+re-run `backup-setup` after moving it), owned by root and writable by root only (`backup-setup` refuses otherwise).
+Config values that end up in generated files (domain, buckets, `HC_URL`, the Telegram ids and token) must not contain spaces,
+quotes, `$`, backticks or backslashes; the scripts refuse them.
 The token is stored only in `/etc/ente-alert.env` (mode 600) and passed to curl on stdin. To turn alerts off, empty `TG_CHAT_ID`
 and re-run `backup-setup`.
 
@@ -124,10 +127,13 @@ and re-run `backup-setup`.
 
 | Command | Does |
 | --- | --- |
-| `/status` | short summary: containers, last backup, last check and verify, proxy, disk, uptime |
-| `/check` | runs `ente-ops.sh check`, replies with the FAIL/WARN lines and the verdict |
-| `/backup` | runs a backup now; replies at once, then with the result |
+| `/status` | four or five lines: services, last good backup and the next one, last check and verify, disk/RAM/uptime, proxy |
+| `/check` | runs `ente-ops.sh check`: "✅ Check passed" or "❌ Check found problems", then each problem and a count of the rest |
+| `/backup` | runs a backup now; replies at once, then "✅ Backup done" (and how long it took) or "❌ Backup failed" with why |
 | `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |
+
+Lines that need a look start with ⚠️ or ❌. Alerts use the same style: "❌ Backup failed on <host>" or "⚠️ Daily check found
+problems on <host>", followed only by the lines that say why.
 
 1. `TG_BOT_USER_ID=<your Telegram user id>` in `ente-setup.env` (for a private chat it is the same number as `TG_CHAT_ID`).
    The bot uses the alert bot's token (`TG_BOT_TOKEN` in the secrets file, or the one `backup-setup` stored).
@@ -269,17 +275,18 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 
 | Command | Where | What |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum, the bot against a fake Telegram |
-| `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, command lines |
+| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum (incl. chunked responses and a stalled client), the bot against a fake Telegram (every reply) |
+| `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, every reply of `/status`, `/check`, `/backup`, `/proxy` (stubbed server), command lines |
 | `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the copy's exclusion, restore fetching only the newest dump, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
 | `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the backup never deletes in the backup bucket (photos or dumps gone from the server stay there), `verify` catching a bad dump, empty tables, a damaged photo or missing config files, its growth line, and every FAIL in the backup part of `check` |
-| `bash tests/test_check.sh` | anywhere (system tools stubbed) | the rest of `check`: services and image age, web and certificates, open ports, sshd/UFW, disk, OOM, pending reboot; each FAIL once, nothing on a healthy server |
+| `bash tests/test_check.sh` | anywhere (system tools stubbed) | the rest of `check`: services and image age, web and certificates, open ports, sshd/UFW, the photo bucket and CORS, the add-ons' checks, disk, OOM, pending reboot; each FAIL once, nothing on a healthy server |
+| `bash tests/test_cli.sh` | anywhere (as an unprivileged user when run as root) | the command lines of `ente-setup.sh`, `ente-ops.sh`, `ente-vpn.sh`; config values refused (quotes, `$`, spaces, bad ids, `AWG_PORT`); the in-place `museum.yaml` write on a full disk; `backup-setup` refusing a script folder others can write |
 | `bash tests/test_quickstart.sh` | anywhere with network (fetches Ente's current quickstart; docker stubbed) | `install`'s edits against today's quickstart: ports on 127.0.0.1, URLs, the external bucket, keys kept, in place, idempotent; a changed layout is refused |
 | `bash tests/test_lockdown.sh` | anywhere (Postgres stubbed) | `lockdown`: oldest user becomes admin only after `y`, re-runs change nothing, install keeps the block, a hand-made `internal:` is refused, edited in place |
-| `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down |
+| `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down; the test message of `backup-setup`; emptying `TG_CHAT_ID` removes every alert file |
 | `sudo bash tests/test_vpn_config.sh` | the server, after `ente-vpn.sh install` | the VPN config generator: keys pair up, same obfuscation on both sides within AmneziaWG's rules, mode 600, never overwrites, refuses a busy port |
-| `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev` |
-| `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, unit, command lines |
+| `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) or a failed backup first changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev`; museum not answering afterwards points there; pinned builds gone from the registry are re-pinned to the running or latest ones |
+| `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, the bucket taken from `museum.yaml`, the rollback of a failed install or switch, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
 | `sudo bash tests/tg_bot_e2e.sh` | the server, `TG_BOT_USER_ID` set | the real bot as its real user with the real sudo rule and actions, against a fake Telegram (`tests/fake_telegram.py`): every command, strangers, groups, old messages, privileges, uninstall; runs a real backup |
 | `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |

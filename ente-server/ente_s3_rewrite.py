@@ -19,7 +19,8 @@ BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HOP = {"connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
        "proxy-authorization", "proxy-authenticate"}
 MAX_BODY = 16 << 20     # API request bodies are small JSON; photo data never comes through here
-MAX_REWRITE = 64 << 20  # JSON responses larger than this are passed through unchanged
+MAX_REWRITE = 64 << 20  # JSON responses that announce a larger Content-Length pass through unchanged. Museum (Go) sends
+                        # anything over about 2 KB without one, chunked: those are always read whole; MemoryMax caps the service
 CHUNK = 64 << 10
 
 
@@ -45,7 +46,7 @@ def _hostport(s):
 
 
 class Config:
-    def __init__(self, listen, upstream, from_host, to_host, bucket):
+    def __init__(self, listen, upstream, from_host, to_host, bucket, quiet=False):
         for name, h in (("from_host", from_host), ("to_host", to_host)):
             if not isinstance(h, str) or not HOST_RE.match(h):
                 raise ValueError("%s must be a bare host name, got %r" % (name, h))
@@ -55,6 +56,7 @@ class Config:
             raise ValueError("from_host and to_host are the same")
         self.listen, self.upstream = tuple(listen), tuple(upstream)
         self.from_host, self.to_host, self.bucket = from_host, to_host, bucket
+        self.quiet = quiet  # no error lines on stderr (tests)
 
     @classmethod
     def from_argv(cls, argv):
@@ -80,7 +82,7 @@ def make_handler(cfg):
             pass
 
         def log_error(self, fmt, *args):
-            if not getattr(cfg, "quiet", False):
+            if not cfg.quiet:
                 sys.stderr.write("ente-s3-rewrite: " + (fmt % args) + "\n")
 
         def _request_body(self):
@@ -181,7 +183,7 @@ def make_handler(cfg):
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 while True:
-                    part = r.read1(CHUNK) if hasattr(r, "read1") else r.read(CHUNK)
+                    part = r.read1(CHUNK)
                     if not part:
                         break
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))

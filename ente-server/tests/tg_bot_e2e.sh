@@ -4,7 +4,8 @@
 # 127.0.0.1, so no real messages are needed. Needs TG_BOT_USER_ID in ente-setup.env and a bot token. Runs a real backup
 # and toggles the S3 proxy (if installed); leaves the bot and the proxy as it found them. Takes a few minutes.
 # Run: sudo bash tests/tg_bot_e2e.sh
-set -uo pipefail
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 BOTSH=./ente-tg-bot.sh HELPER=/usr/local/sbin/ente-tg-action UNIT=/etc/systemd/system/ente-tg-bot.service
@@ -15,11 +16,7 @@ STRANGER=555000111
 WAS_INSTALLED=no; [[ -e $UNIT ]] && WAS_INSTALLED=yes
 PROXY_INSTALLED=no; [[ -e /etc/caddy/ente.d/sites/s3-proxy.caddy ]] && PROXY_INSTALLED=yes
 PROXY_WAS=$(cat /var/lib/ente-setup/s3-proxy 2>/dev/null || echo off)
-T=$(mktemp -d); chmod 755 "$T"
-PASS=0 FAIL=0
-pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/        /' | tail -15; }
-check() { if eval "$2"; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+chmod 755 "$T"
 cleanup() {
   systemctl stop ente-tg-bot-e2e.service 2>/dev/null; systemctl reset-failed ente-tg-bot-e2e.service 2>/dev/null
   [[ -z ${FAKE:-} ]] || kill "$FAKE" 2>/dev/null
@@ -89,25 +86,26 @@ reply() { cat "$T/reply"; }
 check "the bot uses the real token (seen by the fake API)" \
   '[[ $(curl -sS "$API/control/tokens") == *"$(printf %s "$token" | sha256sum | cut -c1-64)"* ]] || { sleep 3; [[ $(curl -sS "$API/control/tokens") == *"$(printf %s "$token" | sha256sum | cut -c1-64)"* ]]; }'
 
-ask "/status"; check "/status: summary with containers and backups" '[[ $(reply) == *"Containers: museum ✓"* && $(reply) == *"Last backup"* ]]' "$(reply)"
-ask "/check" 2 180; check "/check: runs the full check and reports" '[[ $(reply) == *"OK"* && ( $(reply) == *"all checks passed"* || $(reply) == *"FAILED"* ) ]]' "$(reply)"
-check "/check: the check passed" '[[ $(reply) == "✅"* && $(reply) == *"all checks passed"* ]]' "$(reply)"
-ask "/check@some_bot now"; check "arguments are refused" '[[ $(reply) == *"takes no arguments"* ]]' "$(reply)"
-ask "/proxy on; reboot"; check "injection attempt is refused" '[[ $(reply) == Usage* ]]' "$(reply)"
+ask "/status"; check "/status: five short lines: services, backup, checks, system, proxy" \
+  '[[ $(reply | head -1) == "✅ Ente is up (museum, web, postgres)" && $(reply) == *"💾 Backup: last good "*" ago · next "* && $(reply) == *"🩺 Check: "* && $(reply) == *"🖥 Disk "* && $(reply | wc -l) -le 5 ]]' "$(reply)"
+ask "/check" 2 180; check "/check: the check passed, problems listed, the rest counted" \
+  '[[ $(reply | head -1) == "✅ Check passed" && $(reply | tail -1) =~ ^[0-9]+\ checks\ OK$ && $(reply) != *"  OK  "* ]]' "$(reply)"
+ask "/check@some_bot now"; check "arguments are refused" '[[ $(reply) == "/check takes nothing after it. Just send /check." ]]' "$(reply)"
+ask "/proxy on; reboot"; check "injection attempt is refused" '[[ $(reply) == "Send /proxy, /proxy on or /proxy off." ]]' "$(reply)"
 check "and nothing else happened (no reboot pending from us, proxy unchanged)" '[[ $(cat /var/lib/ente-setup/s3-proxy 2>/dev/null || echo off) == "$PROXY_WAS" ]]'
 
 if [[ $PROXY_INSTALLED == yes ]]; then
-  ask "/proxy" 2 60; check "/proxy: state of the S3 proxy" '[[ $(reply) == *"S3 proxy is"* ]]' "$(reply)"
-  ask "/proxy on" 2 180; check "/proxy on: switched on (self-test passed)" '[[ $(reply) == "✅ Proxy on"* && $(cat /var/lib/ente-setup/s3-proxy) == on ]]' "$(reply)"
+  ask "/proxy" 2 60; check "/proxy: state of the S3 proxy, its checks counted" '[[ $(reply | head -1) == "🔀 S3 proxy" && $(reply) == *"S3 proxy is "* && $(reply) == *" checks OK" ]]' "$(reply)"
+  ask "/proxy on" 2 180; check "/proxy on: switched on (self-test passed)" '[[ $(reply) == "✅ S3 proxy is on"* && $(cat /var/lib/ente-setup/s3-proxy) == on ]]' "$(reply)"
   check "and the API really goes through the rewriter" 'curl -sS -m 10 -o /dev/null -D - "https://api.$DOMAIN/ping" | grep -i "^x-ente-link-rewrite: on" >/dev/null'
-  ask "/proxy off" 2 120; check "/proxy off: switched off" '[[ $(reply) == "✅ Proxy off"* && $(cat /var/lib/ente-setup/s3-proxy) == off ]]' "$(reply)"
+  ask "/proxy off" 2 120; check "/proxy off: switched off" '[[ $(reply) == "✅ S3 proxy is off"* && $(cat /var/lib/ente-setup/s3-proxy) == off ]]' "$(reply)"
 else
   ask "/proxy" 2 60; check "/proxy without the add-on says it is not installed" '[[ $(reply) == *"not installed"* ]]' "$(reply)"
 fi
 
 if [[ $PROXY_INSTALLED == yes ]]; then
   systemctl stop ente-s3-rewrite.service
-  ask "/check" 2 180; check "a failing /check says what failed" '[[ $(reply) == "❌"* && $(reply) == *"FAIL  link rewriter not running"* ]]' "$(reply)"
+  ask "/check" 2 180; check "a failing /check says what failed" '[[ $(reply | head -1) == "❌ Check found problems" && $(reply) == *"❌ link rewriter not running"* ]]' "$(reply)"
   systemctl start ente-s3-rewrite.service; sleep 3
 fi
 pid=$(systemctl show -p MainPID --value ente-tg-bot-e2e.service); n0=$(nsent)
@@ -122,23 +120,23 @@ systemd-run --quiet --unit ente-tg-bot-e2e -p User=ente-tg-bot -p Group=ente-tg-
   --state-dir /var/lib/ente-tg-bot-e2e --action-cmd "sudo -n $HELPER" --api-base "$API" --poll-timeout 2
 sleep 3
 t0=$(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service)
-ask "/backup" 1 30; check "/backup: acknowledged at once" '[[ $(reply) == *"Backup started"* ]]' "$(reply)"
-ask "/status" 1 30; check "the bot answers while the backup runs" '[[ $(reply) == *"Containers:"* ]]' "$(reply)"
-for ((i = 0; i < 600; i++)); do [[ $(last) == *"Backup"*"Result:"* ]] && break; sleep 1; done
+ask "/backup" 1 30; check "/backup: acknowledged at once" '[[ $(reply) == "⏳ Backing up"* ]]' "$(reply)"
+ask "/status" 1 30; check "the bot answers while the backup runs" '[[ $(reply) == *"Ente is up"* ]]' "$(reply)"
+for ((i = 0; i < 600; i++)); do [[ $(last) == "✅ Backup done"* || $(last) == "❌ Backup failed"* ]] && break; sleep 1; done
 last >"$T/reply"
-check "/backup: the result follows" '[[ $(reply) == "✅ Backup"* && $(reply) == *"Result: success"* ]]' "$(reply)"
+check "/backup: the result follows" '[[ $(reply | head -1) == "✅ Backup done" && $(reply | sed -n 2p) == "Took "*" s." || $(reply | sed -n 2p) == "Took "*" min." ]]' "$(reply)"
 check "a real backup ran" '[[ $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) != "$t0" ]]'
 
 echo "== other people and other chats"
 t0=$(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service)
 ask "/backup" 1 20 "$STRANGER"
 check "a stranger's /backup runs nothing" '[[ $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]'
-check "the owner is told about it" '[[ $(reply) == *"Ignored a message from someone else"*"$STRANGER"* ]]' "$(reply)"
+check "the owner is told about it" '[[ $(reply) == "🚫 Someone else wrote to me, I ignored it:"*"(id $STRANGER)"* ]]' "$(reply)"
 check "the stranger gets no answer at all" '[[ $(to_others) == 0 ]]'
 n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"chat\": -100555, \"type\": \"group\"}"; sleep 5
 check "the owner's command in a group is ignored" '[[ $(nsent) == "$n0" && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]'
 n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"age\": 300}"; sleep 5
-check "an old command is not run" '[[ $(last) == *"too old"* && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]' "$(last)"
+check "an old command is not run" '[[ $(last) == "⏰ Skipped /backup"* && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]' "$(last)"
 check "the token never appears in the bot's log" '! journalctl -u ente-tg-bot-e2e.service -u ente-tg-bot.service -q -o cat --no-pager | grep -qF "${token#*:}"'
 
 echo "== ente-ops.sh check includes the bot"
@@ -158,6 +156,4 @@ check "everything is gone: service, user, sudo rule, helper, token" \
 run ./ente-ops.sh check; check "check passes without the bot and does not mention it" '[[ $RC -eq 0 ]] && ! grep -q "telegram bot" "$T/out"' "$(grep -E "FAIL|bot" "$T/out")"
 run $BOTSH install; check "install again works" '[[ $RC -eq 0 ]] && systemctl is-active --quiet ente-tg-bot.service' "$(cat "$T/out")"
 
-echo
-echo "$PASS passed, $FAIL failed"
-((FAIL == 0))
+summary
