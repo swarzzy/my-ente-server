@@ -75,10 +75,10 @@ check_web() {
   local h u d min=
   echo "== web"
   if ! systemctl is-active --quiet caddy; then bad "caddy is not running (journalctl -u caddy)"; return 0; fi
-  for u in "api.$DOMAIN/ping" "web.$DOMAIN/" "albums.$DOMAIN/"; do
+  for u in "api.$DOMAIN/ping" $(web_hosts | sed "s|\$|.$DOMAIN/|"); do
     if curl -fsS -m 10 -o /dev/null "https://$u" 2>/dev/null; then ok "https://$u"; else bad "https://$u does not answer"; fi
   done
-  for h in api web albums; do
+  for h in api $(web_hosts); do
     d=$(cert_days "$h.$DOMAIN")
     if [[ -z $d ]]; then bad "no certificate served for $h.$DOMAIN"
     elif ((d < CERT_MIN_DAYS)); then bad "certificate of $h.$DOMAIN expires in $d days: renewal is failing (journalctl -u caddy)"

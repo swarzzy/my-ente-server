@@ -99,7 +99,8 @@ load_env() {
   DOMAIN=${DOMAIN:-}; ADMIN_USER=${ADMIN_USER:-}; ADMIN_SSH_PUBKEY=${ADMIN_SSH_PUBKEY:-}; FAIL2BAN=${FAIL2BAN:-yes}
   SSH_PORT=${SSH_PORT:-22}; HC_URL=${HC_URL:-}; RESTORE=${RESTORE:-no}; CSP_REPORT_ONLY=${CSP_REPORT_ONLY:-no}
   S3_PROVIDER=${S3_PROVIDER:-Other}; S3_ENDPOINT=${S3_ENDPOINT:-}; S3_REGION=${S3_REGION:-}; S3_BUCKET=${S3_BUCKET:-}
-  S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-https://web.$DOMAIN,https://albums.$DOMAIN}
+  WEB_APPS=${WEB_APPS:-}; web_apps_ok
+  S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-$(web_hosts | sed "s|^|https://|; s|\$|.$DOMAIN|" | paste -sd,)}
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
   AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; TG_CHAT_ID=${TG_CHAT_ID:-}
@@ -117,6 +118,23 @@ load_env() {
   photo_bucket
   PHOTO_CFG_ROOT=ente-s3:$PHOTO_BUCKET/$PHOTO_CFG_DIR/
 }
+
+# The Ente web apps this server serves, each at <name>.$DOMAIN: photos (web.) and public albums (albums.) always, the ones in
+# WEB_APPS on request. The web container serves each app on its own port; only these are published (on 127.0.0.1).
+WEB_APP_PORTS="web:3000 albums:3002 auth:3003 locker:3009"
+# web_apps_ok: WEB_APPS names only apps this setup knows (auth, locker), space or comma separated
+web_apps_ok() {
+  local a
+  for a in ${WEB_APPS//,/ }; do
+    [[ $a == auth || $a == locker ]] || die "WEB_APPS: unknown app '$a' (known: auth, locker)"
+  done
+}
+# web_hosts: the first label of each served web app's host name, one per line (web, albums, then WEB_APPS)
+web_hosts() { printf '%s\n' web albums ${WEB_APPS//,/ }; }
+# dns_names: the host names that need a DNS record, as "api., web., albums., ..."
+dns_names() { { echo api; web_hosts; } | sed 's/$/./' | paste -sd, | sed 's/,/, /g'; }
+# web_port NAME: the port the web container serves that app on
+web_port() { local p; for p in $WEB_APP_PORTS; do [[ ${p%%:*} != "$1" ]] || { echo "${p#*:}"; return; }; done; return 1; }
 
 # plain_values VAR...: die if a value holds a space, quote, $, backtick or backslash. These values are written into generated
 # env files, unit lines and the Caddyfile, where such characters would break the file or run as code.
@@ -459,6 +477,13 @@ ensure_pins() {
 
 # write_override: compose.override.yaml with the pinned images, restart policies and OOM priorities.
 # minio and socat only serve the quickstart's local storage; the photos are in the external bucket.
+# extra_ports: the compose ports lines that publish the WEB_APPS on 127.0.0.1 (the quickstart publishes web and albums)
+extra_ports() {
+  local a p
+  [[ -n ${WEB_APPS//[ ,]/} ]] || return 0
+  printf '\n    ports:'
+  for a in ${WEB_APPS//,/ }; do p=$(web_port "$a"); printf '\n      - 127.0.0.1:%s:%s # %s web app' "$p" "$p" "$a"; done
+}
 write_override() {
   write_file "$ENTE_DIR/compose.override.yaml" 600 <<EOF
 services:
@@ -468,7 +493,7 @@ services:
     oom_score_adj: -300
   web:
     image: $(pin_of web)
-    restart: unless-stopped
+    restart: unless-stopped$(extra_ports)
   postgres:
     restart: unless-stopped
     oom_score_adj: -500
@@ -510,7 +535,10 @@ sync_internal() {
 render_caddyfile() {
   # Security headers. deferred, so they replace any the upstream sends. CSP only as Report-Only (CSP_REPORT_ONLY=yes):
   # violations show in the browser console, nothing is blocked. No CORS headers here: museum sets those itself.
-  local csp=''
+  local csp='' sites='' a
+  for a in ${WEB_APPS//,/ }; do # a site block per WEB_APPS app, like web. and albums.
+    sites+="$a.$DOMAIN {"$'\n\t'"import sec"$'\n\t'"import app"$'\n\t'"reverse_proxy 127.0.0.1:$(web_port "$a")"$'\n}\n\n'
+  done
   if [[ $CSP_REPORT_ONLY == yes ]]; then
     csp="Content-Security-Policy-Report-Only \"default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';"
     csp+=" img-src 'self' blob: data:; media-src 'self' blob:; font-src 'self' data:; worker-src 'self' blob:;"
@@ -555,7 +583,7 @@ albums.$DOMAIN {
 	reverse_proxy 127.0.0.1:3002
 }
 
-import $CADDY_SITES/*.caddy
+${sites}import $CADDY_SITES/*.caddy
 EOF
 }
 
@@ -630,7 +658,7 @@ cmd_install() {
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
   if url_ok "https://api.$DOMAIN/ping" 20; then log "https://api.$DOMAIN/ping OK"
-  else warn "https://api.$DOMAIN/ping not reachable yet - point DNS A/AAAA (TTL 300) of api., web., albums.$DOMAIN to this server"; fi
+  else warn "https://api.$DOMAIN/ping not reachable yet - point DNS A/AAAA (TTL 300) of $(dns_names) under $DOMAIN to this server"; fi
   cat <<EOF
 
 Ente is up.
@@ -1088,7 +1116,7 @@ restore_finish() {
   cat <<EOF
 
 Restored. Next:
-  1. DNS: point A/AAAA of api., web., albums.$DOMAIN to $(host_ip) (TTL 300). Certificates are issued once DNS resolves.
+  1. DNS: point A/AAAA of $(dns_names) under $DOMAIN to $(host_ip) (TTL 300). Certificates are issued once DNS resolves.
   2. $0 backup-setup   (installs the timer; remotes already exist)
   3. $SCRIPT_DIR/ente-ops.sh check
 EOF

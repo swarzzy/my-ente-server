@@ -57,6 +57,9 @@ for bad in "S3_PROXY_HOST=" "S3_PROXY_HOST=api.photos.example.org" "S3_PROXY_HOS
   "S3_PROXY_HOST=s3.x.org{" "S3_PROXY_HOST=-x.org"; do
   out=$(in_proxy "$bad" 'proxy_load_env && echo LOADED' 2>&1); check "rejects $bad" '[[ $out != *LOADED* && $out == *S3_PROXY_HOST* ]]' "$out"
 done
+out=$(in_proxy "S3_PROXY_HOST=locker.photos.example.org
+WEB_APPS=locker" 'proxy_load_env && echo LOADED' 2>&1); check "rejects the host of a WEB_APPS app" '[[ $out != *LOADED* && $out == *S3_PROXY_HOST* ]]' "$out"
+out=$(in_proxy "S3_PROXY_HOST=locker.photos.example.org" 'proxy_load_env && echo LOADED' 2>&1); check "... but accepts it when that app is not served" '[[ $out == *LOADED* ]]' "$out"
 out=$(in_setup "S3_PROXY_HOST=whatever" 'load_env && echo LOADED' 2>&1); check "ente-setup.sh itself does not validate the proxy's setting" '[[ $out == *LOADED* ]]' "$out"
 mv "$T/ente/museum.yaml" "$T/m.bak"
 out=$(in_proxy "$P" 'proxy_load_env && echo LOADED' 2>&1); check "without museum.yaml: refuses (install first)" '[[ $out != *LOADED* && $out == *"install first"* ]]' "$out"
@@ -87,6 +90,9 @@ check "ensure_caddy_hooks never overwrites the API upstream (the proxy script ow
 in_setup "$P
 CSP_REPORT_ONLY=yes" 'load_env; render_caddyfile' >"$T/csp.caddy" 2>/dev/null
 check "with CSP_REPORT_ONLY=yes the proxy host is allowed in connect-src" 'grep -q "connect-src .*https://s3.photos.example.org" "$T/csp.caddy"'
+in_setup 'WEB_APPS="auth locker"' 'load_env; ensure_caddy_hooks; render_caddyfile' >"$T/apps.caddy" 2>/dev/null
+check "WEB_APPS: a site per app, like web. (headers, its own port), and the add-on import still last" \
+  'awk "/^auth\./,/^}/" "$T/apps.caddy" | grep -q "reverse_proxy 127.0.0.1:3003" && awk "/^locker\./,/^}/" "$T/apps.caddy" | grep -q "reverse_proxy 127.0.0.1:3009" && [[ $(awk "/^locker\./,/^}/" "$T/apps.caddy" | grep -c "import \(sec\|app\)") -eq 2 && $(grep -v "^\s*$" "$T/apps.caddy" | tail -1) == "import $T/caddy/ente.d/sites/*.caddy" ]]' "$(cat "$T/apps.caddy")"
 
 echo "== files owned by ente-s3-proxy.sh"
 out=$(in_proxy "$P" 'proxy_load_env; render_api_upstream off'); check "API upstream when off: museum" '[[ $out == "reverse_proxy 127.0.0.1:8080" ]]' "$out"
@@ -135,6 +141,11 @@ if command -v caddy >/dev/null; then
       proxy_load_env; ensure_caddy_hooks; render_caddyfile >"$d/Caddyfile"
       if [[ $2 != none ]]; then render_proxy_site >"$d/ente.d/sites/s3-proxy.caddy"; render_api_upstream "$2" >"$d/ente.d/api-upstream.caddy"; fi )
   }
+  base_env >"$T/env"; printf '%s\n' "$P" 'WEB_APPS="auth locker"' >>"$T/env"
+  assemble apps none
+  out=$(caddy adapt --config "$T/apps/Caddyfile" --adapter caddyfile --validate 2>&1 >/dev/null); rc=$?
+  check "caddy validates the config with WEB_APPS=auth locker" '[[ $rc -eq 0 ]] && ! grep -qi "warn" <<<"$out"' "$out"
+  check "... formatted the way caddy fmt formats it" 'diff <(caddy fmt "$T/apps/Caddyfile") "$T/apps/Caddyfile" >/dev/null' "$(diff <(caddy fmt "$T/apps/Caddyfile") "$T/apps/Caddyfile")"
   base_env >"$T/env"; echo "$P" >>"$T/env"
   for c in none off on; do
     assemble "$c" "$c"

@@ -57,6 +57,22 @@ out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$T/open/ente-set
 check "backup-setup refuses a script folder others can write (root's timers run it)" \
   '((rc != 0)) && [[ $out == *"root'"'"'s timers run the scripts in $T/open"* ]]' "$out"
 
+echo "== WEB_APPS: extra Ente web apps (auth, locker)"
+for good in "WEB_APPS=" "WEB_APPS='auth locker'" "WEB_APPS=locker,auth"; do
+  out=$(load "$good"); check "accepts $good" '[[ $out == *LOADED* ]]' "$out"
+done
+out=$(load "WEB_APPS='auth cast'"); check "refuses an app it does not know" '[[ $out != *LOADED* && $out == *"unknown app '"'"'cast'"'"'"* ]]' "$out"
+out=$( { cat "$T/base.env"; echo "WEB_APPS='auth locker'"; } >"$T/env"; ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"
+  load_env; echo "cors=$S3_CORS_ORIGINS"; PINS=$T/none ENTE_DIR=$T/wo; mkdir -p "$ENTE_DIR"
+  write_file() { cat >"$1"; }; dc() { :; }; write_override; cat "$T/wo/compose.override.yaml" ) 2>&1 )
+check "... its apps are published on 127.0.0.1 only, through compose.override.yaml" \
+  'grep -qx "      - 127.0.0.1:3003:3003 # auth web app" <<<"$out" && grep -qx "      - 127.0.0.1:3009:3009 # locker web app" <<<"$out"' "$out"
+check "... and may upload to the photo bucket (CORS)" \
+  '[[ $out == *"cors=https://web.photos.example.org,https://albums.photos.example.org,https://auth.photos.example.org,https://locker.photos.example.org"* ]]' "$out"
+out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; load_env; PINS=$T/none ENTE_DIR=$T/wo
+  write_file() { cat >"$1"; }; dc() { :; }; write_override; cat "$T/wo/compose.override.yaml" ) 2>&1 )
+check "without WEB_APPS the override publishes nothing extra" '! grep -q "ports:" <<<"$out"' "$out"
+
 echo "== the photo bucket: museum.yaml once it has one, else the env file"
 # bucket_run CODE: load_env with the base config (S3_ENDPOINT=s3.example.net, S3_BUCKET=photo) and $T/mb/museum.yaml, then CODE
 bucket_run() { ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; ENTE_DIR=$T/mb; set +e; load_env; eval "$1" ) 2>&1; }

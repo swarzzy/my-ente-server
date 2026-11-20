@@ -93,6 +93,14 @@ cert albums 25; run check_web
 check "a certificate with 25 days left: no FAIL" '[[ $(fails) -eq 0 ]] && grep -q "valid for 2[45]+ days" "$T/out"' "$(cat "$T/out")"
 rm "$T/cert-api.pem"; run check_web
 check "no certificate served: one FAIL" 'one_fail "no certificate served for api.photos.example.org"' "$(cat "$T/out")"
+healthy; cert auth 89; cert locker 89
+WEB_APPS="auth locker" run check_web
+check "WEB_APPS=auth locker: their pages and certificates are checked too" \
+  '[[ $(fails) -eq 0 ]] && grep -q "OK    https://auth.photos.example.org/" "$T/out" && grep -q "OK    https://locker.photos.example.org/" "$T/out"' "$(cat "$T/out")"
+cert locker 5; WEB_APPS="auth locker" URL_DOWN=https://auth.photos.example.org/ run check_web
+check "... and each fault in them is one FAIL" \
+  '[[ $(fails) -eq 2 ]] && grep -q "FAIL  https://auth.photos.example.org/ does not answer" "$T/out" && grep -q "FAIL  certificate of locker.photos.example.org expires" "$T/out"' "$(cat "$T/out")"
+rm -f "$T/cert-auth.pem" "$T/cert-locker.pem"
 healthy
 
 echo "== security"

@@ -34,7 +34,8 @@ them) and stops naming any that a command needs but is missing; it never logs th
 1. **Buckets.** Create two buckets at two providers if you can. The key for the photo bucket needs read/write/delete and
    permission to set CORS (the script sets it; if the provider refuses it prints what to set by hand).
    Backup bucket: the backup only adds to it, so its key needs read/write (no delete). It grows: clean it up by hand (see "Backups").
-2. **DNS.** A (and AAAA) records for `api.`, `web.` and `albums.` under your domain → the VPS, TTL 300.
+2. **DNS.** A (and AAAA) records for `api.`, `web.` and `albums.` under your domain → the VPS, TTL 300. For the Ente Auth and
+   Locker web apps also `auth.` and `locker.`, with `WEB_APPS="auth locker"` in `ente-setup.env` (either one alone works too).
 3. **Config.** Copy `ente-server/` to the VPS, create `ente-setup.env` and `ente-setup.secrets` from the examples.
    `BACKUP_PASSPHRASE` encrypts the config backup: keep it in a password manager, without it the backup is unreadable.
 4. **As root:** `./ente-setup.sh deploy` = `bootstrap` + `install` + `backup-setup`. About 5 minutes. Run it in `tmux` (or `nohup`):
@@ -58,10 +59,18 @@ them) and stops naming any that a command needs but is missing; it never logs th
 
 Run steps separately instead of `deploy` if you prefer: `bootstrap`, `install`, `backup-setup`.
 
+## Extra web apps: Ente Auth and Locker (`WEB_APPS`)
+
+The Ente web image also holds the Auth (2FA codes) and Locker (documents) web apps. `WEB_APPS="auth locker"` in
+`ente-setup.env` (and their DNS records) serves them at `https://auth.<domain>` and `https://locker.<domain>`: `install`
+publishes their ports on 127.0.0.1 only (in `compose.override.yaml`), adds a Caddy site for each with the same headers, and
+allows them in the photo bucket's CORS; `check` then checks their pages and certificates. Re-run `install` after changing it.
+They use the same account and server as Photos; their data is end-to-end encrypted like the photos and in the same backup.
+
 ## Security headers
 
 Caddy adds HSTS (1 year), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a `Permissions-Policy` that turns off
-camera/microphone/geolocation, removes the `Server` header, and on `web.`/`albums.` sends `X-Frame-Options: DENY`.
+camera/microphone/geolocation, removes the `Server` header, and on the web apps (`web.`, `albums.`, `auth.`, `locker.`) sends `X-Frame-Options: DENY`.
 The Caddyfile is rewritten by `install`/`restore`: change headers in `configure_host()`, not in `/etc/caddy/Caddyfile`.
 `CSP_REPORT_ONLY=yes` adds a Content-Security-Policy in report-only mode: use the web app (log in, upload, open a shared album) with the
 browser console open and look for CSP reports before considering enforcing it. HSTS stays in browsers for a year: keep serving HTTPS.
@@ -154,7 +163,7 @@ bot: turn on Telegram's two-step verification. `ente-ops.sh check` includes the 
 Every FAIL is something that can break by itself and that nothing else reports:
 
 - services: museum, web and postgres healthy; sign-ups closed (WARN until `lockdown`); a WARN when an Ente image is over 60 days old;
-- web: Caddy running, `api./ping`, `web.` and `albums.` answer, their certificates valid for at least 20 more days (Caddy renews at 30);
+- web: Caddy running, `api./ping`, `web.`, `albums.` and any `WEB_APPS` answer, their certificates valid for at least 20 more days (Caddy renews at 30);
 - security: nothing reachable over TCP from outside but SSH, 80 and 443 (Docker bypasses UFW, so this is what keeps Postgres
   private), sshd settings, UFW active and allowing SSH;
 - photo bucket reachable, CORS for the web app (the bucket museum uses, from `museum.yaml`; a WARN if `ente-setup.env` names
@@ -205,7 +214,7 @@ If a pinned build is ever deleted from the registry, `install`/`restore` warn an
    photo bucket and tops up any objects missing there from the backup bucket (copy only, never deletes). About 2 minutes for a small library.
    If a restore is interrupted, just run it again. Stopped before the database was restored, it cleans up and starts over;
    after, it only finishes the remaining steps. It never wipes a restored database, and `check` FAILs until it finishes.
-3. Point DNS (`api.`, `web.`, `albums.`, TTL 300) at the new IP; certificates are issued once it resolves. Run `check`.
+3. Point DNS (`api.`, `web.`, `albums.`, plus `auth.` / `locker.` if in `WEB_APPS`; TTL 300) at the new IP; certificates are issued once it resolves. Run `check`.
 
 Apps keep working because the hostnames do not change. To restore into a *new* photo bucket, set the new `S3_*` values:
 objects are copied from the backup bucket. After restoring from the photo bucket alone, `backup-setup` fills the new backup bucket.

@@ -31,9 +31,8 @@ proxy_load_env() {
   local M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
   eval "$(museum_s3)"
   LINK_ENDPOINT=$M_ENDPOINT LINK_BUCKET=$M_BUCKET
-  case $S3_PROXY_HOST in
-    "api.$DOMAIN" | "web.$DOMAIN" | "albums.$DOMAIN" | "$LINK_ENDPOINT") die "S3_PROXY_HOST must be a host name of its own, not $S3_PROXY_HOST" ;;
-  esac
+  [[ $S3_PROXY_HOST != "api.$DOMAIN" && $S3_PROXY_HOST != "$LINK_ENDPOINT" ]] && ! web_hosts | grep -qx "${S3_PROXY_HOST%.$DOMAIN}" ||
+    die "S3_PROXY_HOST must be a host name of its own, not $S3_PROXY_HOST"
 }
 
 # proxy_state: on|off. set_proxy_state on|off: persist it.

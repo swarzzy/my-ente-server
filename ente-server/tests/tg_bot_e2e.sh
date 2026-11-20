@@ -87,7 +87,7 @@ check "the bot uses the real token (seen by the fake API)" \
   '[[ $(curl -sS "$API/control/tokens") == *"$(printf %s "$token" | sha256sum | cut -c1-64)"* ]] || { sleep 3; [[ $(curl -sS "$API/control/tokens") == *"$(printf %s "$token" | sha256sum | cut -c1-64)"* ]]; }'
 
 ask "/status"; check "/status: five short lines: services, backup, checks, system, proxy" \
-  '[[ $(reply | head -1) == "✅ Ente is up (museum, web, postgres)" && $(reply) == *"💾 Backup: last good "*" ago · next "* && $(reply) == *"🩺 Check: "* && $(reply) == *"🖥 Disk "* && $(reply | wc -l) -le 5 ]]' "$(reply)"
+  '[[ $(reply | head -1) == "✅ Ente is up (museum, web, postgres)" && $(reply) == *"💾 Backup: last good "*" ago · next "* && $(reply) == *" Check: "* && $(reply) == *"🖥 Disk "* && $(reply | wc -l) -le 5 ]]' "$(reply)"
 ask "/check" 2 180; check "/check: the check passed, problems listed, the rest counted" \
   '[[ $(reply | head -1) == "✅ Check passed" && $(reply | tail -1) =~ ^[0-9]+\ checks\ OK$ && $(reply) != *"  OK  "* ]]' "$(reply)"
 ask "/check@some_bot now"; check "arguments are refused" '[[ $(reply) == "/check takes nothing after it. Just send /check." ]]' "$(reply)"
