@@ -278,7 +278,7 @@ class BotTest(unittest.TestCase):
     def test_a_stranger_notice_names_them(self):
         self.msg("hi there", sender=STRANGER)
         self.poll()
-        self.assertEqual(self.texts(), ["🚫 Someone else wrote to me, I ignored it: Someone @someone (id %d): 'hi there'" % STRANGER])
+        self.assertEqual(self.texts(), ["🚫 Someone else wrote, ignored: Someone @someone (id %d): 'hi there'" % STRANGER])
 
     def test_long_output_is_cut_to_fit_a_message(self):
         self.runner.out["status"] = (0, "x" * 10000 + "THE END")

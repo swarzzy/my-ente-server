@@ -131,7 +131,7 @@ echo "== other people and other chats"
 t0=$(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service)
 ask "/backup" 1 20 "$STRANGER"
 check "a stranger's /backup runs nothing" '[[ $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]'
-check "the owner is told about it" '[[ $(reply) == "🚫 Someone else wrote to me, I ignored it:"*"(id $STRANGER)"* ]]' "$(reply)"
+check "the owner is told about it" '[[ $(reply) == "🚫 Someone else wrote, ignored:"*"(id $STRANGER)"* ]]' "$(reply)"
 check "the stranger gets no answer at all" '[[ $(to_others) == 0 ]]'
 # the bot handles messages in order: once a /status sent after it is answered, the group message has been seen
 n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"chat\": -100555, \"type\": \"group\"}"; ask "/status" 1 30

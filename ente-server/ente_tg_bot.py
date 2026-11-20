@@ -39,7 +39,7 @@ TITLES = {"backup": ("✅ Backup done", "❌ Backup failed"),
 STARTED = {"backup": "⏳ Backing up...",
            "check": "⏳ Checking (about 30 s)...",
            "proxy-on": "⏳ Turning the S3 proxy on...",
-           "proxy-off": "⏳ Turning the S3 proxy off..",
+           "proxy-off": "⏳ Turning the S3 proxy off...",
            "proxy-status": "⏳ Checking the S3 proxy..."}
 BUSY = {"backup": "⏳ A backup is already running.",
         "check": "⏳ A check is already running.",
@@ -190,7 +190,7 @@ class Bot:
             return
         self.noticed[sid] = now
         name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-        self.send("🚫 Someone else wrote, Ignored: %s%s (id %s): %r" % (
+        self.send("🚫 Someone else wrote, ignored: %s%s (id %s): %r" % (
             name or "no name", " @%s" % sender["username"] if sender.get("username") else "", sid, text[:60]))
 
     def command(self, text):
