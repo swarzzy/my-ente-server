@@ -33,6 +33,7 @@ units they install run them from there.
 - New to it: [docs/functions-and-tests.md](docs/functions-and-tests.md), then the runbook [ente-server/README.md](ente-server/README.md).
 - Taking over: [docs/handoff-brief.md](docs/handoff-brief.md).
 - Installing: the runbook's "Fresh install"; moving servers: its "Moving to a new VPS".
-- Testing: `bash ente-server/tests/run_all.sh` (anywhere), `sudo bash tests/run_all.sh --server` from the folder on the server.
+- Testing: `bash ente-server/tests/run_all.sh` (anywhere, ~15 s), `sudo bash tests/run_all.sh --server` from the folder on the
+  server (~3.5 min), `--browser` for the full browser test too.
 
 Never commit `ente-setup.env`, `ente-setup.secrets` or any key; `.gitignore` covers the usual names.

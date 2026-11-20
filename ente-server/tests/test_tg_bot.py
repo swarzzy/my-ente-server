@@ -90,7 +90,8 @@ class BotTest(unittest.TestCase):
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeTelegram)
         self.srv.lock = threading.Lock()
         self.srv.calls, self.srv.sent, self.srv.updates, self.srv.fail_next = [], [], [], 0
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        # a short poll interval: shutdown() waits up to one interval (the default 0.5 s, paid by every test)
+        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         self.state = tempfile.mkdtemp()
         self.runner = FakeRunner()
         self.log = io.StringIO()
@@ -105,7 +106,8 @@ class BotTest(unittest.TestCase):
         os.rmdir(self.state)
 
     def make_bot(self):
-        api = tb.TelegramAPI("http://127.0.0.1:%d" % self.srv.server_address[1], TOKEN, poll_timeout=1)
+        # a short long-poll: a poll with nothing queued waits this long
+        api = tb.TelegramAPI("http://127.0.0.1:%d" % self.srv.server_address[1], TOKEN, poll_timeout=0.1)
         return tb.Bot(api, OWNER, self.runner, self.state, log=self.log)
 
     def msg(self, text, sender=OWNER, chat=None, chat_type="private", age=0, is_bot=False, edited=False):
@@ -356,7 +358,7 @@ class RunnerTest(unittest.TestCase):
         with open(helper, "w") as f:
             f.write("#!/bin/sh\nsleep 5\n")
         os.chmod(helper, 0o755)
-        rc, out = tb.CommandRunner([helper], timeout=1)("status")
+        rc, out = tb.CommandRunner([helper], timeout=0.3)("status")
         self.assertNotEqual(rc, 0)
         self.assertIn("timed out", out)
         os.unlink(helper)

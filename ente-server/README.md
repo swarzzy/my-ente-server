@@ -285,7 +285,10 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 ## Tests
 
 `bash tests/run_all.sh` runs every suite that changes nothing (the two bucket suites only where rclone is) and prints one line
-per suite; on the live server `sudo bash tests/run_all.sh --server` adds the VPN config test and the end-to-end tests.
+per suite, with its time; the suites that change nothing run side by side (about 15 s). On the live server
+`sudo bash tests/run_all.sh --server` adds the VPN config test and the proxy and bot end-to-end tests (about 3.5 min);
+`--browser` also runs the web app in a real browser (about 4.5 min more): after touching the proxy or the web apps, and
+after an Ente update.
 Each suite also runs on its own:
 
 | Command | Where | What |
@@ -307,7 +310,9 @@ Each suite also runs on its own:
 | `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |
 
 `proxy_e2e.sh` and `tg_bot_e2e.sh` leave their add-on as they found it (installed or not, on or off). The browser test opens registration for a throwaway account, deletes it
-afterwards, closes registration again and removes the Playwright image.
+afterwards and closes registration again. Its first run builds a local image with Playwright (`ente-e2e-playwright`, about
+5.5 GB on disk) and keeps it, so later runs skip the download; `KEEP_IMAGE=0` removes it afterwards (or
+`docker rmi ente-e2e-playwright:1.49.0 && docker builder prune -af` any time). `TEST_TIMES=1` before any bash suite adds the seconds each check took.
 
 ## Notes and limits
 

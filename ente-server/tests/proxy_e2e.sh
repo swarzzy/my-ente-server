@@ -84,7 +84,7 @@ check "systemd restarts a killed rewriter" '[[ $(systemctl show -p MainPID --val
 echo "== a failed self-test rolls back"
 prx off
 sed "s/^S3_PROXY_HOST=.*/S3_PROXY_HOST=no-dns-e2e.$DOMAIN/" ente-setup.env >"$T/bad.env"
-ENV_FILE=$T/bad.env "$PROXYSH" on </dev/null >"$T/out" 2>&1; RC=$?
+ENV_FILE=$T/bad.env PROXY_CERT_TRIES=2 "$PROXYSH" on </dev/null >"$T/out" 2>&1; RC=$? # it can never work: no minute of waiting
 check "proxy on fails when the proxy host does not work" '[[ $RC -ne 0 ]] && grep -q "self-test failed" "$T/out"' "$(tail -5 "$T/out")"
 check "and puts the add-on's files back (no trace of the bad host)" '! grep -rq no-dns-e2e /etc/caddy /etc/systemd/system/ente-s3-rewrite.service'
 check "and leaves the proxy off" '[[ $(cat $STATE) == off ]] && ! api_rewrites'

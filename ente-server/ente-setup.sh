@@ -60,8 +60,9 @@ version_ge() { [[ $(printf '%s\n%s\n' "$2" "${1#v}" | sort -V | head -1) == "$2"
 host_ip() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'; }
 # need VAR...: die unless every named config variable is non-empty.
 need() { local v; for v in "$@"; do [[ -n ${!v} ]] || die "$v is not set in $ENV_FILE"; done; }
-# url_ok URL [TRIES]: poll URL every 3s until it answers 2xx; false after TRIES (default 20).
-url_ok() { local i; for i in $(seq 1 "${2:-20}"); do curl -fsS -m 5 "$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+# url_ok URL [TRIES]: true once URL answers 2xx; gives up after about TRIES x 3 s (default 20). Polls every half second, so a
+# service that comes up a moment later costs a moment, not a whole step.
+url_ok() { local i; for ((i = 0; i < ${2:-20} * 6; i++)); do curl -fsS -m 5 "$1" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
 # yaml_ok FILE: die unless FILE parses as YAML.
 yaml_ok() { python3 -I -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$1" || die "$1 is not valid YAML"; }
 
@@ -383,7 +384,8 @@ PY
 photo_bucket() {
   local out M_KEY M_SECRET M_ENDPOINT M_REGION M_BUCKET
   PHOTO_ENDPOINT=$S3_ENDPOINT PHOTO_BUCKET=$S3_BUCKET
-  [[ -f $ENTE_DIR/museum.yaml ]] && out=$(museum_s3 2>/dev/null) || return 0 # no museum.yaml, or no bucket in it yet
+  # no museum.yaml, or no bucket in it yet (grep first: it is cheaper than starting Python on every load_env)
+  grep -qs '^ *b2-eu-cen:' "$ENTE_DIR/museum.yaml" && out=$(museum_s3 2>/dev/null) || return 0
   eval "$out"
   PHOTO_ENDPOINT=$M_ENDPOINT PHOTO_BUCKET=$M_BUCKET
 }

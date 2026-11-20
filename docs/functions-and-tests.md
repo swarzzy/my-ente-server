@@ -105,7 +105,7 @@ All three are optional and installed separately; each has `install`, `uninstall`
 
 ## Tests
 
-All suites live in `ente-server/tests/` and must pass on the server before a commit; there is no CI. `bash tests/run_all.sh` runs every suite that can run where it is; `sudo bash tests/run_all.sh --server` on the server adds the VPN and end-to-end suites. Counts are from the last full run on the server.
+All suites live in `ente-server/tests/` and must pass on the server before a commit; there is no CI. `bash tests/run_all.sh` runs every suite that can run where it is; `sudo bash tests/run_all.sh --server` on the server adds the VPN and the proxy and bot end-to-end suites (about 3.5 min), and `--browser` also the browser test (about 4.5 min more; after proxy or web app changes and Ente updates). Counts are from the last full run on the server.
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |

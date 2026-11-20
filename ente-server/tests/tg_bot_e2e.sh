@@ -133,9 +133,12 @@ ask "/backup" 1 20 "$STRANGER"
 check "a stranger's /backup runs nothing" '[[ $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]'
 check "the owner is told about it" '[[ $(reply) == "🚫 Someone else wrote to me, I ignored it:"*"(id $STRANGER)"* ]]' "$(reply)"
 check "the stranger gets no answer at all" '[[ $(to_others) == 0 ]]'
-n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"chat\": -100555, \"type\": \"group\"}"; sleep 5
-check "the owner's command in a group is ignored" '[[ $(nsent) == "$n0" && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]'
-n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"age\": 300}"; sleep 5
+# the bot handles messages in order: once a /status sent after it is answered, the group message has been seen
+n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"chat\": -100555, \"type\": \"group\"}"; ask "/status" 1 30
+check "the owner's command in a group is ignored" \
+  '[[ $(nsent) == $((n0 + 1)) && $(reply) == *"Ente is up"* && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]' "$(reply)"
+n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $OWNER, \"age\": 300}"
+for ((i = 0; i < 50; i++)); do (($(nsent) > n0)) && break; sleep 0.2; done # the "skipped" reply
 check "an old command is not run" '[[ $(last) == "⏰ Skipped /backup"* && $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]' "$(last)"
 check "the token never appears in the bot's log" '! journalctl -u ente-tg-bot-e2e.service -u ente-tg-bot.service -q -o cat --no-pager | grep -qF "${token#*:}"'
 

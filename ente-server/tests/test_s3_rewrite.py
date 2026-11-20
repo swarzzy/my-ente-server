@@ -115,6 +115,12 @@ class FakeMuseum(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = do_OPTIONS = do_PATCH = _handle
 
 
+class FakeMuseumServer(ThreadingHTTPServer):
+    """museum (Go) accepts a burst of connections; the default listen backlog of 5 would drop some under load"""
+    daemon_threads = True
+    request_queue_size = 1024
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -126,12 +132,12 @@ def free_port():
 class RewriterTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.museum = ThreadingHTTPServer(("127.0.0.1", 0), FakeMuseum)
-        threading.Thread(target=cls.museum.serve_forever, daemon=True).start()
+        cls.museum = FakeMuseumServer(("127.0.0.1", 0), FakeMuseum)
+        threading.Thread(target=cls.museum.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         cfg = rw.Config(listen=("127.0.0.1", 0), upstream=("127.0.0.1", cls.museum.server_address[1]),
                         from_host=REAL, to_host=PROXY, bucket=BUCKET)
         cls.proxy = rw.make_server(cfg)
-        threading.Thread(target=cls.proxy.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.proxy.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         cls.port = cls.proxy.server_address[1]
 
     @classmethod
@@ -281,7 +287,7 @@ class RewriterTest(unittest.TestCase):
         self.assertLessEqual(self.proxy.RequestHandlerClass.timeout, 300)
         fast = type("Fast", (self.proxy.RequestHandlerClass,), {"timeout": 1})  # the same handler, a short timeout
         srv = rw.Server(("127.0.0.1", 0), fast)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         try:
             s = socket.create_connection(srv.server_address, timeout=10)
             s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly part")  # never finishes
@@ -321,7 +327,7 @@ class UpstreamDownTest(unittest.TestCase):
         cfg = rw.Config(listen=("127.0.0.1", 0), upstream=("127.0.0.1", free_port()), from_host=REAL, to_host=PROXY, bucket=BUCKET,
                         quiet=True)
         srv = rw.make_server(cfg)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         try:
             c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
             c.request("GET", "/ping")

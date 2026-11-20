@@ -20,6 +20,8 @@ PROXY_SITE=$CADDY_SITES/s3-proxy.caddy
 REWRITE_PY=/usr/local/lib/ente-setup/ente_s3_rewrite.py
 REWRITE_UNIT=/etc/systemd/system/ente-s3-rewrite.service
 REWRITE_PORT=8081
+# how many 3-second tries `on` gives a new proxy host's certificate before its self-test fails (tests set it lower)
+PROXY_CERT_TRIES=${PROXY_CERT_TRIES:-20}
 
 # proxy_load_env: ente-setup.sh's config plus S3_PROXY_HOST (a host name of its own), and LINK_ENDPOINT / LINK_BUCKET: the
 # bucket museum signs its links for, read from museum.yaml (the source of truth after install), so proxy and links never differ.
@@ -237,7 +239,7 @@ do_switch() {
   local want=$1 f0
   do_install
   if [[ $want == on ]]; then
-    f0=$FAILS; proxy_checks_base 20
+    f0=$FAILS; proxy_checks_base "$PROXY_CERT_TRIES"
     ((FAILS == f0)) || die "proxy self-test failed before switching"
   fi
   set_proxy_state "$want"
