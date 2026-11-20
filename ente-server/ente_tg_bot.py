@@ -28,7 +28,7 @@ import urllib.request
 ACTIONS = ("status", "check", "backup", "proxy-on", "proxy-off", "proxy-status")
 COMMANDS = [("status", "Quick overview"), ("check", "Full health check"),
             ("backup", "Back up now"), ("proxy", "S3 proxy: state, /proxy on, /proxy off")]
-HELP = ("What I can do:\n/status – quick overview\n/check – full health check (about 30 s)\n/backup – back up now\n"
+HELP = ("Available actions:\n/status – quick overview\n/check – full health check (about 30 s)\n/backup – back up now\n"
         "/proxy – S3 proxy state; /proxy on or /proxy off to switch it")
 # the first line of a finished action's reply: (when it worked, when it did not)
 TITLES = {"backup": ("✅ Backup done", "❌ Backup failed"),
@@ -36,12 +36,12 @@ TITLES = {"backup": ("✅ Backup done", "❌ Backup failed"),
           "proxy-on": ("✅ S3 proxy is on", "❌ Could not turn the S3 proxy on"),
           "proxy-off": ("✅ S3 proxy is off", "❌ Could not turn the S3 proxy off"),
           "proxy-status": ("🔀 S3 proxy", "❌ S3 proxy has problems")}
-STARTED = {"backup": "⏳ Backing up… I'll send the result when it's done.",
-           "check": "⏳ Checking (about 30 s)…",
-           "proxy-on": "⏳ Turning the S3 proxy on (with a self-test)…",
-           "proxy-off": "⏳ Turning the S3 proxy off…",
-           "proxy-status": "⏳ Checking the S3 proxy…"}
-BUSY = {"backup": "⏳ A backup is already running. I'll send its result.",
+STARTED = {"backup": "⏳ Backing up...",
+           "check": "⏳ Checking (about 30 s)...",
+           "proxy-on": "⏳ Turning the S3 proxy on...",
+           "proxy-off": "⏳ Turning the S3 proxy off..",
+           "proxy-status": "⏳ Checking the S3 proxy..."}
+BUSY = {"backup": "⏳ A backup is already running.",
         "check": "⏳ A check is already running.",
         "proxy": "⏳ Busy: the last /proxy command hasn't finished yet."}
 MAX_TEXT = 4000      # Telegram allows 4096 characters
@@ -176,7 +176,7 @@ class Bot:
         age = time.time() - int(m.get("date") or 0)
         if age > self.max_age:
             self.log("ignored %r: too old (%d s)" % (text[:40], age))
-            self.send("⏰ Skipped %s: it was sent %d s ago, while I was offline. Send it again if you still want it."
+            self.send("⏰ Skipped %s: it was sent %d s ago, while offline. Send again."
                       % (text[:40] or "your message", age))
             return
         self.command(text)
@@ -190,7 +190,7 @@ class Bot:
             return
         self.noticed[sid] = now
         name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-        self.send("🚫 Someone else wrote to me, I ignored it: %s%s (id %s): %r" % (
+        self.send("🚫 Someone else wrote, Ignored: %s%s (id %s): %r" % (
             name or "no name", " @%s" % sender["username"] if sender.get("username") else "", sid, text[:60]))
 
     def command(self, text):
