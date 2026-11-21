@@ -126,7 +126,7 @@ dur() {
 }
 ago() { echo "$(dur $(($(date +%s) - $(date -d "$1" +%s 2>/dev/null || date +%s)))) ago"; }
 
-# act_status: five short lines: services, backup, checks, system, proxy. ⚠️/❌ mark what needs a look.
+# act_status: four or five short lines (proxy only when installed): services, backup, checks, system, proxy. ⚠️/❌ mark what needs a look.
 act_status() {
   local s cid st down='' a b last line ts res nxt
   local state=$BACKUP_STATE

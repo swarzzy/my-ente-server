@@ -48,7 +48,8 @@ them) and stops naming any that a command needs but is missing; it never logs th
      `MaxAuthTries 3`: if your ssh-agent holds many keys use `ssh -o IdentitiesOnly=yes -i KEY`.
    - `install`: Docker, Caddy, Ente's quickstart; edits its files (each edit asserted; fails loudly if the quickstart changed),
      checks the photo bucket (read/write/delete), sets CORS, starts everything.
-   - `backup-setup`: rclone remotes, systemd timer (03:00 daily, catches up if missed), first run started.
+   - `backup-setup`: rclone remotes, the backup timer (03:00 daily, catches up if missed), the monthly `verify` timer,
+     Telegram alerts and the daily `check` if `TG_CHAT_ID` is set; first run started.
 5. Keep `BACKUP_PASSPHRASE` in your password manager: with it, either bucket restores the server. (Optionally also
    `/opt/my-ente/museum.yaml`: both buckets already carry it, encrypted.)
 6. **Sign up the owner first** at `https://web.<domain>`, then family. No SMTP, so codes are in the log: `sudo ./ente-setup.sh codes`.
@@ -71,7 +72,7 @@ They use the same account and server as Photos; their data is end-to-end encrypt
 
 Caddy adds HSTS (1 year), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a `Permissions-Policy` that turns off
 camera/microphone/geolocation, removes the `Server` header, and on the web apps (`web.`, `albums.`, `auth.`, `locker.`) sends `X-Frame-Options: DENY`.
-The Caddyfile is rewritten by `install`/`restore`: change headers in `configure_host()`, not in `/etc/caddy/Caddyfile`.
+The Caddyfile is rewritten by `install`/`restore`: change headers in `render_caddyfile()`, not in `/etc/caddy/Caddyfile`.
 `CSP_REPORT_ONLY=yes` adds a Content-Security-Policy in report-only mode: use the web app (log in, upload, open a shared album) with the
 browser console open and look for CSP reports before considering enforcing it. HSTS stays in browsers for a year: keep serving HTTPS.
 

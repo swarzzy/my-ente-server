@@ -1,6 +1,6 @@
 # Ente server setup scripts — handoff brief
 
-Nov 16, 2026 · @Dmitrii
+Nov 20, 2026 · @Dmitrii
 
 ## What this is
 
@@ -16,7 +16,8 @@ Nov 16, 2026 · @Dmitrii
 
 - **Production:** one Debian 13 VPS, reinstalled on Nov 16 and restored from the backup bucket with `deploy` (`RESTORE=yes`): the real disaster-recovery path, about a minute for the small library. The saved Let's Encrypt certificates were put back into Caddy's storage first, so none was reissued. It runs the scripts as of the latest commit on `master`.
 - **Working and tested on the server:** Ente, daily backups to the second bucket (copy only: nothing is ever deleted there; the owner cleans it up by hand) plus the encrypted config copy in the photo bucket, Telegram alerts, the Better Stack heartbeat, the monthly `verify`, the Telegram bot, the S3 proxy (installed, off) and the AmneziaWG VPN. All test suites pass there, including the browser end-to-end test.
-- **Waiting on the owner:** sign up at `https://web.<domain>`, then family, then `sudo ./ente-setup.sh lockdown`. Fetch the NEW VPN client config `/root/awg-client.conf` (the reinstall made new keys), import it, then `shred -u` it on the server.
+- **Owner and lockdown:** the owner's account is the admin and sign-ups are closed. It also serves the Ente Auth and Locker web apps (`WEB_APPS="auth locker"`).
+- **Waiting on the owner:** lift their storage limit with the Ente CLI (README, step 9). Fetch the NEW VPN client config `/root/awg-client.conf` (the reinstall made new keys), import it, then `shred -u` it on the server.
 - **Server access:** only the admin key in `ente-setup.env` (`ADMIN_SSH_PUBKEY`) can log in, as `ops` on port 42876. Root and passwords are off.
 
 ## Open items
