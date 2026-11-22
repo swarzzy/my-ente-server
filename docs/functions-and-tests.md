@@ -39,7 +39,7 @@ The apps upload and download photos directly to the photo bucket; the server han
 
 | Command | What it does | What to test |
 | --- | --- | --- |
-| `bootstrap` | Upgrades packages; creates the admin user (key only, passwordless sudo); moves SSH to `SSH_PORT`, turns off root and password login; enables ufw (SSH, 80, 443), fail2ban, unattended upgrades with automatic reboot at 02:00, 2 GB swap. | Admin can log in on the new port; root and passwords are refused; `sshd -T` shows the settings; ufw active. |
+| `bootstrap` | Upgrades packages; creates the admin user (key only, passwordless sudo); moves SSH to `SSH_PORT`, turns off root and password login; enables ufw (SSH, 80, 443), fail2ban, unattended upgrades with automatic reboot at 02:00 (Debian, plus the Docker, Caddy and AmneziaWG repositories; `install` and `ente-vpn.sh install` write it too), 2 GB swap. | Admin can log in on the new port; root and passwords are refused; `sshd -T` shows the settings; ufw active. |
 | `install` | Installs Docker and Caddy; fetches Ente's quickstart and edits it: ports on 127.0.0.1 only, the domain's URLs, the external photo bucket; pins the Ente images by digest; writes the Caddyfile (TLS, security headers) with `web.`, `albums.` and any `WEB_APPS` (`auth.`, `locker.`); sets CORS on the bucket; starts the containers. | `https://api.<domain>/ping` answers; ports 8080/3000/3002 local only; images pinned; a changed quickstart layout is refused. |
 | `codes` | Prints sign-up verification codes from the last 24 h of museum logs (no mail server). | A sign-up's code shows up. |
 | `lockdown` | After a yes, makes the oldest user the admin and closes sign-ups; restarts museum. | Only after `y`; deleted accounts skipped; re-run changes nothing; new sign-ups refused. |
@@ -110,7 +110,7 @@ All suites live in `ente-server/tests/` and must pass on the server before a com
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |
-| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths | 53 |
+| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins | 54 (+3 on the server) |
 | `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 37 |
 | `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 38 |
 | `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation | 61 |

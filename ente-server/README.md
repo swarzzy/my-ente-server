@@ -203,7 +203,9 @@ re-runs keep the pins, `restore` runs the builds that made the dump, and `check`
 `postgres:15` is not pinned, so its minor fixes arrive with `update`.
 
 `sudo ./ente-setup.sh update`: runs a backup first (rollback point; aborts if it fails), moves the pins to the current `latest`,
-recreates the changed containers, prunes. Read Ente's release notes first. OS updates install themselves.
+recreates the changed containers, prunes. Read Ente's release notes first. OS updates install themselves, and so do those of Docker,
+Caddy and AmneziaWG (their repositories are allowed origins; a Docker upgrade restarts the containers for a few seconds). rclone does
+not: `sudo rclone selfupdate` now and then.
 
 Going back after a bad update: the previous pins are in `/opt/my-ente/image-pins.prev`. Copy that file over `image-pins` and run
 `install`. If the new server version already migrated the database, the old one may not start: then also restore the dump that
@@ -254,7 +256,7 @@ Copy the client config to your device and import it in the AmneziaVPN app, then 
 `ssh -p <SSH_PORT> <ADMIN_USER>@<ip> sudo cat /root/awg-client.conf > awg.conf`, then on the server `sudo shred -u /root/awg-client.conf`.
 
 Re-running `install` keeps the keys (a new `AWG_PORT` is applied; update `Endpoint` in the client). New keys: move `awg0.conf` away, re-run.
-The Amnezia packages are not covered by unattended upgrades (`apt list --upgradable` now and then); a kernel update needs the DKMS build to succeed.
+The Amnezia packages update themselves with unattended upgrades; a kernel update needs the DKMS build to succeed (`ente-vpn.sh status` shows the VPN state).
 `sudo ./ente-vpn.sh status` shows the service, the port and each peer's last handshake. `sudo ./ente-vpn.sh uninstall` removes it all
 (service, keys and configs, UFW rules, NAT table, packages, the PPA); close the port in your provider's firewall yourself.
 The Amnezia PPA's signing key is embedded in `ente-vpn.sh` and checked by fingerprint, so apt accepts only packages Amnezia signed.
@@ -303,7 +305,7 @@ Each suite also runs on its own:
 | `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the copy's exclusion, restore fetching only the newest dump, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
 | `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the backup never deletes in the backup bucket (photos or dumps gone from the server stay there), `verify` catching a bad dump, empty tables, a damaged photo or missing config files, its growth line, every FAIL in the backup part of `check`, and `install` moving the backup to a new photo bucket |
 | `bash tests/test_check.sh` | anywhere (system tools stubbed) | the rest of `check`: services and image age, web and certificates, open ports, sshd/UFW, the photo bucket and CORS, the add-ons' checks, disk, OOM, pending reboot; each FAIL once, nothing on a healthy server |
-| `bash tests/test_cli.sh` | anywhere (as an unprivileged user when run as root) | the command lines of `ente-setup.sh`, `ente-ops.sh`, `ente-vpn.sh`; config values refused (quotes, `$`, spaces, bad ids, `AWG_PORT`); the in-place `museum.yaml` write on a full disk; `backup-setup` refusing a script folder others can write |
+| `bash tests/test_cli.sh` | anywhere (as an unprivileged user when run as root) | the command lines of `ente-setup.sh`, `ente-ops.sh`, `ente-vpn.sh`; config values refused (quotes, `$`, spaces, bad ids, `AWG_PORT`); the in-place `museum.yaml` write on a full disk; `backup-setup` refusing a script folder others can write; the unattended-upgrade config, and on the server that each repository's origin is the allowed one |
 | `bash tests/test_quickstart.sh` | anywhere with network (fetches Ente's current quickstart; docker stubbed) | `install`'s edits against today's quickstart: ports on 127.0.0.1, URLs, the external bucket, keys kept, in place, idempotent; a full disk leaves `museum.yaml` untouched; a changed layout is refused |
 | `bash tests/test_lockdown.sh` | anywhere (Postgres stubbed) | `lockdown`: oldest user becomes admin only after `y`, re-runs change nothing, install keeps the block, a hand-made `internal:` is refused, edited in place |
 | `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down; the test message of `backup-setup`; emptying `TG_CHAT_ID` removes every alert file |

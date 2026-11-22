@@ -237,6 +237,7 @@ cmd_vpn_install() {
   wan=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
   [[ -n $ip && -n $wan ]] || die "no default IPv4 route"
   dpkg -s amneziawg-tools >/dev/null 2>&1 || awg_install
+  write_unattended # its updates install themselves (the AmneziaWG PPA is among the allowed origins)
   modprobe amneziawg || die "the amneziawg kernel module does not load (see: dkms status)"
   install -d -m 700 /etc/amnezia/amneziawg
   write_file "$AWG_NAT" 600 <<EOF

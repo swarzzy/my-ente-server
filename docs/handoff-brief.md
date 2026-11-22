@@ -30,7 +30,6 @@ Nov 20, 2026 · @Dmitrii
 - The bash test harnesses run the code under test with `set +e`, unlike production (`set -e`). An abort that only happens under `set -e` would not show up; the proxy's rollback and the in-place write have their own tests for this.
 - The installers (get.docker.com, Ente's quickstart from `main`) are not pinned.
 - There is no strength check on `BACKUP_PASSPHRASE`. The photo bucket's config copy allows offline guessing.
-- Unattended upgrades do not cover the Amnezia packages.
 - There is no CI and no shellcheck. The tests run by hand on the server: `sudo bash tests/run_all.sh --server`.
 - Optional simplifications not done: `apply_edits` checks each edit three ways, the `sshd -T` count plus the Ubuntu socket branch, and `lockdown`'s y/N prompt.
 

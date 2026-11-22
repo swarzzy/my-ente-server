@@ -55,6 +55,19 @@ out=$(in_setup 'cd "$T"; ENV_FILE=rel.env SECRETS_FILE=$T/s.secrets config_env')
 check "config_env: absolute paths of both files, for the units" '[[ $out == "ENV_FILE=$(realpath "$T")/rel.env SECRETS_FILE=$(realpath "$T")/s.secrets" ]]' "$out"
 out=$(in_setup 'ENV_FILE="$T/my env" config_env; echo "rc=$?"')
 check "config_env refuses a path a unit line would break on" '[[ $out == *"may only hold"* && $out != *"rc=0"* ]]' "$out"
+in_setup 'write_file() { cat >"$T/$(basename "$1")"; }; write_unattended' >/dev/null
+if command -v apt-config >/dev/null; then
+  out=$(apt-config -c "$T/52ente-unattended" dump Unattended-Upgrade 2>&1)
+  check "unattended upgrades: the config parses, reboots at 02:00 and allows Docker, Caddy and AmneziaWG" \
+    '[[ $(grep -cE "Origins-Pattern:: \"(origin=Docker,label=Docker CE|origin=cloudsmith/caddy/stable|origin=LP-PPA-amnezia)\"" <<<"$out") == 3 ]] && grep -q "Automatic-Reboot-Time \"02:00\"" <<<"$out"' "$out"
+fi
+# where a repository is installed (the server), its real origin must be the one allowed: a renamed origin would stop its updates
+pol=$(apt-cache policy 2>/dev/null || true)
+for r in "download.docker.com|o=Docker,.*l=Docker CE" "dl.cloudsmith.io/public/caddy|o=cloudsmith/caddy/stable," "amnezia/ppa|o=LP-PPA-amnezia,"; do
+  url=${r%%|*} want=${r#*|}
+  grep -q "$url" <<<"$pol" || continue
+  check "the $url repository here has the origin unattended upgrades allow" 'grep -A1 "$url" <<<"$pol" | grep -qE "release .*$want"' "$(grep -A1 "$url" <<<"$pol")"
+done
 mkdir -p "$T/open"; cp "$HERE/../ente-setup.sh" "$HERE/../ente-ops.sh" "$T/open/"; chmod 777 "$T/open"
 mkdir -p "$T/ente"; echo "key: x" >"$T/ente/museum.yaml"
 out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$T/open/ente-setup.sh"; ENTE_DIR=$T/ente; cmd_backup_setup ) 2>&1 ); rc=$?

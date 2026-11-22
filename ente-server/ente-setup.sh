@@ -176,6 +176,29 @@ root_only_writable() {
 sticky_dir() { [[ -d $1 && -k $1 && $1 != "$2" ]]; }
 
 # ---------------------------------------------------------------- bootstrap
+# write_unattended: daily unattended upgrades, rebooting at 02:00 when one needs it. Besides Debian's own updates, those of the
+# repositories this setup adds install themselves too: Docker (its upgrade restarts the containers; they come back by their
+# restart policy), Caddy and the AmneziaWG PPA (ente-vpn.sh). A pattern for a repository that is not there matches nothing.
+# Each is the o=/l= that `apt-cache policy` shows for the repository.
+UNATTENDED_CONF=/etc/apt/apt.conf.d/52ente-unattended
+write_unattended() {
+  write_file /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  write_file "$UNATTENDED_CONF" <<'EOF'
+// Managed by ente-setup.sh (write_unattended).
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "02:00";
+// Updates from the repositories ente-setup.sh and ente-vpn.sh add (Docker, Caddy, AmneziaWG) install themselves too.
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Docker,label=Docker CE";
+  "origin=cloudsmith/caddy/stable";
+  "origin=LP-PPA-amnezia";
+};
+EOF
+}
+
 # Create the passwordless-sudo admin user with its key, then harden sshd (key-only, no root) and verify it took effect.
 setup_ssh() {
   local home n i
@@ -241,14 +264,7 @@ cmd_bootstrap() {
   setup_ssh
   if [[ -n $oldport && $oldport != "$SSH_PORT" ]]; then ufw delete allow "$oldport/tcp" >/dev/null || true; fi
   ufw --force enable >/dev/null
-  write_file /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
-  write_file /etc/apt/apt.conf.d/52ente-unattended <<'EOF'
-Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "02:00";
-EOF
+  write_unattended
   if ! swapon --show=NAME --noheadings | grep -x /swapfile >/dev/null; then
     if [[ ! -f /swapfile ]]; then fallocate -l 2G /swapfile; chmod 600 /swapfile; mkswap /swapfile >/dev/null; fi
     swapon /swapfile
@@ -665,6 +681,7 @@ cmd_install() {
   apt_get update; apt_install curl ca-certificates python3-yaml gnupg
   install_docker
   install_caddy
+  write_unattended # also on servers bootstrapped before it covered Docker and Caddy
   run_quickstart
   configure_host
   log "starting containers"
