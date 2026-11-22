@@ -76,6 +76,7 @@ Nothing is sent while all is well. Every FAIL is something that can break by its
 | Monthly verify (`ente-ops.sh verify`, 1st, 04:30) | Photos match the backup by checksum (size where no common checksum); both encrypted config copies decrypt and equal the local files; the newest dump restores into a scratch database with tables, users and files present; an INFO line on the backup bucket's growth. Changes nothing. | Corrupt dump, empty tables, damaged photo, missing config file each give one FAIL; a table added by an update is no false FAIL. |
 | Alert: backup failed | `❌ Backup failed on <host>` with its ERROR lines (or the last 15 log lines). | Right title and lines; broken UTF-8 and long logs still send. |
 | Alert: check or verify found problems | `⚠️ Daily check found problems on <host>` or `⚠️ Monthly backup verify found problems on <host>`, one ❌ line per problem. | Only FAIL lines, no OK, WARN or verdict noise. |
+| Monthly news (`ente-ops.sh news`, 2nd, 10:00) | Compares the pinned museum and web builds with the registry's `latest` (no download) and, if one is newer, sends both build dates and the `update` hint to Telegram. Installed with the alerts; `check` fails if its timer is off while alerts are on. | Current: nothing sent; newer: listed; registry or Telegram down: fails. |
 | Alert test message | Sent by every `backup-setup` run; a failure stops setup before anything is installed. | Wrong chat id stops setup. |
 | Heartbeat (`HC_URL`) | Pinged after each fully good backup; the outside service alerts when a ping is missing (also covers the server being down). | A missed night is reported by the service. |
 | Alerts off | Emptying `TG_CHAT_ID` and re-running `backup-setup` removes all alert files. | All six files gone. |
@@ -112,12 +113,12 @@ All suites live in `ente-server/tests/` and must pass on the server before a com
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |
-| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins | 56 (+3 on the server) |
+| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins | 57 (+3 on the server) |
 | `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 38 |
-| `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 39 |
+| `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 41 |
 | `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation, timer units | 62 |
-| `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off | 21 |
-| `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning; `pg-update`, `rclone-update` | 39 |
+| `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off, news unit | 22 |
+| `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning; `pg-update`, `rclone-update`, `news` | 45 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
 | `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |

@@ -5,6 +5,7 @@
 #   verify      deep test that the S3 backup restores (monthly by ente-verify.timer)
 #   pg-update   Postgres's minor releases (security fixes), weekly by ente-pg-update.timer
 #   rclone-update  rclone's new releases (rclone.org's binary, which apt does not update), weekly by ente-rclone-update.timer
+#   news        tells Telegram when Ente has newer builds than the pinned ones, monthly by ente-news.timer (alerts on)
 # Config and secrets: those of ente-setup.sh. Needs ente-setup.sh next to it (its helpers).
 OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=ente-setup.sh
@@ -177,6 +178,9 @@ check_backup() {
   elif (($(hours_since "$s") > 45 * 24)); then bad "last good verify is older than 45 days ($s)"
   else ok "monthly verify: last passed $s"; fi
   [[ -n $TG_CHAT_ID || -n $HC_URL ]] || warn "no failure alerts (set TG_CHAT_ID or HC_URL)"
+  if [[ -n $TG_CHAT_ID ]] && ! systemctl is-enabled --quiet ente-news.timer 2>/dev/null; then
+    bad "ente-news.timer not enabled: no monthly note about new Ente builds (run ente-setup.sh backup-setup)"
+  fi
 }
 
 check_system() {
@@ -361,8 +365,38 @@ cmd_rclone_update() {
   log "rclone $old -> $new (the previous one is $bin.prev)"
 }
 
+# ---------------------------------------------------------------- news
+ALERT_BIN=/usr/local/bin/ente-alert # installed by setup_alerts
+# reg_info REF: "DIGEST DATE" of REF in the registry: the image index digest (what image-pins hold) and the amd64 build date.
+# Asks the registry only; nothing is downloaded.
+reg_info() {
+  docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}} {{(index .Image "linux/amd64").Created}}' 2>/dev/null |
+    awk 'NR == 1 {print $1, $2}'
+}
+# news: Ente's images have no versions, so this compares the pinned builds with the registry's `latest`. When there is a newer one,
+# it says so (with both build dates) and sends it to Telegram if alerts are on; monthly by ente-news.timer. Silent when current.
+cmd_news() {
+  load_env
+  local svc repo pin cur new msg=''
+  for svc in museum web; do
+    repo=$(repo_of $svc); pin=$(pin_of $svc)
+    new=$(reg_info "$repo:latest"); [[ -n $new ]] || die "cannot ask the registry about $repo:latest"
+    [[ ${new%% *} != "${pin#*@}" ]] || continue
+    cur=$(reg_info "$pin"); cur=${cur#* }
+    msg+="$svc: running the build of ${cur:-an unknown date}, a newer one is from ${new#* }"$'
+'
+  done
+  if [[ -z $msg ]]; then log "Ente is current (museum and web are the latest builds)"; return 0; fi
+  msg+=$'
+'"Read the release notes (https://github.com/ente/ente/releases), then: sudo $SCRIPT_DIR/ente-setup.sh update"
+  printf '%s
+' "$msg"
+  if [[ -x $ALERT_BIN ]]; then printf '%s
+' "$msg" | "$ALERT_BIN" "🆕 Newer Ente builds for $(hostname)" || die "could not send to Telegram"; fi
+}
+
 # ---------------------------------------------------------------- main
-OPS_COMMANDS="check verify pg-update rclone-update"
+OPS_COMMANDS="check verify pg-update rclone-update news"
 ops_usage() { echo "usage: $0 {${OPS_COMMANDS// /|}}" >&2; exit 2; }
 
 # sourced (tests): define the functions only

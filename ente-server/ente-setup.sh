@@ -1043,14 +1043,15 @@ tg_api() { # tg_api METHOD [curl args...]: call the Bot API with TG_BOT_TOKEN
 }
 # the files setup_alerts installs, removed again when TG_CHAT_ID is emptied
 ALERT_FILES=(/etc/systemd/system/ente-check.timer /etc/systemd/system/ente-check.service /etc/systemd/system/ente-alert@.service
-  /etc/ente-alert.env /usr/local/bin/ente-alert /usr/local/bin/ente-alert-unit)
+  /etc/ente-alert.env /usr/local/bin/ente-alert /usr/local/bin/ente-alert-unit /etc/systemd/system/ente-news.timer
+  /etc/systemd/system/ente-news.service)
 setup_alerts() {
   local f ce
   if [[ -z $TG_CHAT_ID ]]; then
     ALERT_ONFAIL=
     for f in "${ALERT_FILES[@]}"; do
       [[ -e $f ]] || continue
-      systemctl disable --now ente-check.timer >/dev/null 2>&1 || true
+      systemctl disable --now ente-check.timer ente-news.timer >/dev/null 2>&1 || true
       rm -f "${ALERT_FILES[@]}"
       systemctl daemon-reload; log "telegram alerts removed (TG_CHAT_ID empty)"
       break
@@ -1118,6 +1119,29 @@ Type=oneshot
 Environment=$ce
 ExecStart=/bin/bash "$SCRIPT_DIR/ente-ops.sh" check
 EOF
+  write_file /etc/systemd/system/ente-news.service <<EOF
+[Unit]
+Description=Monthly note about newer Ente builds (ente-ops.sh news)
+After=docker.service network-online.target
+Wants=network-online.target
+OnFailure=ente-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=$ce
+ExecStart=/bin/bash "$SCRIPT_DIR/ente-ops.sh" news
+EOF
+  write_file /etc/systemd/system/ente-news.timer <<'EOF'
+[Unit]
+Description=Monthly note about newer Ente builds
+
+[Timer]
+OnCalendar=*-*-02 10:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   write_file /etc/systemd/system/ente-check.timer <<'EOF'
 [Unit]
 Description=Daily Ente health check
@@ -1130,9 +1154,9 @@ Persistent=true
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now ente-check.timer >/dev/null 2>&1
+  systemctl enable --now ente-check.timer ente-news.timer >/dev/null 2>&1
   ALERT_ONFAIL='OnFailure=ente-alert@%n.service'
-  log "telegram alerts on (failed backup, daily check at 09:00), test message sent. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
+  log "telegram alerts on (failed backup, daily check at 09:00, newer Ente builds on the 2nd), test message sent. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
 }
 
 # backup-setup: rclone remotes, refuse a foreign backup, install the timer and start a first backup.

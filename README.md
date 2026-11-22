@@ -10,7 +10,7 @@ nightly encrypted backups to a second bucket, daily health checks and Telegram a
 ente-server/            the deployable folder: copy it whole to the server (e.g. /root/ente-server), owned by root
   README.md             the runbook: install, backups, restore, updates, add-ons, tests
   ente-setup.sh         setup commands: deploy, bootstrap, install, codes, lockdown, backup-setup, restore, update
-  ente-ops.sh           running it: check (daily), verify (monthly), pg-update and rclone-update (weekly)
+  ente-ops.sh           running it: check (daily), verify (monthly), pg-update and rclone-update (weekly), news (monthly)
   ente-backup.sh        one backup run (installed by backup-setup, run daily by systemd)
   ente-s3-proxy.sh      add-on: photo traffic through the server
   ente_s3_rewrite.py      its link rewriter

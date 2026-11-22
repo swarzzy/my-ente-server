@@ -39,6 +39,10 @@ check "the token and chat id are stored in /etc/ente-alert.env, mode 600" \
 check "the token is in no other file" '[[ $(grep -rlF -- "${TOKEN#*:}" "$R") == "$R/etc/ente-alert.env" ]]' "$(grep -rlF -- "${TOKEN#*:}" "$R")"
 check "the check unit alerts on failure and runs ente-ops.sh check" \
   'grep -qx "OnFailure=ente-alert@%n.service" "$R/etc/systemd/system/ente-check.service" && grep -q "ente-ops.sh\" check$" "$R/etc/systemd/system/ente-check.service"'
+check "the monthly news unit runs ente-ops.sh news on the 2nd, alerts on failure, with the same config files" \
+  'grep -q "ente-ops.sh\" news$" "$R/etc/systemd/system/ente-news.service" && grep -qx "OnFailure=ente-alert@%n.service" "$R/etc/systemd/system/ente-news.service" &&
+   grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T/secrets")" "$R/etc/systemd/system/ente-news.service" &&
+   grep -qx "OnCalendar=\*-\*-02 10:00:00" "$R/etc/systemd/system/ente-news.timer"' "$(cat "$R/etc/systemd/system/ente-news."* 2>&1)"
 check "... with the config and secrets files setup used (not the default ones)" \
   'grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T/secrets")" "$R/etc/systemd/system/ente-check.service"' \
   "$(grep Environment "$R/etc/systemd/system/ente-check.service")"

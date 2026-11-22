@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for `ente-setup.sh update` and `ente-ops.sh pg-update` / `rclone-update` (at the end): a failed download changes nothing (image-pins and the rollback point image-pins.prev stay
+# Tests for `ente-setup.sh update` and `ente-ops.sh pg-update` / `rclone-update` / `news` (at the end): a failed download changes nothing (image-pins and the rollback point image-pins.prev stay
 # as they were), a real update moves the pins and keeps the old ones as the rollback point, and a re-run keeps that point.
 # docker, docker compose and systemd are stubs, so this runs anywhere bash is and changes nothing outside a temp dir.
 # Run: bash tests/test_update.sh
@@ -223,5 +223,45 @@ TO=72 DPKG=1 rc_run; RC=$?
 check "rclone from a Debian package: left to apt" '((RC == 0)) && grep -q "apt updates it" "$T/out" && [[ $(ver) == "rclone v1.70.0" ]]' "$(cat "$T/out")"
 TO=72 RUNNING=ente-backup.service rc_run; RC=$?
 check "a backup is running: waits for next week" '((RC == 0)) && grep -q "ente-backup.service is running" "$T/out" && [[ $(ver) == "rclone v1.70.0" ]]' "$(cat "$T/out")"
+
+
+echo "== news: newer Ente builds"
+# news_run: ente-ops.sh news with the registry stubbed: LM / LW = the digest numbers of museum's and web's latest (the pins are
+# 1 and 2); REG_DOWN: the registry does not answer; NO_ALERT: alerts not set up; SEND_FAIL: Telegram rejects. Sent messages go to $T/sent.
+news_run() {
+  reset; rm -f "$T/sent"
+  printf '#!/bin/bash\n[[ -z $SEND_FAIL ]] || exit 1\n{ echo "TITLE $1"; cat; } >"%s"\n' "$T/sent" >"$T/alert"; chmod 755 "$T/alert"
+  ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test SEND_FAIL=${SEND_FAIL:-}
+    # shellcheck source=/dev/null
+    . "$HERE/../ente-ops.sh"
+    ENTE_DIR=$T/ente PINS=$T/ente/image-pins ALERT_BIN=$T/alert
+    [[ -z ${NO_ALERT:-} ]] || ALERT_BIN=$T/none
+    set +e
+    docker() {
+      [[ -z ${REG_DOWN:-} ]] || return 1
+      case "$1 $2 $3 $4" in
+        "buildx imagetools inspect $M:latest") echo "sha256:$(d "${LM:-1}") 2026-11-15 05:06:30.1 +0000 UTC" ;;
+        "buildx imagetools inspect $W:latest") echo "sha256:$(d "${LW:-2}") 2026-11-18 07:27:37.6 +0000 UTC" ;;
+        "buildx imagetools inspect $M@sha256:"*) echo "${4#*@} 2026-10-01 01:00:00.0 +0000 UTC" ;;
+        "buildx imagetools inspect $W@sha256:"*) echo "${4#*@} 2026-11-11 07:24:48.1 +0000 UTC" ;;
+        *) echo "unexpected docker $*" >&2; return 1 ;;
+      esac
+    }
+    main news ) >"$T/out" 2>&1
+}
+news_run; RC=$?
+check "both builds are the latest: nothing sent" '((RC == 0)) && grep -q "Ente is current" "$T/out" && [[ ! -e $T/sent ]]' "$(cat "$T/out")"
+LW=4 news_run; RC=$?
+check "a newer web build: Telegram gets it, with both build dates and what to do" \
+  '((RC == 0)) && grep -q "^TITLE 🆕 Newer Ente builds for " "$T/sent" && grep -q "^web: running the build of 2026-11-11, a newer one is from 2026-11-18$" "$T/sent" &&
+   ! grep -q "^museum" "$T/sent" && grep -q "release notes.*ente-setup.sh update$" "$T/sent"' "$(cat "$T/out" "$T/sent" 2>&1)"
+LM=3 LW=4 news_run; RC=$?
+check "both newer: both listed" '((RC == 0)) && grep -q "^museum: running the build of 2026-10-01, a newer one is from 2026-11-15$" "$T/sent" && grep -q "^web:" "$T/sent"' "$(cat "$T/sent" 2>&1)"
+LW=4 NO_ALERT=1 news_run; RC=$?
+check "without Telegram alerts: only printed" '((RC == 0)) && grep -q "^web: running" "$T/out" && [[ ! -e $T/sent ]]' "$(cat "$T/out")"
+LW=4 SEND_FAIL=1 news_run; RC=$?
+check "Telegram rejects it: it fails (the unit's alert retries the message)" '((RC != 0)) && grep -q "could not send to Telegram" "$T/out"' "$(cat "$T/out")"
+REG_DOWN=1 news_run; RC=$?
+check "the registry does not answer: it fails, nothing sent" '((RC != 0)) && grep -q "cannot ask the registry" "$T/out" && [[ ! -e $T/sent ]]' "$(cat "$T/out")"
 
 summary

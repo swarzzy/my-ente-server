@@ -118,7 +118,9 @@ What survives what (you also need each provider's account to create new keys, an
 With `TG_CHAT_ID` set, `backup-setup` installs alerts that need no other service:
 - a failed backup sends "❌ Backup failed on <host>" with its ERROR lines (or the last 15 log lines);
 - `check` runs daily at 09:00 (`ente-check.timer`) and sends "⚠️ Daily check found problems on <host>" with one ❌ line per
-  problem (a stale backup, a container down, the disk nearly full, ...); the monthly `verify` does the same.
+  problem (a stale backup, a container down, the disk nearly full, ...); the monthly `verify` does the same;
+- on the 2nd of each month at 10:00 (`ente-news.timer`, `ente-ops.sh news`), "🆕 Newer Ente builds for <host>" if the registry has a
+  newer museum or web build than the pinned ones, with both build dates and what to run (`update`). It asks the registry only.
 
 Nothing is sent while all is well. Not covered: the VPS itself being down (only an outside monitor such as `HC_URL` sees that).
 
