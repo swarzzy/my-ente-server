@@ -128,5 +128,38 @@ check "neither Telegram nor a heartbeat: a WARN" '[[ $(fails) -eq 0 ]] && grep -
 touch "$T/ente/.restore-finishing"; cb_run
 check "an unfinished restore: FAIL" 'one_fail "a restore did not finish"' "$(grep FAIL "$T/out")"
 rm "$T/ente/.restore-finishing"
+E=$T/root/etc/ente-backup.env
+sed -i 's/^PHOTO_BUCKET=.*/PHOTO_BUCKET="old"/' "$E"; cb_run
+check "the backup copies another bucket than museum uses: FAIL" 'one_fail "the backup copies ?/old, but museum uses s3.example.net/photo"' "$(grep FAIL "$T/out")"
+sed -i 's/^PHOTO_BUCKET=.*/PHOTO_BUCKET="photo"/' "$E"
+
+echo "== install moves the backup to a new photo bucket"
+cat >>"$T/ente/museum.yaml" <<'X'
+s3:
+  b2-eu-cen:
+    key: K2
+    secret: S2
+    endpoint: s3.new.net
+    region: r9
+    bucket: photo2
+X
+# refresh: install's refresh_backup_source, with the ownership check (it lists the bucket) recorded instead of run
+refresh() { in_setup 'check_backup_owner() { echo "OWNER-CHECK $1"; }; refresh_backup_source' >"$T/out" 2>&1; }
+check "install runs it once museum is up" 'in_setup "declare -f cmd_install" | grep -q refresh_backup_source'
+refresh; RC=$?
+check "museum.yaml names a new bucket: the backup's env file follows" '((RC == 0)) && grep -qx "PHOTO_BUCKET=\"photo2\"" "$E"' "$(cat "$T/out"; cat "$E")"
+check "... ente-s3 points at its endpoint, with its keys" \
+  '[[ $(conf_get ente-s3 endpoint) == s3.new.net && $(conf_get ente-s3 access_key_id) == K2 && $(conf_get ente-s3 secret_access_key) == S2 ]]'
+check "... the config copy goes to the new bucket" '[[ $(conf_get photo-crypt remote) == ente-s3:photo2/ente-backup-config/config ]]' "$(conf_get photo-crypt remote)"
+check "... once that bucket holds no other instance's backup" 'grep -qx "OWNER-CHECK ente-s3:photo2/ente-backup-config/" "$T/out"' "$(cat "$T/out")"
+cb_run
+check "... and check is content" '[[ $(fails) -eq 0 ]]' "$(grep FAIL "$T/out")"
+refresh; RC=$?
+check "a re-run with the same bucket: no second ownership check" '((RC == 0)) && ! grep -q OWNER-CHECK "$T/out"' "$(cat "$T/out")"
+sed -i 's/endpoint: s3.new.net/endpoint: s3.other.net/' "$T/ente/museum.yaml"; cb_run
+check "museum moved to another endpoint, the backup did not: FAIL" 'one_fail "the backup copies s3.new.net/photo2, but museum uses s3.other.net/photo2"' "$(grep FAIL "$T/out")"
+mv "$E" "$T/env.keep"; sum=$(sha256sum "$RCLONE_CONFIG"); refresh; RC=$?
+check "no backup set up yet: install leaves rclone and the env file alone" '((RC == 0)) && [[ ! -e $E && $(sha256sum "$RCLONE_CONFIG") == "$sum" ]]'
+mv "$T/env.keep" "$E"
 
 summary

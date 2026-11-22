@@ -20,7 +20,7 @@ in_setup() {
   ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test
     # shellcheck source=/dev/null
     . "$HERE/../ente-ops.sh"
-    ENTE_DIR=$T/ente RCLONE_CONFIG=$T/rclone.conf BACKUP_STATE=$T/state DUMP_DIR=$T/dumps # never the host's real files
+    ENTE_DIR=$T/ente RCLONE_CONFIG=$T/rclone.conf BACKUP_STATE=$T/state DUMP_DIR=$T/dumps BACKUP_ENV_FILE=$T/root/etc/ente-backup.env # never the host's real files
     set +e
     load_env
     eval "$1" )
@@ -64,7 +64,7 @@ backup_script() {
   in_setup '
     write_file() { local f=$T/root$1; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "${2:-644}" "$f"; }
     systemctl() { :; }
-    ALERT_ONFAIL= SCRIPT_DIR=$HERE/.. install_backup_units' >/dev/null 2>&1
+    ALERT_ONFAIL= SCRIPT_DIR=$HERE/.. BACKUP_ENV_FILE=/etc/ente-backup.env install_backup_units' >/dev/null 2>&1
 }
 # BACKUP_ENV: the backup's paths, all in the temp dir (the script reads them from the environment)
 BACKUP_ENV=(ENTE_DIR="$T/ente" DUMP_DIR="$T/dumps" BACKUP_STATE="$T/state" RCLONE_CONFIG="$RCLONE_CONFIG")

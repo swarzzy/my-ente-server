@@ -56,6 +56,10 @@ check "a second run succeeds and changes nothing" '((RC == 0)) && [[ $(sha256sum
 printf '%s\n' S3_ACCESS_KEY= S3_SECRET_KEY= >"$T/secrets"
 in_setup apply_edits >"$T/out" 2>&1; RC=$?
 check "a re-run without keys in the secrets file keeps the keys in museum.yaml" '((RC == 0)) && [[ $(sha256sum "$C" "$M") == "$sha" ]]' "$(tail -5 "$T/out")"
+ln -s /dev/full "$M.new" # the bucket edit's new copy lands on a full disk
+in_setup 'S3_BUCKET=other edit_museum_s3 "$M"' >"$T/out" 2>&1; RC=$?
+check "the bucket edit on a full disk: dies, museum.yaml untouched, no leftover copy" \
+  '((RC != 0)) && grep -q "S3 edit failed" "$T/out" && [[ $(sha256sum "$C" "$M") == "$sha" && ! -e $M.new && ! -L $M.new ]]' "$(tail -3 "$T/out")"
 
 echo "== a changed layout is refused"
 cp "$C" "$T/compose.good"

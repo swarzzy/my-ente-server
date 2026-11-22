@@ -58,7 +58,7 @@ The backup never deletes anything in the backup bucket; old photos and dumps are
 | Copy to the backup bucket | Copies the encrypted config (`backup-crypt:`) and every photo object (`<bucket>/objects`). Copy only. | Photos deleted from the photo bucket, and dumps gone from the server, stay in the backup. |
 | Config copy in the photo bucket | Syncs the same encrypted config into the photo bucket (`ente-backup-config/`, the last 7 dumps). | Follows the server's dumps; excluded from the photo copy. |
 | Stamps and heartbeat | Each successful part leaves a stamp for `check`; a fully good run pings `HC_URL`. | A failed part leaves no stamp and exits 1; a failed ping does not fail the backup. |
-| Bucket source | Bucket name and endpoint come from `museum.yaml` once install wrote them, else from `ente-setup.env`. | An edited `S3_BUCKET` without re-running install keeps the old bucket and `check` warns. |
+| Bucket source | Bucket name and endpoint come from `museum.yaml` once install wrote them, else from `ente-setup.env`. | An edited `S3_BUCKET` without re-running install keeps the old bucket and `check` warns. Re-running install moves the backup to the new bucket too (env file, `ente-s3` and `photo-crypt` remotes, after the ownership check); `check` fails if the backup copies another bucket or endpoint than museum uses. |
 | `restore` | See Setup commands. Restores only the newest dump; a server mid-restore is never wiped once its database is restored. | See Setup commands. |
 | Manual clean-up | README commands: list and remove photos no longer in the photo bucket; delete dumps older than 90 days (`--dry-run` first). | Dry runs list what would go. |
 
@@ -91,7 +91,7 @@ Photos stay end-to-end encrypted by the Ente apps; the server never sees plainte
 | Secrets | Keys live in `ente-setup.secrets` (600) and root-only files; the backup is encrypted with `BACKUP_PASSPHRASE`; tokens never on a command line. | Token appears in no other file and in no log. |
 | Config values | Values written into generated files (domain, buckets, `HC_URL`, Telegram ids and token, proxy host, VPN port) are refused if they hold quotes, `$`, spaces or backslashes, or have the wrong shape. | Injection attempts refused. |
 | Root-run folder | Root's timers and the bot run scripts from the script folder, so it must be root's alone; `backup-setup` and the bot install refuse otherwise. | A folder others can write is refused. |
-| Safe writes | `museum.yaml` (holds the master key) is rewritten in place and never left truncated on a full disk. | On a full disk, setup dies and keeps the new content. |
+| Safe writes | `museum.yaml` (holds the master key) is rewritten in place and never left truncated on a full disk. | On a full disk, setup dies and keeps the new content; the bucket edit dies and leaves `museum.yaml` untouched. |
 
 ## Add-ons
 
@@ -111,12 +111,12 @@ All suites live in `ente-server/tests/` and must pass on the server before a com
 | --- | --- | --- | --- |
 | `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source | 51 |
 | `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 37 |
-| `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check` | 28 |
+| `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 38 |
 | `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores | 54 |
 | `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off | 20 |
 | `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning | 22 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
-| `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 16 |
+| `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |
 | `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, sudo rule, every reply (stubbed server) | 68 |
 | `test_vpn_config.sh` | server, after VPN install | VPN key and obfuscation config | 13 |

@@ -16,6 +16,7 @@ LOG=/var/log/ente-setup.log
 ENTE_DIR=/opt/my-ente
 PINS=$ENTE_DIR/image-pins
 DUMP_DIR=/var/backups/ente # local DB dumps, synced to the config backup (the backup script hardcodes it)
+BACKUP_ENV_FILE=/etc/ente-backup.env # the backup's config (where to, which photo bucket), written by backup-setup
 BACKUP_STATE=/var/lib/ente-backup # stamps the backup script leaves; ente-ops.sh check/verify read them (tests point this elsewhere)
 PHOTO_CFG_DIR=ente-backup-config # inside the photo bucket: the encrypted config copy (see make_photo_crypt)
 CADDY_DIR=${CADDY_DIR:-/etc/caddy}
@@ -348,12 +349,13 @@ PY
   yaml_ok "$c"; yaml_ok "$m"
 }
 
-# Point the b2-eu-cen bucket at the external photo bucket and drop the two unused buckets.
+# edit_museum_s3 FILE: point the b2-eu-cen bucket at the external photo bucket and drop the two unused buckets. The edit goes
+# to FILE.new and is checked there; only then does overwrite_in_place put it into FILE, so a full disk never truncates FILE.
 edit_museum_s3() {
   S3_ENDPOINT=$S3_ENDPOINT S3_REGION=$S3_REGION S3_BUCKET=$S3_BUCKET S3_ACCESS_KEY=$S3_ACCESS_KEY S3_SECRET_KEY=$S3_SECRET_KEY \
-    python3 -I - "$1" <<'PY' || die "museum.yaml: S3 edit failed (quickstart layout changed?)"
+    python3 -I - "$1" "$1.new" <<'PY' || { rm -f "$1.new"; die "museum.yaml: S3 edit failed (quickstart layout changed, or disk full?); $1 is unchanged"; }
 import json, os, re, sys, yaml
-path = sys.argv[1]; e = os.environ
+path, new = sys.argv[1:]; e = os.environ
 vals = {"key": e["S3_ACCESS_KEY"], "secret": e["S3_SECRET_KEY"], "endpoint": e["S3_ENDPOINT"],
         "region": e["S3_REGION"], "bucket": e["S3_BUCKET"]}
 out = []; blk = None
@@ -370,12 +372,14 @@ for ln in open(path).read().split("\n"):
         if k: ln = "%s%s: %s" % (k.group(1), k.group(2), json.dumps(vals[k.group(2)]))
     if re.match(r"^ *are_local_buckets:", ln): ln = re.sub(r":.*", ": false", ln)
     out.append(ln)
-open(path, "w").write("\n".join(out))
-d = yaml.safe_load(open(path))["s3"]
+with open(new, "w") as f:
+    f.write("\n".join(out)); f.flush(); os.fsync(f.fileno())
+d = yaml.safe_load(open(new))["s3"]
 assert d["are_local_buckets"] is False and d["use_path_style_urls"] is True
 assert [k for k in d if isinstance(d[k], dict)] == ["b2-eu-cen"], list(d)
 assert {k: d["b2-eu-cen"][k] for k in vals} == vals
 PY
+  if cmp -s "$1.new" "$1"; then rm -f "$1.new"; else overwrite_in_place "$1.new" "$1"; fi
 }
 
 # photo_bucket: PHOTO_ENDPOINT and PHOTO_BUCKET, the photo bucket museum really uses: from museum.yaml once install has
@@ -659,6 +663,7 @@ cmd_install() {
   if [[ -n $pre && $MUSEUM_CFG_CHANGED == 1 ]]; then log "museum.yaml changed, restarting museum"; dc restart museum >/dev/null; fi
   wait_healthy museum
   url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping failed locally"
+  refresh_backup_source
   if url_ok "https://api.$DOMAIN/ping" 20; then log "https://api.$DOMAIN/ping OK"
   else warn "https://api.$DOMAIN/ping not reachable yet - point DNS A/AAAA (TTL 300) of $(dns_names) under $DOMAIN to this server"; fi
   cat <<EOF
@@ -849,15 +854,41 @@ PY
   rm -f "$theirs"
 }
 
-# Install the backup run (ente-backup.sh, its config /etc/ente-backup.env), its systemd service + daily 03:00 timer, and the
-# monthly verify.
-install_backup_units() {
-  write_file /etc/ente-backup.env 600 <<EOF
+# write_backup_env: the backup's config file: where it copies to, and which photo bucket it copies.
+write_backup_env() {
+  write_file "$BACKUP_ENV_FILE" 600 <<EOF
 HC_URL="$HC_URL"
 BACKUP_ROOT="$BACKUP_ROOT"
 PHOTO_BUCKET="$PHOTO_BUCKET"
 PHOTO_CFG_DIR="$PHOTO_CFG_DIR"
 EOF
+}
+# backup_env_bucket: the photo bucket the backup copies (empty before backup-setup)
+backup_env_bucket() { sed -n 's/^PHOTO_BUCKET="\(.*\)"$/\1/p' "$BACKUP_ENV_FILE" 2>/dev/null || true; }
+# photo_remote_endpoint: the endpoint of the ente-s3 rclone remote, the backup's way into the photo bucket
+photo_remote_endpoint() {
+  awk -F' *= *' '/^\[/ {s = ($0 == "[ente-s3]")} s && $1 == "endpoint" {print $2}' "$RCLONE_CONFIG" 2>/dev/null || true
+}
+
+# refresh_backup_source: once backup-setup has run, point the backup at the photo bucket museum.yaml now names (bucket,
+# endpoint, keys). Without it, install switching the bucket would leave the nightly backup copying the old one.
+refresh_backup_source() {
+  [[ -f $BACKUP_ENV_FILE ]] || return 0
+  local was; was=$(photo_remote_endpoint)/$(backup_env_bucket)
+  photo_bucket; PHOTO_CFG_ROOT=ente-s3:$PHOTO_BUCKET/$PHOTO_CFG_DIR/
+  make_photo_remote
+  make_photo_crypt
+  if [[ $was != "$PHOTO_ENDPOINT/$PHOTO_BUCKET" ]]; then
+    check_backup_owner "$PHOTO_CFG_ROOT" photo-crypt "the photo bucket's $PHOTO_CFG_DIR/"
+    log "the backup now copies the photo bucket $PHOTO_ENDPOINT/$PHOTO_BUCKET (was $was)"
+  fi
+  write_backup_env
+}
+
+# Install the backup run (ente-backup.sh, its config $BACKUP_ENV_FILE), its systemd service + daily 03:00 timer, and the
+# monthly verify.
+install_backup_units() {
+  write_backup_env
   # the backup run itself is ente-backup.sh (standalone; this only installs it)
   [[ -f $SCRIPT_DIR/ente-backup.sh ]] || die "ente-backup.sh is missing next to $0 (copy the whole ente-server folder)"
   write_file /usr/local/bin/ente-backup.sh 755 <"$SCRIPT_DIR/ente-backup.sh"
@@ -873,7 +904,7 @@ Type=oneshot
 OOMScoreAdjust=500
 TimeoutStartSec=infinity
 Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
-EnvironmentFile=/etc/ente-backup.env
+EnvironmentFile=$BACKUP_ENV_FILE
 ExecStart=/usr/local/bin/ente-backup.sh
 EOF
   write_file /etc/systemd/system/ente-backup.timer <<'EOF'

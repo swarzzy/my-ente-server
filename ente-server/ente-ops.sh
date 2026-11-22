@@ -151,11 +151,16 @@ stamp_check() {
   else ok "$2 $s"; fi
 }
 check_backup() {
-  local s running=
+  local s running= b e
   echo "== backup"
   for s in .restore-incomplete .restore-finishing; do
     [[ ! -e $ENTE_DIR/$s ]] || bad "a restore did not finish ($ENTE_DIR/$s): run ente-setup.sh restore again"
   done
+  # the backup copies the bucket in its env file, through the ente-s3 remote: both must be the one museum uses
+  b=$(backup_env_bucket) e=$(photo_remote_endpoint)
+  if [[ -n $b && ($b != "$PHOTO_BUCKET" || (-n $e && $e != "$PHOTO_ENDPOINT")) ]]; then
+    bad "the backup copies ${e:-?}/$b, but museum uses $PHOTO_ENDPOINT/$PHOTO_BUCKET: run ente-setup.sh backup-setup"
+  fi
   if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then running=1; ok "a backup is running now"; fi
   stamp_check last-ok-s3 "last good backup" "$running"
   stamp_check last-ok-photo-config "config copy in the photo bucket" "$running"
