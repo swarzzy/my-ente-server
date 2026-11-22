@@ -39,6 +39,9 @@ check "the token and chat id are stored in /etc/ente-alert.env, mode 600" \
 check "the token is in no other file" '[[ $(grep -rlF -- "${TOKEN#*:}" "$R") == "$R/etc/ente-alert.env" ]]' "$(grep -rlF -- "${TOKEN#*:}" "$R")"
 check "the check unit alerts on failure and runs ente-ops.sh check" \
   'grep -qx "OnFailure=ente-alert@%n.service" "$R/etc/systemd/system/ente-check.service" && grep -q "ente-ops.sh\" check$" "$R/etc/systemd/system/ente-check.service"'
+check "... with the config and secrets files setup used (not the default ones)" \
+  'grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T/secrets")" "$R/etc/systemd/system/ente-check.service"' \
+  "$(grep Environment "$R/etc/systemd/system/ente-check.service")"
 
 echo "== emptying TG_CHAT_ID removes the alerts"
 mkdir -p "$T/off"; for f in timer service alert-unit env alert alert-script; do echo x >"$T/off/$f"; done

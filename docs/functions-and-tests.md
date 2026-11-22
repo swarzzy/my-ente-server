@@ -43,7 +43,7 @@ The apps upload and download photos directly to the photo bucket; the server han
 | `install` | Installs Docker and Caddy; fetches Ente's quickstart and edits it: ports on 127.0.0.1 only, the domain's URLs, the external photo bucket; pins the Ente images by digest; writes the Caddyfile (TLS, security headers) with `web.`, `albums.` and any `WEB_APPS` (`auth.`, `locker.`); sets CORS on the bucket; starts the containers. | `https://api.<domain>/ping` answers; ports 8080/3000/3002 local only; images pinned; a changed quickstart layout is refused. |
 | `codes` | Prints sign-up verification codes from the last 24 h of museum logs (no mail server). | A sign-up's code shows up. |
 | `lockdown` | After a yes, makes the oldest user the admin and closes sign-ups; restarts museum. | Only after `y`; deleted accounts skipped; re-run changes nothing; new sign-ups refused. |
-| `backup-setup` | Creates the rclone remotes, refuses a bucket holding another instance's backup, installs the backup and verify timers, Telegram alerts (sends a test message), starts a first backup. | Foreign or unreadable backup refused; script folder writable by others refused; test message arrives. |
+| `backup-setup` | Creates the rclone remotes, refuses a bucket holding another instance's backup, installs the backup and verify timers, Telegram alerts (sends a test message), starts a first backup. Backup bucket keys in the secrets file replace the remote's (rotation); the passphrase is never replaced. | Foreign or unreadable backup refused; script folder writable by others refused; test message arrives; new keys applied, none given keeps the old. |
 | `restore` | On a fresh server: takes config and database from whichever bucket has the newer dump, restores the newest dump, copies missing photos back from the backup bucket. Resumes if interrupted. | Restore from each bucket alone; wrong passphrase refused; interrupted at each stage, then re-run. |
 | `update` | Backs up first, moves the image pins to Ente's latest builds, recreates what changed, keeps the old pins in `image-pins.prev`. | Failed download or failed backup changes nothing; museum not answering points to `image-pins.prev`. |
 | `deploy` | `bootstrap` + `install` (or `restore` with `RESTORE=yes`) + `backup-setup` in one go. | A clean VPS ends with `check` passing. |
@@ -91,6 +91,7 @@ Photos stay end-to-end encrypted by the Ente apps; the server never sees plainte
 | Secrets | Keys live in `ente-setup.secrets` (600) and root-only files; the backup is encrypted with `BACKUP_PASSPHRASE`; tokens never on a command line. | Token appears in no other file and in no log. |
 | Config values | Values written into generated files (domain, buckets, `HC_URL`, Telegram ids and token, proxy host, VPN port) are refused if they hold quotes, `$`, spaces or backslashes, or have the wrong shape. | Injection attempts refused. |
 | Root-run folder | Root's timers and the bot run scripts from the script folder, so it must be root's alone; `backup-setup` and the bot install refuse otherwise. | A folder others can write is refused. |
+| Config paths | The check and verify timers and the bot helper run with the `ENV_FILE`/`SECRETS_FILE` paths setup used (absolute), not only the defaults next to the scripts. | Units and helper carry the paths; a path a unit line would break on is refused. |
 | Safe writes | `museum.yaml` (holds the master key) is rewritten in place and never left truncated on a full disk. | On a full disk, setup dies and keeps the new content; the bucket edit dies and leaves `museum.yaml` untouched. |
 
 ## Add-ons
@@ -109,16 +110,16 @@ All suites live in `ente-server/tests/` and must pass on the server before a com
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |
-| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source | 51 |
+| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths | 53 |
 | `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 37 |
 | `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 38 |
-| `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores | 54 |
-| `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off | 20 |
+| `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation | 61 |
+| `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off | 21 |
 | `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning | 22 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
 | `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |
-| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, sudo rule, every reply (stubbed server) | 68 |
+| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, sudo rule, every reply (stubbed server) | 69 |
 | `test_vpn_config.sh` | server, after VPN install | VPN key and obfuscation config | 13 |
 | `python3 -m unittest discover -s tests` | anywhere | link rewriter, bot against a fake Telegram | 49 |
 | `proxy_e2e.sh` | server | the proxy end to end, real signed links | 42 |

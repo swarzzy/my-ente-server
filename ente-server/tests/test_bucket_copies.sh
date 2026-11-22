@@ -19,6 +19,9 @@ echo "== the backup script"
 backup_script
 check "backup-setup installs ente-backup.sh unchanged, and its env file" \
   'cmp -s "$T/root/usr/local/bin/ente-backup.sh" "$HERE/../ente-backup.sh" && [[ $(stat -c %a "$T/root/usr/local/bin/ente-backup.sh") == 755 && -s $T/root/etc/ente-backup.env ]]'
+check "the verify unit reads the config and secrets files backup-setup used" \
+  'grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T")/none" "$T/root/etc/systemd/system/ente-verify.service"' \
+  "$(grep Environment "$T/root/etc/systemd/system/ente-verify.service")"
 check "the env file names the config copy's folder" 'grep -qx "PHOTO_CFG_DIR=\"ente-backup-config\"" "$T/root/etc/ente-backup.env"'
 ( env "${BACKUP_ENV[@]}" BACKUP_ROOT= ENTE_BACKUP_ENV=$T/none bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; RC=$?
 check "without its config the backup stops at once and says so" '((RC != 0)) && grep -q "BACKUP_ROOT: not set" "$T/out"' "$(cat "$T/out")"
@@ -155,5 +158,24 @@ printf 'zz=\xff\n' | LC_ALL=C in_setup 'rclone_set ente-s3' >"$T/out" 2>&1; RC=$
 check "a write that fails half-way: rclone_set fails" '((RC != 0))' "$(tail -3 "$T/out")"
 check "... and the config is exactly as before (no remote lost)" 'cmp -s "$RCLONE_CONFIG" "$T/conf.before"' "$(cat "$RCLONE_CONFIG")"
 check "... and no temp file is left next to it" '[[ -z $(find "$(dirname "$RCLONE_CONFIG")" -maxdepth 1 -name ".rclone.conf.*") ]]'
+
+echo "== new backup bucket keys"
+printf '[backup]\ntype = alias\nremote = %s\n\n[backup-crypt]\ntype = crypt\nremote = backup:bk/config\npassword = %s\n' \
+  "$T/b2" "$(rclone obscure 'correct horse')" >"$T/keys.conf"
+# keys K S: make_backup_remotes on a copy of the config, with those keys in the secrets
+keys() { in_setup "export RCLONE_CONFIG=$T/keys.conf; BACKUP_S3_ACCESS_KEY=$1 BACKUP_S3_SECRET_KEY=$2; make_backup_remotes; echo rc=\$?" >"$T/out" 2>&1; }
+kget() { RCLONE_CONFIG=$T/keys.conf conf_get backup "$1"; }
+pw=$(RCLONE_CONFIG=$T/keys.conf conf_get backup-crypt password)
+keys K1 S1
+check "an existing remote takes the keys from the secrets file" 'grep -q rc=0 "$T/out" && [[ $(kget access_key_id) == K1 && $(kget secret_access_key) == S1 ]] && grep -q "keys from" "$T/out"' "$(cat "$T/out")"
+keys K2 S2
+check "... and new keys replace them (rotation)" '[[ $(kget access_key_id) == K2 && $(kget secret_access_key) == S2 ]]' "$(cat "$T/out")"
+keys K2 S2
+check "... the same keys again: nothing written" '! grep -q "keys from" "$T/out"' "$(cat "$T/out")"
+keys "" ""
+check "no keys in the secrets file: the remote keeps its keys" 'grep -q rc=0 "$T/out" && [[ $(kget access_key_id) == K2 ]]' "$(cat "$T/out")"
+keys K3 ""
+check "only one of the two keys: refused, the old ones stay" '! grep -q rc=0 "$T/out" && grep -q BACKUP_S3_SECRET_KEY "$T/out" && [[ $(kget access_key_id) == K2 ]]' "$(cat "$T/out")"
+check "the backup passphrase is never replaced" '[[ $(RCLONE_CONFIG=$T/keys.conf conf_get backup-crypt password) == "$pw" ]]'
 
 summary

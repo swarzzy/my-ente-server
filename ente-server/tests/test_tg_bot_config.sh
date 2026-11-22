@@ -85,6 +85,10 @@ for a in "rm" "status;id" "" "../x" "--help" "STATUS"; do
   out=$("$T/helper" "$a" 2>&1); rc=$?; check "helper refuses '$a'" '[[ $rc -eq 2 && $out != *forwarded* ]]' "$out"
 done
 out=$("$T/helper" status check 2>&1); rc=$?; check "helper refuses two arguments" '[[ $rc -eq 2 && $out != *forwarded* ]]' "$out"
+printf '#!/bin/bash\necho "files: $ENV_FILE $SECRETS_FILE"\n' >"$T/fake-bot.sh"
+( cd "$T" && BOT_RUN="env -i" in_bot "$U" "" "BOT_SCRIPT=$T/fake-bot.sh bot_helper" ) >"$T/helper2"; chmod 755 "$T/helper2"
+out=$("$T/helper2" status 2>&1)
+check "helper runs the actions with the config and secrets files the install used" '[[ $out == "files: $(realpath "$T/env") $(realpath "$T/secrets")" ]]' "$out"
 check "helper does not pass the environment through (absolute paths only)" '! grep -qE "\\\$[A-Z_]+[^0-9]" <(grep -v "^#" "$T/helper" | grep -v "\\\$1\|\\\$#")' "$(cat "$T/helper")"
 
 echo "== failing actions still report"

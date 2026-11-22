@@ -51,6 +51,10 @@ echo new >"$T/new"
 out=$(in_setup 'overwrite_in_place "$T/new" /dev/full; echo "rc=$?"')
 check "overwrite_in_place on a full disk: dies, keeps the new content and says where" \
   '[[ $out == *"could not write /dev/full"*"its new content is in $T/new"* && $out != *"rc=0"* && $(cat "$T/new") == new ]]' "$out"
+out=$(in_setup 'cd "$T"; ENV_FILE=rel.env SECRETS_FILE=$T/s.secrets config_env')
+check "config_env: absolute paths of both files, for the units" '[[ $out == "ENV_FILE=$(realpath "$T")/rel.env SECRETS_FILE=$(realpath "$T")/s.secrets" ]]' "$out"
+out=$(in_setup 'ENV_FILE="$T/my env" config_env; echo "rc=$?"')
+check "config_env refuses a path a unit line would break on" '[[ $out == *"may only hold"* && $out != *"rc=0"* ]]' "$out"
 mkdir -p "$T/open"; cp "$HERE/../ente-setup.sh" "$HERE/../ente-ops.sh" "$T/open/"; chmod 777 "$T/open"
 mkdir -p "$T/ente"; echo "key: x" >"$T/ente/museum.yaml"
 out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$T/open/ente-setup.sh"; ENTE_DIR=$T/ente; cmd_backup_setup ) 2>&1 ); rc=$?

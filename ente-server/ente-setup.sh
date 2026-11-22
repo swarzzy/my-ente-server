@@ -2,7 +2,7 @@
 # ente-setup.sh - turn a fresh Debian 12/13 VPS into a backed-up Ente Photos server.
 # Photos live in an external S3 bucket (no local storage needed); a second S3 bucket holds the backup.
 # Usage: ente-setup.sh <command> (see COMMANDS below)
-# Config:  ente-setup.env next to this script (or ENV_FILE=/path). See ente-setup.env.example.
+# Config:  ente-setup.env next to this script (or ENV_FILE=/path; the timers and the bot keep the path setup used). See ente-setup.env.example.
 # Secrets: ente-setup.secrets next to it (or SECRETS_FILE=/path, or the environment). See ente-setup.secrets.example.
 set -euo pipefail
 # apt keyrings, source lists and unit files must be world-readable even when root's shell has a strict umask (apt verifies
@@ -87,6 +87,16 @@ overwrite_in_place() {
 
 # need_secret VAR...: die unless every named secret is set (secrets file or environment). Secrets are never logged.
 need_secret() { local v; for v in "$@"; do [[ -n ${!v:-} ]] || die "$v is not set: put it in $SECRETS_FILE"; done; }
+
+# config_env: "ENV_FILE=... SECRETS_FILE=...", the absolute paths of the config and secrets files this run reads. The timers and
+# the bot helper run the scripts later with it, so they read these files too, not the default ones next to the scripts.
+# Use as `ce=$(config_env)` (a failure inside a heredoc would go unnoticed).
+config_env() {
+  local e s
+  e=$(realpath -m -- "$ENV_FILE") s=$(realpath -m -- "$SECRETS_FILE")
+  [[ $e$s =~ ^[A-Za-z0-9_./@+-]+$ ]] || die "ENV_FILE and SECRETS_FILE paths may only hold letters, digits and _ . / @ + - ($e, $s)"
+  echo "ENV_FILE=$e SECRETS_FILE=$s"
+}
 
 # Source the config and secrets files, apply defaults, validate.
 load_env() {
@@ -758,17 +768,29 @@ except BaseException:
 ' "$conf" "$1")
 }
 
+# rclone_get REMOTE KEY: a value from rclone.conf (empty if not there)
+rclone_get() {
+  python3 -I -c '
+import configparser, sys
+cp = configparser.RawConfigParser(); cp.read(sys.argv[1]); print(cp.get(sys.argv[2], sys.argv[3], fallback=""))
+' "$(rclone config file | tail -1)" "$1" "$2"
+}
+
 # make_backup_remotes: backup (S3 bucket) and backup-crypt (encrypted config/ folder in it).
-# Existing remotes keep their keys and passphrase.
+# The backup bucket's keys from the secrets file always win, so new keys take effect on the next backup-setup; without
+# them an existing remote keeps its keys. backup-crypt keeps its passphrase: a new one could not read the backup.
 make_backup_remotes() {
   local obs
-  if ! rclone listremotes | grep -x 'backup:' >/dev/null; then
+  if [[ -n $BACKUP_S3_ACCESS_KEY || -n $BACKUP_S3_SECRET_KEY ]] || ! rclone listremotes | grep -x 'backup:' >/dev/null; then
     need_secret BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY
-    rclone_set backup <<EOF
+    if [[ $(rclone_get backup access_key_id) != "$BACKUP_S3_ACCESS_KEY" || $(rclone_get backup secret_access_key) != "$BACKUP_S3_SECRET_KEY" ]]; then
+      rclone_set backup <<EOF
 type=s3
 access_key_id=$BACKUP_S3_ACCESS_KEY
 secret_access_key=$BACKUP_S3_SECRET_KEY
 EOF
+      log "backup remote: keys from $SECRETS_FILE"
+    fi
   fi
   rclone_set backup <<EOF
 provider=$BACKUP_S3_PROVIDER
@@ -823,10 +845,7 @@ EOF
 # Museum never lists its bucket (it only touches the object keys its database names), so the folder is invisible to it.
 make_photo_crypt() {
   local pw
-  pw=$(python3 -I -c '
-import configparser, sys
-cp = configparser.RawConfigParser(); cp.read(sys.argv[1]); print(cp.get("backup-crypt", "password"))
-' "$(rclone config file | tail -1)") && [[ -n $pw ]] || die "backup-crypt remote has no passphrase; run make_backup_remotes first"
+  pw=$(rclone_get backup-crypt password) && [[ -n $pw ]] || die "backup-crypt remote has no passphrase; run make_backup_remotes first"
   rclone_set photo-crypt <<EOF
 type=crypt
 remote=${PHOTO_CFG_ROOT}config
@@ -888,6 +907,7 @@ refresh_backup_source() {
 # Install the backup run (ente-backup.sh, its config $BACKUP_ENV_FILE), its systemd service + daily 03:00 timer, and the
 # monthly verify.
 install_backup_units() {
+  local ce; ce=$(config_env)
   write_backup_env
   # the backup run itself is ente-backup.sh (standalone; this only installs it)
   [[ -f $SCRIPT_DIR/ente-backup.sh ]] || die "ente-backup.sh is missing next to $0 (copy the whole ente-server folder)"
@@ -928,6 +948,7 @@ $ALERT_ONFAIL
 [Service]
 Type=oneshot
 TimeoutStartSec=infinity
+Environment=$ce
 ExecStart=/bin/bash "$SCRIPT_DIR/ente-ops.sh" verify
 EOF
   write_file /etc/systemd/system/ente-verify.timer <<'EOF'
@@ -960,7 +981,7 @@ tg_api() { # tg_api METHOD [curl args...]: call the Bot API with TG_BOT_TOKEN
 ALERT_FILES=(/etc/systemd/system/ente-check.timer /etc/systemd/system/ente-check.service /etc/systemd/system/ente-alert@.service
   /etc/ente-alert.env /usr/local/bin/ente-alert /usr/local/bin/ente-alert-unit)
 setup_alerts() {
-  local f
+  local f ce
   if [[ -z $TG_CHAT_ID ]]; then
     ALERT_ONFAIL=
     for f in "${ALERT_FILES[@]}"; do
@@ -974,6 +995,7 @@ setup_alerts() {
   fi
   if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
   need_secret TG_BOT_TOKEN
+  ce=$(config_env)
   tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
   tg_api sendMessage --data-urlencode "chat_id=$TG_CHAT_ID" \
     --data-urlencode "text=🔔 Ente alerts on $(hostname) ($DOMAIN) are set up. Alerts arrive here when a backup or the daily check fails." 2>/dev/null ||
@@ -1029,6 +1051,7 @@ OnFailure=ente-alert@%n.service
 
 [Service]
 Type=oneshot
+Environment=$ce
 ExecStart=/bin/bash "$SCRIPT_DIR/ente-ops.sh" check
 EOF
   write_file /etc/systemd/system/ente-check.timer <<'EOF'
@@ -1053,8 +1076,10 @@ cmd_backup_setup() {
   load_env
   [[ -f $ENTE_DIR/museum.yaml ]] || die "run install first"
   # the verify timer (and the daily check, with alerts on) runs ente-ops.sh from this folder as root
-  root_only_writable "$SCRIPT_DIR/ente-ops.sh" "$SCRIPT_DIR/ente-setup.sh" "$ENV_FILE" ||
-    die "root's timers run the scripts in $SCRIPT_DIR: they must be root's alone (chown -R root: $SCRIPT_DIR; chmod -R go-w $SCRIPT_DIR)"
+  local own=("$SCRIPT_DIR/ente-ops.sh" "$SCRIPT_DIR/ente-setup.sh" "$ENV_FILE")
+  [[ ! -e $SECRETS_FILE ]] || own+=("$SECRETS_FILE")
+  root_only_writable "${own[@]}" ||
+    die "root's timers run the scripts in $SCRIPT_DIR and read $ENV_FILE and $SECRETS_FILE: they must be root's alone (chown -R root: $SCRIPT_DIR; chmod -R go-w $SCRIPT_DIR)"
   install_rclone
   make_backup_remotes
   make_photo_remote

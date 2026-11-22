@@ -86,8 +86,10 @@ bot_sudoers() {
   echo "$BOT_USER ALL=(root) NOPASSWD: $list"
 }
 
-# bot_helper: the root helper; checks the action name again and runs `ente-tg-bot.sh action NAME`.
+# bot_helper: the root helper; checks the action name again and runs `ente-tg-bot.sh action NAME`, with the config and secrets
+# files the install used.
 bot_helper() {
+  local ce; ce=$(config_env)
   cat <<EOF
 #!/bin/bash
 # Managed by ente-tg-bot.sh. The only command the Telegram bot may run as root (see $BOT_SUDOERS).
@@ -97,7 +99,7 @@ case \$1 in
   *) echo "unknown action" >&2; exit 2 ;;
 esac
 cd / || exit 1
-exec $BOT_RUN /bin/bash "$BOT_SCRIPT" action "\$1"
+exec $BOT_RUN /usr/bin/env $ce /bin/bash "$BOT_SCRIPT" action "\$1"
 EOF
 }
 

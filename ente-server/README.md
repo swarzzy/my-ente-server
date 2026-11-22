@@ -100,6 +100,9 @@ alerts you about the missing ping; the bot's `/status` shows it).
 `backup-setup` refuses to touch a backup bucket that already holds another Ente instance's backup, one the passphrase cannot read, or one it cannot list.
 The backup never deletes, so give the backup bucket a key limited to that bucket without delete permission (B2: no `deleteFiles`): then
 the server cannot destroy the backup. Do the clean-up above with a separate key, from your PC.
+New backup bucket keys: put them in `ente-setup.secrets` and re-run `backup-setup`, then revoke the old key. (Photo bucket keys:
+`install`.) Moved `ente-setup.env` or `ente-setup.secrets` (`ENV_FILE`/`SECRETS_FILE`)? Re-run `backup-setup` and, if installed,
+`ente-tg-bot.sh install`: the timers and the bot keep the paths they were set up with.
 
 What survives what (you also need each provider's account to create new keys, and your Ente password to log in):
 
