@@ -19,7 +19,7 @@ run() {
     set +e
     load_env
     sleep() { :; }
-    systemctl() { case "$*" in "is-active --quiet caddy") [[ -z ${CADDY_DOWN:-} ]] ;; esac; }
+    systemctl() { case "$*" in "is-active --quiet caddy") [[ -z ${CADDY_DOWN:-} ]] ;; "is-enabled --quiet ente-pg-update.timer") [[ -z ${PG_TIMER_OFF:-} ]] ;; esac; }
     dc() { [[ $1 == ps && " ${SVC_DOWN:-} " != *" $3 "* ]] && echo "cid-$3"; return 0; }
     docker() {
       case "$*" in
@@ -72,6 +72,8 @@ SVC_DOWN=web run check_services
 check "web not running: one FAIL" 'one_fail "web not running"' "$(cat "$T/out")"
 SVC_BAD=museum run check_services
 check "museum unhealthy: one FAIL" 'one_fail "museum unhealthy"' "$(cat "$T/out")"
+PG_TIMER_OFF=1 run check_services
+check "the Postgres update timer is off: FAIL" 'one_fail "ente-pg-update.timer not enabled"' "$(cat "$T/out")"
 IMG_AGE=90 run check_services
 check "images 90 days old: a WARN for museum and for web (not postgres), no FAIL" \
   '[[ $(fails) -eq 0 && $(grep -c "WARN.*image is 90 days old" "$T/out") -eq 2 ]]' "$(cat "$T/out")"

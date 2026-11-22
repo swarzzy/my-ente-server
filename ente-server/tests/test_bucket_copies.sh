@@ -22,6 +22,13 @@ check "backup-setup installs ente-backup.sh unchanged, and its env file" \
 check "the verify unit reads the config and secrets files backup-setup used" \
   'grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T")/none" "$T/root/etc/systemd/system/ente-verify.service"' \
   "$(grep Environment "$T/root/etc/systemd/system/ente-verify.service")"
+check "backup-setup installs the weekly Postgres and rclone updates, with the same config files" \
+  'grep -qx "ExecStart=/bin/bash \"$HERE/../ente-ops.sh\" pg-update" "$T/root/etc/systemd/system/ente-pg-update.service" &&
+   grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T")/none" "$T/root/etc/systemd/system/ente-pg-update.service" &&
+   grep -qx "OnCalendar=Sun \*-\*-\* 05:00:00" "$T/root/etc/systemd/system/ente-pg-update.timer" &&
+   grep -qx "ExecStart=/bin/bash \"$HERE/../ente-ops.sh\" rclone-update" "$T/root/etc/systemd/system/ente-rclone-update.service" &&
+   grep -qx "OnCalendar=Sun \*-\*-\* 05:15:00" "$T/root/etc/systemd/system/ente-rclone-update.timer"' \
+  "$(cat "$T/root/etc/systemd/system/ente-pg-update."* 2>&1)"
 check "the env file names the config copy's folder" 'grep -qx "PHOTO_CFG_DIR=\"ente-backup-config\"" "$T/root/etc/ente-backup.env"'
 ( env "${BACKUP_ENV[@]}" BACKUP_ROOT= ENTE_BACKUP_ENV=$T/none bash "$HERE/../ente-backup.sh" ) >"$T/out" 2>&1; RC=$?
 check "without its config the backup stops at once and says so" '((RC != 0)) && grep -q "BACKUP_ROOT: not set" "$T/out"' "$(cat "$T/out")"

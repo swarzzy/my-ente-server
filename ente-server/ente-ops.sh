@@ -3,6 +3,8 @@
 # Usage: ente-ops.sh <command> (see OPS_COMMANDS below)
 #   check       read-only health report; exit 1 on any FAIL (daily by ente-check.timer when Telegram alerts are on)
 #   verify      deep test that the S3 backup restores (monthly by ente-verify.timer)
+#   pg-update   Postgres's minor releases (security fixes), weekly by ente-pg-update.timer
+#   rclone-update  rclone's new releases (rclone.org's binary, which apt does not update), weekly by ente-rclone-update.timer
 # Config and secrets: those of ente-setup.sh. Needs ente-setup.sh next to it (its helpers).
 OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=ente-setup.sh
@@ -42,7 +44,7 @@ hours_since() { echo $((($(date +%s) - $(date -d "$1" +%s)) / 3600)); }
 container_state() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo gone; }
 
 check_services() {
-  local s cid st i img days
+  local s cid st i img days v
   echo "== services"
   for s in museum web postgres; do
     cid=$(dc ps -q "$s" 2>/dev/null || true)
@@ -55,11 +57,14 @@ check_services() {
     done
     if [[ $st != healthy && $st != running ]]; then bad "$s $st"; continue; fi
     img=$(docker image inspect -f '{{.Created}}' "$(docker inspect -f '{{.Image}}' "$cid")" 2>/dev/null || true)
-    if [[ $s == postgres || -z $img ]]; then ok "$s $st"; continue; fi
+    if [[ $s == postgres ]]; then v=$(pg_version "$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)"); ok "$s $st${v:+ ($v)}"; continue; fi
+    if [[ -z $img ]]; then ok "$s $st"; continue; fi
     ok "$s $st (image built ${img:0:10})"
     days=$(($(hours_since "$img") / 24))
     ((days <= IMAGE_MAX_DAYS)) || warn "$s image is $days days old: read Ente's release notes, then run ente-setup.sh update"
   done
+  systemctl is-enabled --quiet ente-pg-update.timer 2>/dev/null ||
+    bad "ente-pg-update.timer not enabled: Postgres gets no security updates (run ente-setup.sh backup-setup)"
   if internal_locked; then ok "sign-ups closed"
   elif [[ -n $(internal_admin) ]]; then bad "sign-ups are OPEN although lockdown was done (re-run lockdown)"
   else warn "sign-ups are open: run lockdown once the family has signed up"; fi
@@ -162,6 +167,8 @@ check_backup() {
     bad "the backup copies ${e:-?}/$b, but museum uses $PHOTO_ENDPOINT/$PHOTO_BUCKET: run ente-setup.sh backup-setup"
   fi
   if [[ $(systemctl show ente-backup.service -p ActiveState --value 2>/dev/null) == activating ]]; then running=1; ok "a backup is running now"; fi
+  systemctl is-enabled --quiet ente-rclone-update.timer 2>/dev/null ||
+    bad "ente-rclone-update.timer not enabled: rclone gets no updates (run ente-setup.sh backup-setup)"
   stamp_check last-ok-s3 "last good backup" "$running"
   stamp_check last-ok-photo-config "config copy in the photo bucket" "$running"
   s=$(cat "$BACKUP_STATE"/verify-ok 2>/dev/null || true)
@@ -285,8 +292,77 @@ cmd_verify() {
   echo "backup verified"
 }
 
+# ---------------------------------------------------------------- pg-update
+# pg_version IMAGE: the Postgres version an image holds (its PG_VERSION), e.g. 15.14
+pg_version() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^PG_VERSION=//p' || true; }
+# pg-update: Postgres's minor releases (security and bug fixes; same data format, so no dump and restore), weekly by
+# ente-pg-update.timer. Pulls the image compose names (postgres:15: never a new major version). If it is a newer build than the
+# running one, and the last good backup is less than 36 h old (the rollback point), recreates postgres, restarts museum (fresh
+# database connections) and checks that it answers. Waits for next week while a backup or verify runs (both use the database).
+cmd_pg_update() {
+  load_env
+  local cid img run new s u
+  cid=$(dc ps -q postgres 2>/dev/null || true)
+  [[ -n $cid ]] || die "postgres is not running"
+  img=$(docker inspect -f '{{.Config.Image}}' "$cid") || die "cannot inspect postgres"
+  run=$(docker inspect -f '{{.Image}}' "$cid") || die "cannot inspect postgres"
+  dc pull -q postgres || die "cannot pull $img"
+  new=$(docker image inspect -f '{{.Id}}' "$img") || die "cannot inspect $img"
+  if [[ $new == "$run" ]]; then log "postgres $(pg_version "$run") is current"; return 0; fi
+  for u in ente-backup.service ente-verify.service; do
+    if [[ $(systemctl show "$u" -p ActiveState --value 2>/dev/null) == activating ]]; then
+      log "$u is running: postgres $(pg_version "$new") waits for next week"; return 0
+    fi
+  done
+  s=$(cat "$BACKUP_STATE/last-ok-s3" 2>/dev/null || true)
+  [[ -n $s ]] && (($(hours_since "$s") < 36)) ||
+    die "postgres $(pg_version "$run") -> $(pg_version "$new") not applied: no good backup in the last 36 h (the rollback point)"
+  if [[ $(pg_version "$run") == "$(pg_version "$new")" ]]; then log "postgres $(pg_version "$new"): a rebuilt image (its base system's fixes)"
+  else log "postgres $(pg_version "$run") -> $(pg_version "$new")"; fi
+  dc up -d postgres
+  wait_healthy postgres 120
+  dc restart museum >/dev/null
+  wait_healthy museum
+  url_ok http://127.0.0.1:8080/ping 10 || die "museum /ping fails after the postgres update"
+  docker image prune -f >/dev/null
+  log "postgres updated to $(pg_version "$new")"
+}
+
+# ---------------------------------------------------------------- rclone-update
+# rclone_ver: the installed rclone's version, e.g. v1.72.0
+rclone_ver() { rclone version 2>/dev/null | awk 'NR == 1 {print $2}' || true; }
+# rclone-update: rclone from rclone.org (its install script, as install_rclone does) is a plain binary apt never updates, so
+# `rclone selfupdate` (it checks the download's checksum) runs weekly by ente-rclone-update.timer. The new version must still
+# read both buckets (the backup bucket's encrypted config, the photo bucket), else the previous binary goes back and it fails
+# (an alert). The previous binary stays next to it (.prev) for a rollback by hand. Waits while a backup or verify runs.
+# An rclone from a Debian package is left to apt.
+cmd_rclone_update() {
+  load_env
+  local bin old new u
+  bin=$(command -v rclone) || die "rclone is not installed"
+  bin=$(readlink -f "$bin")
+  if dpkg -S "$bin" >/dev/null 2>&1; then log "rclone comes from a Debian package: apt updates it"; return 0; fi
+  for u in ente-backup.service ente-verify.service; do
+    if [[ $(systemctl show "$u" -p ActiveState --value 2>/dev/null) == activating ]]; then
+      log "$u is running: the rclone update waits for next week"; return 0
+    fi
+  done
+  old=$(rclone_ver)
+  # the running version, kept aside: it becomes .prev only if a new one arrives (a run with nothing new keeps the old .prev)
+  cp -p "$bin" "$bin.old" || { rm -f "$bin.old"; die "cannot keep a copy of $bin (disk full?)"; }
+  rclone selfupdate --stable >/dev/null 2>&1 || { rm -f "$bin.old"; die "rclone selfupdate failed (still $old)"; }
+  new=$(rclone_ver)
+  if [[ $new == "$old" ]]; then rm -f "$bin.old"; log "rclone $old is current"; return 0; fi
+  if ! rclone lsf backup-crypt: --max-depth 1 >/dev/null 2>&1 || ! rclone lsf "ente-s3:$PHOTO_BUCKET" --max-depth 1 >/dev/null 2>&1; then
+    mv -f "$bin.old" "$bin"
+    die "rclone $new cannot read the buckets: back to $(rclone_ver)"
+  fi
+  mv -f "$bin.old" "$bin.prev"
+  log "rclone $old -> $new (the previous one is $bin.prev)"
+}
+
 # ---------------------------------------------------------------- main
-OPS_COMMANDS="check verify"
+OPS_COMMANDS="check verify pg-update rclone-update"
 ops_usage() { echo "usage: $0 {${OPS_COMMANDS// /|}}" >&2; exit 2; }
 
 # sourced (tests): define the functions only

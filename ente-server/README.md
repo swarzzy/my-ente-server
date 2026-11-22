@@ -200,12 +200,17 @@ server, so it cannot prove that your own copies of them work: that is what the y
 The Ente images (`ghcr.io/ente/server`, `ghcr.io/ente/web`) have no version tags, so the script pins the exact builds by digest in
 `/opt/my-ente/image-pins` (written into `compose.override.yaml`, carried by the backup). Nothing changes version by itself; `install`
 re-runs keep the pins, `restore` runs the builds that made the dump, and `check` shows their build dates (a WARN after 60 days).
-`postgres:15` is not pinned, so its minor fixes arrive with `update`.
+`postgres:15` is not pinned: its minor releases (security fixes, same data format) install themselves, Sundays at 05:00
+(`ente-pg-update.timer`, installed by `backup-setup`; by hand: `sudo ./ente-ops.sh pg-update`). It applies a newer 15.x only after a
+good backup in the last 36 h (else it fails, with an alert), waits a week while a backup or verify runs, recreates postgres,
+restarts museum and checks it answers. Never a new major version. `update` also brings them.
 
 `sudo ./ente-setup.sh update`: runs a backup first (rollback point; aborts if it fails), moves the pins to the current `latest`,
 recreates the changed containers, prunes. Read Ente's release notes first. OS updates install themselves, and so do those of Docker,
-Caddy and AmneziaWG (their repositories are allowed origins; a Docker upgrade restarts the containers for a few seconds). rclone does
-not: `sudo rclone selfupdate` now and then.
+Caddy and AmneziaWG (their repositories are allowed origins; a Docker upgrade restarts the containers for a few seconds).
+rclone (rclone.org's binary, which apt does not update) updates itself Sundays at 05:15 (`ente-rclone-update.timer`, installed by
+`backup-setup`; by hand: `sudo ./ente-ops.sh rclone-update`): `rclone selfupdate`, then the new version must read both buckets, else
+the previous one goes back and you get an alert. The previous binary stays as `/usr/bin/rclone.prev`.
 
 Going back after a bad update: the previous pins are in `/opt/my-ente/image-pins.prev`. Copy that file over `image-pins` and run
 `install`. If the new server version already migrated the database, the old one may not start: then also restore the dump that
@@ -310,7 +315,7 @@ Each suite also runs on its own:
 | `bash tests/test_lockdown.sh` | anywhere (Postgres stubbed) | `lockdown`: oldest user becomes admin only after `y`, re-runs change nothing, install keeps the block, a hand-made `internal:` is refused, edited in place |
 | `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down; the test message of `backup-setup`; emptying `TG_CHAT_ID` removes every alert file |
 | `sudo bash tests/test_vpn_config.sh` | the server, after `ente-vpn.sh install` | the VPN config generator: keys pair up, same obfuscation on both sides within AmneziaWG's rules, mode 600, never overwrites, refuses a busy port |
-| `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) or a failed backup first changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev`; museum not answering afterwards points there; pinned builds gone from the registry are re-pinned to the running or latest ones |
+| `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) or a failed backup first changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev`; museum not answering afterwards points there; pinned builds gone from the registry are re-pinned to the running or latest ones; `pg-update` and `rclone-update`: current version left alone, a newer one applied in order (postgres, museum restart, check), refused without a recent good backup (Postgres), postponed while a backup or verify runs, a failed download or a silent museum, an rclone that cannot read a bucket rolled back, a packaged rclone left to apt |
 | `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, the bucket taken from `museum.yaml`, the rollback of a failed install or switch, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
 | `sudo bash tests/tg_bot_e2e.sh` | the server, `TG_BOT_USER_ID` set | the real bot as its real user with the real sudo rule and actions, against a fake Telegram (`tests/fake_telegram.py`): every command, strangers, groups, old messages, privileges, uninstall; runs a real backup |

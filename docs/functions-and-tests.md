@@ -71,6 +71,8 @@ Nothing is sent while all is well. Every FAIL is something that can break by its
 | Function | What it does | What to test |
 | --- | --- | --- |
 | Daily check (`ente-ops.sh check`, 09:00) | Read-only report, exit 1 on any FAIL. Services: museum, web, postgres healthy; sign-ups closed after lockdown; Ente images under 60 days (WARN). Web: Caddy up, api/web/albums (and auth/locker when in `WEB_APPS`) answer, certificates valid 20+ days. Security: see that section. Photo bucket reachable, CORS allowed. Add-ons' own checks. Backup: last good backup and config copy under 36 h, verify under 45 days, no unfinished restore. System: disk (WARN 80%, FAIL 90%), OOM kills in 24 h, reboot pending over a day (WARN). | Each fault gives exactly one FAIL; a healthy server none; a running first backup only WARNs. |
+| Weekly Postgres update (`ente-ops.sh pg-update`, Sun 05:00) | Applies a newer `postgres:15` build (minor releases: security fixes): recreates postgres, restarts museum, checks `/ping`. Needs a good backup in the last 36 h; waits while a backup or verify runs. `check` fails if its timer is off. | Current build untouched; no recent backup refused (fails); running backup or verify postponed; failed download changes nothing. |
+| Weekly rclone update (`ente-ops.sh rclone-update`, Sun 05:15) | `rclone selfupdate` of rclone.org's binary (apt does not update it); the new version must list both buckets, else the previous one goes back and it fails. Keeps `rclone.prev`. Skips a packaged rclone; waits while a backup or verify runs. `check` fails if its timer is off. | New release kept or rolled back; failed selfupdate changes nothing; packaged rclone untouched. |
 | Monthly verify (`ente-ops.sh verify`, 1st, 04:30) | Photos match the backup by checksum (size where no common checksum); both encrypted config copies decrypt and equal the local files; the newest dump restores into a scratch database with tables, users and files present; an INFO line on the backup bucket's growth. Changes nothing. | Corrupt dump, empty tables, damaged photo, missing config file each give one FAIL; a table added by an update is no false FAIL. |
 | Alert: backup failed | `❌ Backup failed on <host>` with its ERROR lines (or the last 15 log lines). | Right title and lines; broken UTF-8 and long logs still send. |
 | Alert: check or verify found problems | `⚠️ Daily check found problems on <host>` or `⚠️ Monthly backup verify found problems on <host>`, one ❌ line per problem. | Only FAIL lines, no OK, WARN or verdict noise. |
@@ -110,12 +112,12 @@ All suites live in `ente-server/tests/` and must pass on the server before a com
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |
-| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins | 54 (+3 on the server) |
-| `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 37 |
-| `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 38 |
-| `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation | 61 |
+| `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins | 56 (+3 on the server) |
+| `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 38 |
+| `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 39 |
+| `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation, timer units | 62 |
 | `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off | 21 |
-| `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning | 22 |
+| `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning; `pg-update`, `rclone-update` | 39 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
 | `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |

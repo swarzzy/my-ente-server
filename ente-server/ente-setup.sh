@@ -921,8 +921,9 @@ refresh_backup_source() {
   write_backup_env
 }
 
-# Install the backup run (ente-backup.sh, its config $BACKUP_ENV_FILE), its systemd service + daily 03:00 timer, and the
-# monthly verify.
+# Install the backup run (ente-backup.sh, its config $BACKUP_ENV_FILE), its systemd service + daily 03:00 timer, the
+# monthly verify, the weekly Postgres minor update (ente-ops.sh pg-update: it needs a recent good backup) and the weekly rclone
+# update (ente-ops.sh rclone-update).
 install_backup_units() {
   local ce; ce=$(config_env)
   write_backup_env
@@ -979,8 +980,54 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  write_file /etc/systemd/system/ente-pg-update.service <<EOF
+[Unit]
+Description=Postgres minor-release update (ente-ops.sh pg-update)
+After=docker.service network-online.target
+Wants=network-online.target
+$ALERT_ONFAIL
+
+[Service]
+Type=oneshot
+Environment=$ce
+ExecStart=/bin/bash "$SCRIPT_DIR/ente-ops.sh" pg-update
+EOF
+  write_file /etc/systemd/system/ente-pg-update.timer <<'EOF'
+[Unit]
+Description=Weekly Postgres minor-release update
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  write_file /etc/systemd/system/ente-rclone-update.service <<EOF
+[Unit]
+Description=rclone update (ente-ops.sh rclone-update)
+After=network-online.target
+Wants=network-online.target
+$ALERT_ONFAIL
+
+[Service]
+Type=oneshot
+Environment=$ce
+ExecStart=/bin/bash "$SCRIPT_DIR/ente-ops.sh" rclone-update
+EOF
+  write_file /etc/systemd/system/ente-rclone-update.timer <<'EOF'
+[Unit]
+Description=Weekly rclone update
+
+[Timer]
+OnCalendar=Sun *-*-* 05:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   systemctl daemon-reload
-  systemctl enable --now ente-backup.timer ente-verify.timer >/dev/null 2>&1
+  systemctl enable --now ente-backup.timer ente-verify.timer ente-pg-update.timer ente-rclone-update.timer >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- telegram alerts

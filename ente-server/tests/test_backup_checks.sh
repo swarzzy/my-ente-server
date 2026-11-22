@@ -94,6 +94,7 @@ cb_run() {
     systemctl() {
       case "$*" in
         "is-enabled --quiet ente-verify.timer") [[ -z ${NO_VERIFY_TIMER:-} ]] ;;
+        "is-enabled --quiet ente-rclone-update.timer") [[ -z ${NO_RCLONE_TIMER:-} ]] ;;
         *ActiveState*) if [[ -n ${RUNNING:-} ]]; then echo activating; else echo inactive; fi ;;
       esac
     }
@@ -121,6 +122,8 @@ fresh; ago '50 days' >"$T/state/verify-ok"; cb_run
 check "the last good verify is 50 days old: FAIL" 'one_fail "verify is older than 45 days"' "$(grep FAIL "$T/out")"
 fresh; rm "$T/state/verify-ok"; cb_run
 check "verify has never passed: only a WARN" '[[ $(fails) -eq 0 ]] && grep -q "WARN  monthly verify has not passed" "$T/out"' "$(cat "$T/out")"
+fresh; NO_RCLONE_TIMER=1 cb_run
+check "the rclone update timer is off: FAIL" 'one_fail "ente-rclone-update.timer not enabled"' "$(grep FAIL "$T/out")"
 fresh; NO_VERIFY_TIMER=1 cb_run
 check "the verify timer is off: FAIL" 'one_fail "ente-verify.timer not enabled"' "$(grep FAIL "$T/out")"
 NO_ALERTS= cb_run
