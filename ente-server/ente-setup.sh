@@ -112,7 +112,8 @@ load_env() {
   SSH_PORT=${SSH_PORT:-22}; HC_URL=${HC_URL:-}; RESTORE=${RESTORE:-no}; CSP_REPORT_ONLY=${CSP_REPORT_ONLY:-no}
   S3_PROVIDER=${S3_PROVIDER:-Other}; S3_ENDPOINT=${S3_ENDPOINT:-}; S3_REGION=${S3_REGION:-}; S3_BUCKET=${S3_BUCKET:-}
   WEB_APPS=${WEB_APPS:-}; web_apps_ok
-  S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-$(web_hosts | sed "s|^|https://|; s|\$|.$DOMAIN|" | paste -sd,)}
+  # the web apps, and ente://app: the desktop apps' origin (without it they cannot read the ETag and block uploads over 20 MB)
+  S3_CORS_ORIGINS=${S3_CORS_ORIGINS:-$( { web_hosts | sed "s|^|https://|; s|\$|.$DOMAIN|"; echo ente://app; } | paste -sd,)}
   BACKUP_S3_PROVIDER=${BACKUP_S3_PROVIDER:-Other}; BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
   BACKUP_S3_REGION=${BACKUP_S3_REGION:-}; BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
   AWG_PORT=${AWG_PORT:-}; S3_PROXY_HOST=${S3_PROXY_HOST:-}; TG_CHAT_ID=${TG_CHAT_ID:-}

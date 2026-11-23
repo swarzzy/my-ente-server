@@ -84,8 +84,14 @@ out=$( { cat "$T/base.env"; echo "WEB_APPS='auth locker'"; } >"$T/env"; ( ENV_FI
   write_file() { cat >"$1"; }; dc() { :; }; write_override; cat "$T/wo/compose.override.yaml" ) 2>&1 )
 check "... its apps are published on 127.0.0.1 only, through compose.override.yaml" \
   'grep -qx "      - 127.0.0.1:3003:3003 # auth web app" <<<"$out" && grep -qx "      - 127.0.0.1:3009:3009 # locker web app" <<<"$out"' "$out"
-check "... and may upload to the photo bucket (CORS)" \
-  '[[ $out == *"cors=https://web.photos.example.org,https://albums.photos.example.org,https://auth.photos.example.org,https://locker.photos.example.org"* ]]' "$out"
+check "... and may upload to the photo bucket (CORS), like the desktop apps (ente://app)" \
+  '[[ $out == *"cors=https://web.photos.example.org,https://albums.photos.example.org,https://auth.photos.example.org,https://locker.photos.example.org,ente://app"* ]]' "$out"
+out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; load_env; echo "cors=$S3_CORS_ORIGINS" ) 2>&1 )
+check "CORS default without WEB_APPS: web, albums and the desktop apps" \
+  '[[ $out == *"cors=https://web.photos.example.org,https://albums.photos.example.org,ente://app" ]]' "$out"
+out=$( { cat "$T/base.env"; echo "S3_CORS_ORIGINS=*"; } >"$T/env"; ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"
+  load_env; echo "cors=$S3_CORS_ORIGINS" ) 2>&1 )
+check "S3_CORS_ORIGINS in the env file replaces the default as given" '[[ $out == *"cors=*" ]]' "$out"
 out=$( ( ENV_FILE=$T/base.env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; load_env; PINS=$T/none ENTE_DIR=$T/wo
   write_file() { cat >"$1"; }; dc() { :; }; write_override; cat "$T/wo/compose.override.yaml" ) 2>&1 )
 check "without WEB_APPS the override publishes nothing extra" '! grep -q "ports:" <<<"$out"' "$out"
