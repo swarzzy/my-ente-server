@@ -104,7 +104,7 @@ All three are optional and installed separately; each has `install`, `uninstall`
 | Add-on | What it does | What to test |
 | --- | --- | --- |
 | S3 proxy (`ente-s3-proxy.sh install / on / off`) | For devices that reach the bucket badly: a link rewriter in front of museum swaps the bucket host in its signed links for `S3_PROXY_HOST`; Caddy forwards only the bucket path and the apps' methods to the real endpoint with its own Host, so signatures stay valid. Bucket host and name come from `museum.yaml`. If the rewriter dies, Caddy falls back to museum. | `on` self-tests before going live; any failed step rolls everything back; links handed out while on keep working after off; uploads incl. multipart work both ways (browser test). |
-| Telegram bot (`ente-tg-bot.sh install`) | One person's commands by private message: `/status` (four or five lines), `/check`, `/backup`, `/proxy [on\|off]`. Runs as its own user, long-polls (no open port); may run as root only six fixed actions through a sudo rule. Strangers are ignored, the owner told at most hourly; commands older than a minute are skipped. | Only the owner's private messages act; injection refused; replies short with ✅/❌ titles; an action survives a bot restart; uninstall removes user, rule and token. |
+| Telegram bot (`ente-tg-bot.sh install`) | One person's commands by private message: `/status` (five or six lines, incl. both buckets' usage, measured by each good backup), `/check`, `/backup`, `/proxy [on\|off]`. Runs as its own user, long-polls (no open port); may run as root only six fixed actions through a sudo rule. Strangers are ignored, the owner told at most hourly; commands older than a minute are skipped. | Only the owner's private messages act; injection refused; replies short with ✅/❌ titles; an action survives a bot restart; uninstall removes user, rule and token. |
 | AmneziaWG VPN (`ente-vpn.sh install`) | An obfuscated WireGuard VPN on `AWG_PORT` (UDP 1024–65535) with one shared client config; NAT, IPv4 only. Independent of Ente. | Self-test from a network namespace: handshake, exit address, no IPv6 leak, 20 MB download. |
 
 ## Tests
@@ -116,13 +116,13 @@ All suites live in `ente-server/tests/` and must pass on the server before a com
 | `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins, the bucket CORS origins | 59 (+3 on the server) |
 | `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 38 |
 | `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults and growth line, backup part of `check`, the backup following a bucket switch | 41 |
-| `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation, timer units | 62 |
+| `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation, timer units | 63 |
 | `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off, news unit | 22 |
 | `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning; `pg-update`, `rclone-update`, `news` | 45 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
 | `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |
-| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, sudo rule, every reply (stubbed server) | 69 |
+| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, sudo rule, every reply (stubbed server) | 71 |
 | `test_vpn_config.sh` | server, after VPN install | VPN key and obfuscation config | 13 |
 | `python3 -m unittest discover -s tests` | anywhere | link rewriter, bot against a fake Telegram | 49 |
 | `proxy_e2e.sh` | server | the proxy end to end, real signed links | 42 |

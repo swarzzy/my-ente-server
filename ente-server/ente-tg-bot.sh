@@ -128,7 +128,23 @@ dur() {
 }
 ago() { echo "$(dur $(($(date +%s) - $(date -d "$1" +%s 2>/dev/null || date +%s)))) ago"; }
 
-# act_status: four or five short lines (proxy only when installed): services, backup, checks, system, proxy. ⚠️/❌ mark what needs a look.
+# iec BYTES: 845.0MiB. bucket_usage FILE: the bucket line of /status from what the last good backup measured.
+iec() { numfmt --to=iec-i --suffix=B --format=%.1f "$1" 2>/dev/null || echo "$1 B"; }
+bucket_usage() {
+  local k bytes count d='' p='' b=''
+  while read -r k bytes count; do
+    case $k in
+      date) d=$bytes ;;
+      photo) p="photos $(iec "$bytes") ($count files)" ;;
+      backup) b="backup $(iec "$bytes") ($count files)" ;;
+    esac
+  done < <(cat "$1" 2>/dev/null)
+  if [[ -n $d && -n $p && -n $b ]]; then echo "🪣 Buckets: $p · $b · measured $(ago "$d")"
+  else echo "🪣 Buckets: not measured yet (the next good backup does)"; fi
+}
+
+# act_status: five or six short lines (proxy only when installed): services, backup, checks, system, buckets, proxy. ⚠️/❌ mark
+# what needs a look.
 act_status() {
   local s cid st down='' a b last line ts res nxt
   local state=$BACKUP_STATE
@@ -161,6 +177,7 @@ act_status() {
   if [[ -e $state/verify-ok ]]; then line+=" · verify: passed $(ago "$(cat "$state/verify-ok")")"; else line+=" · verify: not passed yet"; fi
   echo "$line"
   echo "🖥 Disk $(df -h / | awk 'NR == 2 {print $5 " used (" $4 " free)"}') · RAM $(free -m | awk '/^Mem:/ {print $7}') MB free · up $(dur "$(cut -d. -f1 /proc/uptime)")$([[ -e $REBOOT_FLAG ]] && echo ' · reboot pending')"
+  bucket_usage "$state/usage"
   [[ ! -e $CADDY_SITES/s3-proxy.caddy ]] || echo "🔀 S3 proxy: $([[ $(cat "$PROXY_STATE" 2>/dev/null) == on ]] && echo on || echo off)"
 }
 

@@ -131,26 +131,32 @@ act() {
 stamps() { date -Is -d "$1 ago" >"$T/st/last-ok-s3"; date -Is -d "${2:-$1} ago" >"$T/st/last-ok-photo-config"; date -Is -d "3 days ago" >"$T/st/verify-ok"; }
 out=$(act 'dur 45; dur 600; dur 7200; dur 200000' | tr '\n' '|'); check "dur: s, min, h, days" '[[ $out == "45 s|10 min|2 h|2 days|" ]]' "$out"
 stamps "2 hours"; rm -f "$T/st/hc-fail" "$T/reboot"
+printf 'date %s\nphoto 886046720 360\nbackup 2684354560 371\n' "$(date -Is -d "3 hours ago")" >"$T/st/usage"
 out=$(act act_status)
-check "status, all well: four lines, no warnings" '[[ $(wc -l <<<"$out") -eq 4 && $out != *"⚠️"* && $out != *"❌"* ]]' "$out"
+check "status, all well: five lines, no warnings" '[[ $(wc -l <<<"$out") -eq 5 && $out != *"⚠️"* && $out != *"❌"* ]]' "$out"
 check "... services" '[[ $(sed -n 1p <<<"$out") == "✅ Ente is up (museum, web, postgres)" ]]' "$out"
 check "... backup: last good and next run" '[[ $(sed -n 2p <<<"$out") == "💾 Backup: last good 2 h ago · next Tue 03:00" ]]' "$out"
 check "... check and verify" '[[ $(sed -n 3p <<<"$out") == "🩺 Check: passed 5 h ago · verify: passed 3 days ago" ]]' "$out"
 check "... disk, RAM, uptime" '[[ $(sed -n 4p <<<"$out") == "🖥 Disk 26% used (17G free) · RAM 1408 MB free · up "* ]]' "$out"
+check "... both buckets as the last good backup measured them" \
+  '[[ $(sed -n 5p <<<"$out") == "🪣 Buckets: photos 845.0MiB (360 files) · backup 2.5GiB (371 files) · measured 3 h ago" ]]' "$out"
 touch "$T/sites/s3-proxy.caddy"; echo on >"$T/proxy-state"; touch "$T/reboot"; date >"$T/st/hc-fail"
 out=$(EXITED=web DOWN=postgres BRES=exit-code CRES=exit-code act act_status)
 check "status, problems: a container exited, one missing" '[[ $(sed -n 1p <<<"$out") == "❌ Down: web (exited), postgres (not running)" ]]' "$out"
 check "... a failed last run and a failed heartbeat ping" '[[ $(sed -n 2p <<<"$out") == "💾 Backup: last good 2 h ago, the last run failed · next Tue 03:00 · heartbeat ping failed" ]]' "$out"
 check "... a check that found problems" '[[ $(sed -n 3p <<<"$out") == "⚠️ Check: found problems 5 h ago (/check)"* ]]' "$out"
-check "... a pending reboot, and the proxy" '[[ $(sed -n 4p <<<"$out") == *" · reboot pending" && $(sed -n 5p <<<"$out") == "🔀 S3 proxy: on" ]]' "$out"
+check "... a pending reboot, and the proxy last" '[[ $(sed -n 4p <<<"$out") == *" · reboot pending" && $(sed -n 6p <<<"$out") == "🔀 S3 proxy: on" ]]' "$out"
 rm -f "$T/sites/s3-proxy.caddy" "$T/reboot" "$T/st/hc-fail"
 stamps "2 hours" "40 hours"; out=$(act act_status | sed -n 2p)
 check "status: the older part of the backup counts, over 36 h is a warning" '[[ $out == "⚠️ Backup: last good 40 h ago · next Tue 03:00" ]]' "$out"
 stamps "40 hours" "2 hours"; out=$(act act_status | sed -n 2p)
 check "... whichever part it is" '[[ $out == "⚠️ Backup: last good 40 h ago · next Tue 03:00" ]]' "$out"
-rm "$T/st/last-ok-photo-config" "$T/st/verify-ok"; out=$(BTS= CTS= act act_status)
-check "status after a fresh install: no good backup yet, nothing run" \
-  '[[ $(sed -n 2p <<<"$out") == "⚠️ Backup: no good backup yet · next Tue 03:00" && $(sed -n 3p <<<"$out") == "🩺 Check: not run since boot · verify: not passed yet" ]]' "$out"
+rm "$T/st/last-ok-photo-config" "$T/st/verify-ok" "$T/st/usage"; out=$(BTS= CTS= act act_status)
+check "status after a fresh install: no good backup yet, nothing run, buckets not measured" \
+  '[[ $(sed -n 2p <<<"$out") == "⚠️ Backup: no good backup yet · next Tue 03:00" && $(sed -n 3p <<<"$out") == "🩺 Check: not run since boot · verify: not passed yet" &&
+     $(sed -n 5p <<<"$out") == "🪣 Buckets: not measured yet (the next good backup does)" ]]' "$out"
+printf 'date %s\nphoto 1 1\n' "$(date -Is)" >"$T/st/usage"; out=$(act act_status | sed -n 5p)
+check "a usage file without the backup bucket counts as not measured" '[[ $out == "🪣 Buckets: not measured yet"* ]]' "$out"
 
 printf '%s\n' "== a" "  OK    one" "  WARN  sign-ups are open" "  OK    two" "  FAIL  web exited" "  OK    three" "" "1 check(s) FAILED" >"$T/fake.out"
 out=$(FAKE_RC=1 act 'act_check; echo "rc=$?"')

@@ -144,7 +144,7 @@ and re-run `backup-setup`.
 
 | Command | Does |
 | --- | --- |
-| `/status` | four or five lines: services, last good backup and the next one, last check and verify, disk/RAM/uptime, proxy |
+| `/status` | five or six lines: services, last good backup and the next one, last check and verify, disk/RAM/uptime, bucket usage (measured by each good backup), proxy |
 | `/check` | runs `ente-ops.sh check`: "✅ Check passed" or "❌ Check found problems", then each problem and a count of the rest |
 | `/backup` | runs a backup now; replies at once, then "✅ Backup done" (and how long it took) or "❌ Backup failed" with why |
 | `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |

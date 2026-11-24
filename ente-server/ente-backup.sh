@@ -6,8 +6,8 @@
 #      It never deletes anything in the backup bucket: deleted photos and old dumps stay there until you clean up by hand;
 #   3. syncs the same encrypted config into the photo bucket (photo-crypt:; the last 7 days of dumps), so either bucket
 #      alone restores everything;
-#   4. after a fully good run, pings HC_URL. Each step leaves a stamp in BACKUP_STATE: last-ok-* for `ente-ops.sh check`,
-#      hc-ok / hc-fail for the bot's /status.
+#   4. after a fully good run, measures both buckets (BACKUP_STATE/usage, for the bot's /status) and pings HC_URL.
+#      Each step leaves a stamp in BACKUP_STATE: last-ok-* for `ente-ops.sh check`, hc-ok / hc-fail for the bot's /status.
 # Installed by `ente-setup.sh backup-setup` as /usr/local/bin/ente-backup.sh and run by ente-backup.service (daily, 03:00).
 # By hand: sudo systemctl start ente-backup.service (or run the installed script as root). Exit 1 on any failed step.
 #
@@ -52,6 +52,15 @@ if rclone sync "$DUMPS" photo-crypt: --checkers 4; then
   echo "$START" > "$STATE/last-ok-photo-config"
 else echo "ERROR: config copy to the photo bucket failed" >&2; rc=1; fi
 ((rc == 0)) || exit 1
+# bucket usage for the bot's /status: "photo BYTES COUNT" (without the config copy) and "backup BYTES COUNT" (the whole backup
+# bucket), as rclone lists them (current objects). Measured here, not in /status: listing a big bucket takes a while.
+# A failed measurement keeps the last one and does not fail the backup.
+echo "== bucket usage"
+size_of() { rclone size --json "$@" 2>/dev/null | sed -nE 's/.*"count":([0-9]+).*"bytes":([0-9]+).*/\2 \1/p'; }
+if p=$(size_of "ente-s3:$PHOTO_BUCKET" --exclude "/$PHOTO_CFG_DIR/**") && [[ -n $p ]] &&
+  b=$(size_of "$BACKUP_ROOT") && [[ -n $b ]]; then
+  printf 'date %s\nphoto %s\nbackup %s\n' "$(date -Is)" "$p" "$b" > "$STATE/usage.tmp" && mv "$STATE/usage.tmp" "$STATE/usage"
+else echo "WARNING: could not measure the buckets; /status shows the last measurement" >&2; fi
 # heartbeat (healthchecks.io, Better Stack, ...): only after a fully good run. A failed ping does not fail the backup
 # (that would send a false "backup failed"); the heartbeat service notices the missing ping and alerts by itself.
 if [[ -n $HC_URL ]]; then

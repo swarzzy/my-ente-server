@@ -44,6 +44,12 @@ check "the copy decrypts: museum.yaml equals the live one" 'rclone cat photo-cry
 check "the copy holds today's dump" 'rclone lsf photo-crypt: 2>/dev/null | grep -x "ente_db-$(date +%F).dump" >/dev/null'
 check "the backup bucket's copy decrypts too" 'rclone cat backup-crypt:museum.yaml 2>/dev/null | cmp -s - "$T/ente/museum.yaml"'
 check "both stamps are written (s3, photo-config)" '[[ -s $T/state/last-ok-s3 && -s $T/state/last-ok-photo-config ]]'
+# bytes and files under a folder, as "BYTES COUNT" (FIND_ARGS narrow it)
+du_of() { find "$1" -type f "${@:2}" -printf '%s\n' | awk '{b += $1; n++} END {print b + 0, n + 0}'; }
+want_p=$(du_of "$T/s3/photo" -not -path "*/ente-backup-config/*"); want_b=$(du_of "$T/b2/bk")
+check "the run measures both buckets for /status: photos without the config copy, the whole backup bucket" \
+  '[[ $(sed -n 2p "$T/state/usage") == "photo $want_p" && $(sed -n 3p "$T/state/usage") == "backup $want_b" && $(sed -n 1p "$T/state/usage") == "date "* ]]' \
+  "want photo $want_p, backup $want_b; got: $(cat "$T/state/usage" 2>&1)"
 rm "$T/s3/photo/1580559962386439/bbb"
 run_backup; RC=$?
 check "a second run succeeds" '((RC == 0))' "$(tail -5 "$T/out")"
