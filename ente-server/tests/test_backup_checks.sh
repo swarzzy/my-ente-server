@@ -58,6 +58,9 @@ verify_run; RC=$?
 check "a good backup (the backup bucket also holds old dumps the server no longer has): verify passes" \
   '((RC == 0)) && grep -q "^backup verified" "$T/out"' "$(cat "$T/out")"
 check "... and records it for check" '[[ -s $T/state/verify-ok ]]'
+check "... with the backup bucket's growth: 32 photos, the 30 gone from the photo bucket, 27 dumps" \
+  'grep -q "INFO  backup bucket: 32 photos (.*), 30 of them (.*) no longer in the photo bucket; 27 dumps" "$T/out"' "$(grep INFO "$T/out")"
+check "... and the newest local dump restored" 'grep -q "OK    ente_db-$(date +%F).dump restores: 86 tables, 3 users, 10 files" "$T/out"' "$(cat "$T/out")"
 # du_of DIR [FIND ARGS]: "BYTES COUNT" of the files under DIR, what rclone size reports for a local "bucket"
 du_of() { find "$1" -type f "${@:2}" -printf '%s\n' | awk '{b += $1; n++} END {print b + 0, n + 0}'; }
 want_p=$(du_of "$T/s3/photo" -not -path "*/ente-backup-config/*"); want_b=$(du_of "$B")
@@ -75,9 +78,6 @@ cp "$T/state/usage" "$T/usage.before"
 in_setup 'PHOTO_BUCKET=does-not-exist; measure_buckets' >"$T/out" 2>&1; RC=$?
 check "a bucket that cannot be listed: it fails and the last measurement stays" '((RC != 0)) && cmp -s "$T/state/usage" "$T/usage.before"' "$(cat "$T/out")"
 rm "$P/new-one"
-check "... with the backup bucket's growth: 32 photos, the 30 gone from the photo bucket, 27 dumps" \
-  'grep -q "INFO  backup bucket: 32 photos (.*), 30 of them (.*) no longer in the photo bucket; 27 dumps" "$T/out"' "$(grep INFO "$T/out")"
-check "... and the newest local dump restored" 'grep -q "OK    ente_db-$(date +%F).dump restores: 86 tables, 3 users, 10 files" "$T/out"' "$(cat "$T/out")"
 LIVE_TABLES=87 verify_run; RC=$?
 check "an update added a table since the dump: no false FAIL" '((RC == 0))' "$(grep FAIL "$T/out")"
 vok=$(cat "$T/state/verify-ok")
