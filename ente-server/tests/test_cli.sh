@@ -113,11 +113,11 @@ check "... and the backup gets museum's bucket" 'grep -qx "PHOTO_BUCKET=\"museum
 out=$(bucket_run 'echo "M_KEY=[${M_KEY:-}]"'); check "... without leaving museum's keys in the shell" '[[ $out == "M_KEY=[]" ]]' "$out"
 
 echo "== ente-ops.sh"
-for c in check verify pg-update rclone-update news; do check "$c is a known command" 'asks_root ente-ops.sh $c'; done
+for c in check verify pg-update rclone-update news size; do check "$c is a known command" 'asks_root ente-ops.sh $c'; done
 check "no command: usage error" 'usage_error ente-ops.sh'
 check "a setup command is not here" 'usage_error ente-ops.sh install'
 check "an extra argument: usage error" 'usage_error ente-ops.sh check extra'
-out=$(asuser bash "$CLI/ente-ops.sh" 2>&1); check "the usage line lists exactly check, verify, pg-update, rclone-update and news" '[[ $out == *"{check|verify|pg-update|rclone-update|news}"* ]]' "$out"
+out=$(asuser bash "$CLI/ente-ops.sh" 2>&1); check "the usage line lists exactly check, verify, pg-update, rclone-update, news and size" '[[ $out == *"{check|verify|pg-update|rclone-update|news|size}"* ]]' "$out"
 
 echo "== ente-vpn.sh"
 for c in install status uninstall; do check "$c is a known command" 'asks_root ente-vpn.sh $c'; done

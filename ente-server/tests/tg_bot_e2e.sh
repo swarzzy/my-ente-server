@@ -43,7 +43,7 @@ run $BOTSH install; check "install again changes nothing and does not restart th
 
 echo "== what the bot user may run as root"
 as_bot() { runuser -u ente-tg-bot -- "$@" </dev/null >/dev/null 2>&1; }
-for a in status check backup proxy-on proxy-off proxy-status; do
+for a in status check backup proxy-on proxy-off proxy-status size; do
   as_bot sudo -n -l "$HELPER" "$a"; RC=$?; check "may run: ente-tg-action $a" '[[ $RC -eq 0 ]]'
 done
 as_bot sudo -n /usr/bin/id; RC=$?; check "may not run: id" '[[ $RC -ne 0 ]]'

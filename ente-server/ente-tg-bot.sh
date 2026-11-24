@@ -2,13 +2,14 @@
 # ente-tg-bot.sh - optional add-on to ente-setup.sh: a Telegram bot through which ONE person (TG_BOT_USER_ID) can
 #   /status   a short server summary          /check   run the full health check
 #   /backup   run a backup now                /proxy   the S3 proxy's state;  /proxy on | /proxy off
+#   /size     measure both buckets now
 # Usage: ente-tg-bot.sh {install|uninstall|status|check}     (and `action NAME`, used by the root helper)
 # Config: TG_BOT_USER_ID in ente-setup.env (your Telegram user id: the same number as TG_CHAT_ID for a private chat).
 # Token: the alert bot's (TG_BOT_TOKEN in ente-setup.secrets, or the one backup-setup stored in /etc/ente-alert.env).
 #
 # Security: the bot (ente_tg_bot.py) runs as the unprivileged user ente-tg-bot, long-polls Telegram (no open port),
-# accepts only private messages from TG_BOT_USER_ID and maps commands to six fixed action names. The only thing it may
-# run as root is /usr/local/sbin/ente-tg-action with one of those names (a sudo rule listing exactly those six command
+# accepts only private messages from TG_BOT_USER_ID and maps commands to seven fixed action names. The only thing it may
+# run as root is /usr/local/sbin/ente-tg-action with one of those names (a sudo rule listing exactly those seven command
 # lines); the helper checks the name again and runs `ente-tg-bot.sh action NAME`. Both scripts must be root's alone.
 BOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) # the real path: it is embedded in the root helper
 # shellcheck source=ente-setup.sh
@@ -23,7 +24,7 @@ BOT_SCRIPT=${BOT_SCRIPT:-$BOT_DIR/ente-tg-bot.sh}
 ALERT_ENV=${ALERT_ENV:-/etc/ente-alert.env}
 PROXY_STATE=${PROXY_STATE:-/var/lib/ente-setup/s3-proxy} # ente-s3-proxy.sh's state file (on|off)
 REBOOT_FLAG=/var/run/reboot-required
-BOT_ACTIONS="status check backup proxy-on proxy-off proxy-status"
+BOT_ACTIONS="status check backup proxy-on proxy-off proxy-status size"
 # How the helper starts an action: as a transient unit of its own, so it gets a clean environment and working directory
 # (nothing of the bot user's reaches root), survives a restart of the bot, and is stopped after 6 hours.
 BOT_RUN=${BOT_RUN:-systemd-run --quiet --wait --pipe --collect -p RuntimeMaxSec=21600}
@@ -95,7 +96,7 @@ bot_helper() {
 # Managed by ente-tg-bot.sh. The only command the Telegram bot may run as root (see $BOT_SUDOERS).
 [[ \$# -eq 1 ]] || { echo "usage: ente-tg-action ACTION" >&2; exit 2; }
 case \$1 in
-  status | check | backup | proxy-on | proxy-off | proxy-status) ;;
+  status | check | backup | proxy-on | proxy-off | proxy-status | size) ;;
   *) echo "unknown action" >&2; exit 2 ;;
 esac
 cd / || exit 1
@@ -128,19 +129,11 @@ dur() {
 }
 ago() { echo "$(dur $(($(date +%s) - $(date -d "$1" +%s 2>/dev/null || date +%s)))) ago"; }
 
-# iec BYTES: 845.0MiB. bucket_usage FILE: the bucket line of /status from what the last good backup measured.
-iec() { numfmt --to=iec-i --suffix=B --format=%.1f "$1" 2>/dev/null || echo "$1 B"; }
+# bucket_usage FILE: the bucket line of /status, from the last measurement (verify, monthly, or /size).
 bucket_usage() {
-  local k bytes count d='' p='' b=''
-  while read -r k bytes count; do
-    case $k in
-      date) d=$bytes ;;
-      photo) p="photos $(iec "$bytes") ($count files)" ;;
-      backup) b="backup $(iec "$bytes") ($count files)" ;;
-    esac
-  done < <(cat "$1" 2>/dev/null)
-  if [[ -n $d && -n $p && -n $b ]]; then echo "🪣 Buckets: $p · $b · measured $(ago "$d")"
-  else echo "🪣 Buckets: not measured yet (the next good backup does)"; fi
+  local U_DATE U_PHOTO U_BACKUP
+  if usage_get "$1"; then echo "🪣 Buckets: photos $U_PHOTO · backup $U_BACKUP · measured $(ago "$U_DATE")"
+  else echo "🪣 Buckets: not measured yet (/size)"; fi
 }
 
 # act_status: five or six short lines (proxy only when installed): services, backup, checks, system, buckets, proxy. ⚠️/❌ mark
@@ -181,6 +174,15 @@ act_status() {
   [[ ! -e $CADDY_SITES/s3-proxy.caddy ]] || echo "🔀 S3 proxy: $([[ $(cat "$PROXY_STATE" 2>/dev/null) == on ]] && echo on || echo off)"
 }
 
+# act_size: measure both buckets now (ente-ops.sh size, which saves it for /status and check); on failure its last lines.
+act_size() {
+  local out rc U_DATE U_PHOTO U_BACKUP
+  out=$(bash "$BOT_DIR/ente-ops.sh" size 2>&1) && rc=0 || rc=$?
+  if ((rc == 0)) && usage_get "$BACKUP_STATE/usage"; then echo "📷 Photos: $U_PHOTO"; echo "💾 Backup: $U_BACKUP"
+  else sed -E 's/^[0-9-]+ [0-9:]+ \[[a-z -]+\] //; s/^ERROR: /❌ /' <<<"$out" | tail -3; ((rc)) || rc=1; fi
+  return "$rc"
+}
+
 # act_check: the check's problems as ❌/⚠️ lines and a count of the rest; the bot's title says passed or not.
 act_check() {
   local out rc
@@ -188,6 +190,7 @@ act_check() {
   if ! grep -qE '^  (OK|FAIL|WARN)' <<<"$out"; then tail -3 <<<"$out"; return "$rc"; fi # it did not run
   sed -n 's/^  FAIL  /❌ /p' <<<"$out"   # failures first, then warnings
   sed -n 's/^  WARN  /⚠️ /p' <<<"$out"
+  sed -n 's/^  INFO  buckets: /🪣 Buckets: /p' <<<"$out" # the last measurement, as check shows it
   echo "$(grep -c '^  OK' <<<"$out") checks OK"
   return "$rc"
 }
@@ -228,6 +231,7 @@ bot_cmd_action() {
     proxy-on) act_proxy on ;;
     proxy-off) act_proxy off ;;
     proxy-status) act_proxy status ;;
+    size) act_size ;;
   esac
 }
 
@@ -299,7 +303,7 @@ bot_usage() { echo "usage: $0 {install|uninstall|status|check}" >&2; exit 2; }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case "$*" in
     install | uninstall | status | check) ;;
-    "action status" | "action check" | "action backup" | "action proxy-on" | "action proxy-off" | "action proxy-status") ;;
+    "action status" | "action check" | "action backup" | "action proxy-on" | "action proxy-off" | "action proxy-status" | "action size") ;;
     *) bot_usage ;;
   esac
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }

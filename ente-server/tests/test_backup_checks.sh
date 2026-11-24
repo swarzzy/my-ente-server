@@ -58,6 +58,23 @@ verify_run; RC=$?
 check "a good backup (the backup bucket also holds old dumps the server no longer has): verify passes" \
   '((RC == 0)) && grep -q "^backup verified" "$T/out"' "$(cat "$T/out")"
 check "... and records it for check" '[[ -s $T/state/verify-ok ]]'
+# du_of DIR [FIND ARGS]: "BYTES COUNT" of the files under DIR, what rclone size reports for a local "bucket"
+du_of() { find "$1" -type f "${@:2}" -printf '%s\n' | awk '{b += $1; n++} END {print b + 0, n + 0}'; }
+want_p=$(du_of "$T/s3/photo" -not -path "*/ente-backup-config/*"); want_b=$(du_of "$B")
+check "... and measures both buckets: photos without the config copy, the whole backup bucket" \
+  '[[ $(sed -n 2p "$T/state/usage") == "photo $want_p" && $(sed -n 3p "$T/state/usage") == "backup $want_b" && $(sed -n 1p "$T/state/usage") == "date "* ]] &&
+   grep -q "^  INFO  bucket usage saved: photos .* files; backup .* files" "$T/out"' \
+  "want photo $want_p, backup $want_b; got: $(cat "$T/state/usage" 2>&1)"
+rm "$T/state/usage"; echo big >"$P/new-one"
+in_setup 'cmd_size' >"$T/out" 2>&1; RC=$?
+want_p=$(du_of "$T/s3/photo" -not -path "*/ente-backup-config/*")
+check "size measures now and saves it (a new photo counted at once)" \
+  '((RC == 0)) && [[ $(sed -n 2p "$T/state/usage") == "photo $want_p" ]] && grep -q "^photo bucket photo: .* files$" "$T/out" && grep -q "^backup bucket .*: .* files$" "$T/out"' \
+  "$(cat "$T/out" "$T/state/usage" 2>&1)"
+cp "$T/state/usage" "$T/usage.before"
+in_setup 'PHOTO_BUCKET=does-not-exist; measure_buckets' >"$T/out" 2>&1; RC=$?
+check "a bucket that cannot be listed: it fails and the last measurement stays" '((RC != 0)) && cmp -s "$T/state/usage" "$T/usage.before"' "$(cat "$T/out")"
+rm "$P/new-one"
 check "... with the backup bucket's growth: 32 photos, the 30 gone from the photo bucket, 27 dumps" \
   'grep -q "INFO  backup bucket: 32 photos (.*), 30 of them (.*) no longer in the photo bucket; 27 dumps" "$T/out"' "$(grep INFO "$T/out")"
 check "... and the newest local dump restored" 'grep -q "OK    ente_db-$(date +%F).dump restores: 86 tables, 3 users, 10 files" "$T/out"' "$(cat "$T/out")"

@@ -59,8 +59,8 @@ check "does not set NoNewPrivileges (sudo needs it)" '[[ $out != *"NoNewPrivileg
 
 echo "== sudo rule"
 in_bot "$U" "" 'bot_sudoers' >"$T/sudoers"
-check "allows exactly the six actions, as root, for the bot user only" \
-  '[[ $(grep -c "^ente-tg-bot ALL=(root) NOPASSWD:" "$T/sudoers") == 1 && $(grep -o "/usr/local/sbin/ente-tg-action [a-z-]*" "$T/sudoers" | sort | tr "\n" " ") == "/usr/local/sbin/ente-tg-action backup /usr/local/sbin/ente-tg-action check /usr/local/sbin/ente-tg-action proxy-off /usr/local/sbin/ente-tg-action proxy-on /usr/local/sbin/ente-tg-action proxy-status /usr/local/sbin/ente-tg-action status " ]]' "$(cat "$T/sudoers")"
+check "allows exactly the seven actions, as root, for the bot user only" \
+  '[[ $(grep -c "^ente-tg-bot ALL=(root) NOPASSWD:" "$T/sudoers") == 1 && $(grep -o "/usr/local/sbin/ente-tg-action [a-z-]*" "$T/sudoers" | sort | tr "\n" " ") == "/usr/local/sbin/ente-tg-action backup /usr/local/sbin/ente-tg-action check /usr/local/sbin/ente-tg-action proxy-off /usr/local/sbin/ente-tg-action proxy-on /usr/local/sbin/ente-tg-action proxy-status /usr/local/sbin/ente-tg-action size /usr/local/sbin/ente-tg-action status " ]]' "$(cat "$T/sudoers")"
 check "no wildcard and no other command" '! grep -qE "\*|ALL$|ALL,|/bin/|/usr/bin/" <(grep -v "^#" "$T/sudoers")' "$(cat "$T/sudoers")"
 if command -v visudo >/dev/null; then
   out=$(visudo -cf "$T/sudoers" 2>&1); rc=$?; check "visudo accepts the rule" '[[ $rc -eq 0 ]]' "$out"
@@ -78,7 +78,7 @@ check "the real helper starts actions as a transient unit, from /, with a time l
 printf '#!/bin/bash\necho "forwarded: $* cwd=$PWD leak=${LEAK:-none}"\n' >"$T/fake-bot.sh"
 out=$(cd "$T" && LEAK=secret "$T/helper" status 2>&1); check "helper passes on neither the working directory nor the environment" '[[ $out == "forwarded: action status cwd=/ leak=none" ]]' "$out"
 printf '#!/bin/bash\necho "forwarded: $*"\n' >"$T/fake-bot.sh"
-for a in status check backup proxy-on proxy-off proxy-status; do
+for a in status check backup proxy-on proxy-off proxy-status size; do
   out=$("$T/helper" "$a" 2>&1); check "helper forwards '$a'" '[[ $out == "forwarded: action $a" ]]' "$out"
 done
 for a in "rm" "status;id" "" "../x" "--help" "STATUS"; do
@@ -138,8 +138,8 @@ check "... services" '[[ $(sed -n 1p <<<"$out") == "✅ Ente is up (museum, web,
 check "... backup: last good and next run" '[[ $(sed -n 2p <<<"$out") == "💾 Backup: last good 2 h ago · next Tue 03:00" ]]' "$out"
 check "... check and verify" '[[ $(sed -n 3p <<<"$out") == "🩺 Check: passed 5 h ago · verify: passed 3 days ago" ]]' "$out"
 check "... disk, RAM, uptime" '[[ $(sed -n 4p <<<"$out") == "🖥 Disk 26% used (17G free) · RAM 1408 MB free · up "* ]]' "$out"
-check "... both buckets as the last good backup measured them" \
-  '[[ $(sed -n 5p <<<"$out") == "🪣 Buckets: photos 845.0MiB (360 files) · backup 2.5GiB (371 files) · measured 3 h ago" ]]' "$out"
+check "... both buckets as last measured (verify or /size)" \
+  '[[ $(sed -n 5p <<<"$out") == "🪣 Buckets: photos 845.0MiB, 360 files · backup 2.5GiB, 371 files · measured 3 h ago" ]]' "$out"
 touch "$T/sites/s3-proxy.caddy"; echo on >"$T/proxy-state"; touch "$T/reboot"; date >"$T/st/hc-fail"
 out=$(EXITED=web DOWN=postgres BRES=exit-code CRES=exit-code act act_status)
 check "status, problems: a container exited, one missing" '[[ $(sed -n 1p <<<"$out") == "❌ Down: web (exited), postgres (not running)" ]]' "$out"
@@ -154,13 +154,22 @@ check "... whichever part it is" '[[ $out == "⚠️ Backup: last good 40 h ago 
 rm "$T/st/last-ok-photo-config" "$T/st/verify-ok" "$T/st/usage"; out=$(BTS= CTS= act act_status)
 check "status after a fresh install: no good backup yet, nothing run, buckets not measured" \
   '[[ $(sed -n 2p <<<"$out") == "⚠️ Backup: no good backup yet · next Tue 03:00" && $(sed -n 3p <<<"$out") == "🩺 Check: not run since boot · verify: not passed yet" &&
-     $(sed -n 5p <<<"$out") == "🪣 Buckets: not measured yet (the next good backup does)" ]]' "$out"
+     $(sed -n 5p <<<"$out") == "🪣 Buckets: not measured yet (/size)" ]]' "$out"
 printf 'date %s\nphoto 1 1\n' "$(date -Is)" >"$T/st/usage"; out=$(act act_status | sed -n 5p)
 check "a usage file without the backup bucket counts as not measured" '[[ $out == "🪣 Buckets: not measured yet"* ]]' "$out"
 
+printf '%s\n' "photo bucket p: 1.0KiB, 2 files" >"$T/fake.out"
+out=$(act 'printf "date %s\nphoto 3221225472 1200\nbackup 4294967296 1300\n" "$(date -Is)" >"$T/st/usage"; act_size; echo "rc=$?"')
+check "size: both buckets from the fresh measurement" '[[ $out == "$(printf "📷 Photos: 3.0GiB, 1200 files\n💾 Backup: 4.0GiB, 1300 files\nrc=0")" ]]' "$out"
+printf '%s\n' "2026-11-24 10:00:00 [size] ERROR: cannot list the buckets (the last measurement stays)" >"$T/fake.out"
+out=$(FAKE_RC=1 act 'act_size; echo "rc=$?"')
+check "size that fails: why, without the timestamp, and a failure" '[[ $out == "$(printf "❌ cannot list the buckets (the last measurement stays)\nrc=1")" ]]' "$out"
 printf '%s\n' "== a" "  OK    one" "  WARN  sign-ups are open" "  OK    two" "  FAIL  web exited" "  OK    three" "" "1 check(s) FAILED" >"$T/fake.out"
 out=$(FAKE_RC=1 act 'act_check; echo "rc=$?"')
 check "check: problems as ❌/⚠️ lines, the rest counted, exit code kept" '[[ $out == "$(printf "❌ web exited\n⚠️ sign-ups are open\n3 checks OK\nrc=1")" ]]' "$out"
+printf '%s\n' "  OK    one" "  INFO  buckets: photos 1.0GiB, 9 files; backup 2.0GiB, 9 files (measured x)" >"$T/fake.out"
+out=$(act 'act_check; echo "rc=$?"')
+check "check: the last bucket measurement is shown too" '[[ $out == "$(printf "🪣 Buckets: photos 1.0GiB, 9 files; backup 2.0GiB, 9 files (measured x)\n1 checks OK\nrc=0")" ]]' "$out"
 printf '%s\n' "something" "run as root (sudo x)" >"$T/fake.out"
 out=$(FAKE_RC=1 act 'act_check; echo "rc=$?"'); check "check that did not run: its last lines" '[[ $out == *"run as root"* && $out == *"rc=1" ]]' "$out"
 

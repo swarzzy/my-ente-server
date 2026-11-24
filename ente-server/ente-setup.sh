@@ -85,6 +85,23 @@ overwrite_in_place() {
   rm -f "$1"
 }
 
+# iec BYTES: 845.0MiB. usage_get FILE: reads a bucket measurement (written by `ente-ops.sh size` and `verify`: lines
+# "date ISO", "photo BYTES COUNT", "backup BYTES COUNT") into U_DATE, U_PHOTO and U_BACKUP ("845.0MiB, 360 files");
+# returns 1 when there is none or it is incomplete.
+iec() { numfmt --to=iec-i --suffix=B --format=%.1f "$1" 2>/dev/null || echo "$1 B"; }
+usage_get() {
+  local k bytes count
+  U_DATE='' U_PHOTO='' U_BACKUP=''
+  while read -r k bytes count; do
+    case $k in
+      date) U_DATE=$bytes ;;
+      photo) U_PHOTO="$(iec "$bytes"), $count files" ;;
+      backup) U_BACKUP="$(iec "$bytes"), $count files" ;;
+    esac
+  done < <(cat "$1" 2>/dev/null)
+  [[ -n $U_DATE && -n $U_PHOTO && -n $U_BACKUP ]]
+}
+
 # need_secret VAR...: die unless every named secret is set (secrets file or environment). Secrets are never logged.
 need_secret() { local v; for v in "$@"; do [[ -n ${!v:-} ]] || die "$v is not set: put it in $SECRETS_FILE"; done; }
 

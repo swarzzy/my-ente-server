@@ -6,10 +6,13 @@
 #   pg-update   Postgres's minor releases (security fixes), weekly by ente-pg-update.timer
 #   rclone-update  rclone's new releases (rclone.org's binary, which apt does not update), weekly by ente-rclone-update.timer
 #   news        tells Telegram when Ente has newer builds than the pinned ones, monthly by ente-news.timer (alerts on)
+#   size        measures both buckets now and saves it (also done by verify); check and the bot's /status show the last one
 # Config and secrets: those of ente-setup.sh. Needs ente-setup.sh next to it (its helpers).
 OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=ente-setup.sh
 . "$OPS_DIR/ente-setup.sh" # its helpers and config; its own main does not run when sourced
+
+info() { printf '  INFO  %s\n' "$*"; }
 
 # new_uploads NAME: prints a temp file of rclone exclude rules naming the photo objects uploaded since the last good backup to
 # NAME (s3) started. They are not in that backup yet, and that is not an error. The caller passes it as --exclude-from
@@ -157,7 +160,7 @@ stamp_check() {
   else ok "$2 $s"; fi
 }
 check_backup() {
-  local s running= b e
+  local s running= b e U_DATE U_PHOTO U_BACKUP
   echo "== backup"
   for s in .restore-incomplete .restore-finishing; do
     [[ ! -e $ENTE_DIR/$s ]] || bad "a restore did not finish ($ENTE_DIR/$s): run ente-setup.sh restore again"
@@ -178,6 +181,8 @@ check_backup() {
   elif (($(hours_since "$s") > 45 * 24)); then bad "last good verify is older than 45 days ($s)"
   else ok "monthly verify: last passed $s"; fi
   [[ -n $TG_CHAT_ID || -n $HC_URL ]] || warn "no failure alerts (set TG_CHAT_ID or HC_URL)"
+  if usage_get "$BACKUP_STATE/usage"; then info "buckets: photos $U_PHOTO; backup $U_BACKUP (measured $U_DATE)"
+  else info "buckets: not measured yet (run: $0 size, or wait for the monthly verify)"; fi
   if [[ -n $TG_CHAT_ID ]] && ! systemctl is-enabled --quiet ente-news.timer 2>/dev/null; then
     bad "ente-news.timer not enabled: no monthly note about new Ente builds (run ente-setup.sh backup-setup)"
   fi
@@ -223,7 +228,6 @@ verify_cleanup() {
 }
 # vq ARGS: psql in the postgres container, unaligned output with space-separated columns.
 vq() { dc exec -T postgres psql -U pguser -At -F ' ' "$@" </dev/null; }
-info() { printf '  INFO  %s\n' "$*"; }
 # backup_growth: one line on the backup bucket's size: photos (and those no longer in the photo bucket, which a clean-up would
 # remove) and dumps. Information only.
 backup_growth() {
@@ -262,6 +266,8 @@ cmd_verify() {
   else bad "photo objects differ from the backup: $(rc_err "$out")"; fi
   rm -f "$ex"
   backup_growth
+  if measure_buckets; then usage_get "$BACKUP_STATE/usage"; info "bucket usage saved: photos $U_PHOTO; backup $U_BACKUP"
+  else warn "cannot list the buckets to measure them (the last measurement stays)"; fi
 
   echo "== config backup (decrypted, byte for byte)"
   if out=$(rclone check "$DUMP_DIR" backup-crypt: --one-way --download --checkers 4 2>&1); then
@@ -294,6 +300,29 @@ cmd_verify() {
   if ((FAILS)); then echo "$FAILS verify check(s) FAILED"; return 1; fi
   mkdir -p "$BACKUP_STATE"; date -Is >"$BACKUP_STATE/verify-ok"
   echo "backup verified"
+}
+
+# ---------------------------------------------------------------- size
+# size_of REMOTE [FLAGS]: "BYTES COUNT" of REMOTE as rclone lists it (current objects only; providers that keep old versions
+# bill those too). Nothing on failure. The S3 API has no bucket-size call: this lists every object, 1000 per request.
+size_of() { rclone size --json "$@" 2>/dev/null | sed -nE 's/.*"count":([0-9]+).*"bytes":([0-9]+).*/\2 \1/p'; }
+# measure_buckets: measures the photo bucket (without the config copy) and the whole backup bucket and saves both to
+# $BACKUP_STATE/usage (see usage_get). Returns 1, keeping the last measurement, when either cannot be listed.
+measure_buckets() {
+  local p b
+  p=$(size_of "ente-s3:$PHOTO_BUCKET" --exclude "/$PHOTO_CFG_DIR/**") && [[ -n $p ]] || return 1
+  b=$(size_of "$BACKUP_ROOT") && [[ -n $b ]] || return 1
+  mkdir -p "$BACKUP_STATE"
+  printf 'date %s\nphoto %s\nbackup %s\n' "$(date -Is)" "$p" "$b" >"$BACKUP_STATE/usage.tmp" && mv "$BACKUP_STATE/usage.tmp" "$BACKUP_STATE/usage"
+}
+# size: measure now (by hand, or the bot's /size). Prints one line per bucket.
+cmd_size() {
+  local U_DATE U_PHOTO U_BACKUP
+  load_env
+  measure_buckets || die "cannot list the buckets (the last measurement stays)"
+  usage_get "$BACKUP_STATE/usage"
+  echo "photo bucket $PHOTO_BUCKET: $U_PHOTO"
+  echo "backup bucket ${BACKUP_ROOT%/}: $U_BACKUP"
 }
 
 # ---------------------------------------------------------------- pg-update
@@ -396,7 +425,7 @@ cmd_news() {
 }
 
 # ---------------------------------------------------------------- main
-OPS_COMMANDS="check verify pg-update rclone-update news"
+OPS_COMMANDS="check verify pg-update rclone-update news size"
 ops_usage() { echo "usage: $0 {${OPS_COMMANDS// /|}}" >&2; exit 2; }
 
 # sourced (tests): define the functions only

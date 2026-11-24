@@ -189,7 +189,7 @@ class BotTest(unittest.TestCase):
         replies = self.texts()
         self.assertEqual(len(replies), 4)
         for r in replies:
-            for c in ("/status", "/check", "/backup", "/proxy"):
+            for c in ("/status", "/check", "/backup", "/proxy", "/size"):
                 self.assertIn(c, r)
 
     def test_proxy_arguments(self):
@@ -201,13 +201,22 @@ class BotTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(self.runner.calls, ["proxy-status", "proxy-on", "proxy-off", "proxy-status"])
 
+    def test_size_measures_in_the_background_with_a_title(self):
+        self.msg("/size")
+        self.poll()
+        self.wait_sent(2)  # acknowledgement + result
+        self.assertEqual(self.runner.calls, ["size"])
+        self.assertTrue(self.texts()[0].startswith("⏳ Measuring the buckets"), self.texts())
+        self.assertTrue(self.texts()[1].startswith("🪣 Bucket usage"), self.texts())
+
     def test_bad_arguments_are_refused_without_running_anything(self):
-        for text in ("/proxy maybe", "/proxy on; rm -rf /", "/proxy on off", "/status now", "/backup please", "/check `id`"):
+        for text in ("/proxy maybe", "/proxy on; rm -rf /", "/proxy on off", "/status now", "/backup please", "/check `id`",
+                     "/size now"):
             self.msg(text)
         self.poll()
         time.sleep(0.2)
         self.assertEqual(self.runner.calls, [])
-        self.assertEqual(len(self.texts()), 6)
+        self.assertEqual(len(self.texts()), 7)
 
     def test_bot_name_suffix_is_accepted(self):
         self.msg("/status@ente_test_bot")
@@ -266,7 +275,7 @@ class BotTest(unittest.TestCase):
         self.assertEqual(set(tb.TITLES), set(tb.ACTIONS) - {"status"})
         self.assertEqual(set(tb.STARTED), set(tb.ACTIONS) - {"status"})
         for ok, bad in tb.TITLES.values():
-            self.assertTrue(ok[0] in "✅🔀" and bad.startswith("❌"), (ok, bad))
+            self.assertTrue(ok[0] in "✅🔀🪣" and bad.startswith("❌"), (ok, bad))
 
     def test_an_action_without_output_gets_only_its_title(self):
         self.runner.out["proxy-off"] = (0, "")
@@ -326,7 +335,7 @@ class BotTest(unittest.TestCase):
         calls = [b for m, b in self.srv.calls if m == "setMyCommands"]
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["scope"], {"type": "chat", "chat_id": OWNER})
-        self.assertEqual({c["command"] for c in calls[0]["commands"]}, {"status", "check", "backup", "proxy"})
+        self.assertEqual({c["command"] for c in calls[0]["commands"]}, {"status", "check", "backup", "proxy", "size"})
 
     def test_accepted_and_ignored_commands_are_logged(self):
         self.msg("/status")

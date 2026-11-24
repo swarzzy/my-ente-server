@@ -9,6 +9,7 @@ and maps each command to one fixed action name; no text from Telegram ever reach
   /check           the full health check                 -> check
   /backup          run a backup now, report the result   -> backup
   /proxy [on|off]  the S3 proxy: state, or switch it      -> proxy-status | proxy-on | proxy-off
+  /size            measure both buckets now              -> size
 
 Usage: ente-tg-bot --user-id ID --state-dir DIR --action-cmd "sudo -n /usr/local/sbin/ente-tg-action"
        [--token-file FILE (default: $CREDENTIALS_DIRECTORY/token)] [--api-base https://api.telegram.org]
@@ -25,25 +26,29 @@ import time
 import urllib.error
 import urllib.request
 
-ACTIONS = ("status", "check", "backup", "proxy-on", "proxy-off", "proxy-status")
+ACTIONS = ("status", "check", "backup", "proxy-on", "proxy-off", "proxy-status", "size")
 COMMANDS = [("status", "Quick overview"), ("check", "Full health check"),
-            ("backup", "Back up now"), ("proxy", "S3 proxy: state, /proxy on, /proxy off")]
+            ("backup", "Back up now"), ("proxy", "S3 proxy: state, /proxy on, /proxy off"),
+            ("size", "Measure the buckets now")]
 HELP = ("Available actions:\n/status – quick overview\n/check – full health check (about 30 s)\n/backup – back up now\n"
-        "/proxy – S3 proxy state; /proxy on or /proxy off to switch it")
+        "/proxy – S3 proxy state; /proxy on or /proxy off to switch it\n/size – measure both buckets now")
 # the first line of a finished action's reply: (when it worked, when it did not)
 TITLES = {"backup": ("✅ Backup done", "❌ Backup failed"),
           "check": ("✅ Check passed", "❌ Check found problems"),
           "proxy-on": ("✅ S3 proxy is on", "❌ Could not turn the S3 proxy on"),
           "proxy-off": ("✅ S3 proxy is off", "❌ Could not turn the S3 proxy off"),
-          "proxy-status": ("🔀 S3 proxy", "❌ S3 proxy has problems")}
+          "proxy-status": ("🔀 S3 proxy", "❌ S3 proxy has problems"),
+          "size": ("🪣 Bucket usage", "❌ Could not measure the buckets")}
 STARTED = {"backup": "⏳ Backing up...",
            "check": "⏳ Checking (about 30 s)...",
            "proxy-on": "⏳ Turning the S3 proxy on...",
            "proxy-off": "⏳ Turning the S3 proxy off...",
-           "proxy-status": "⏳ Checking the S3 proxy..."}
+           "proxy-status": "⏳ Checking the S3 proxy...",
+           "size": "⏳ Measuring the buckets (lists every object: a minute for a big library)..."}
 BUSY = {"backup": "⏳ A backup is already running.",
         "check": "⏳ A check is already running.",
-        "proxy": "⏳ Busy: the last /proxy command hasn't finished yet."}
+        "proxy": "⏳ Busy: the last /proxy command hasn't finished yet.",
+        "size": "⏳ The buckets are already being measured."}
 MAX_TEXT = 4000      # Telegram allows 4096 characters
 MAX_AGE = 60         # seconds; older commands are not run (e.g. queued while the bot was down)
 NOTICE_EVERY = 3600  # at most one notice per stranger per hour
@@ -109,7 +114,7 @@ class Bot:
                 self.offset = int(f.read().strip())
         except (OSError, ValueError):
             self.offset = 0
-        self.locks = {k: threading.Lock() for k in ("check", "backup", "proxy")}
+        self.locks = {k: threading.Lock() for k in ("check", "backup", "proxy", "size")}
         self.noticed = {}
 
     # ---- plumbing
@@ -199,7 +204,7 @@ class Bot:
             self.send(HELP)
             return
         cmd, args = words[0][1:].split("@", 1)[0].lower(), [a.lower() for a in words[1:]]
-        if cmd not in ("status", "check", "backup", "proxy"):  # also /start and /help
+        if cmd not in ("status", "check", "backup", "proxy", "size"):  # also /start and /help
             self.send(HELP)
             return
         if cmd == "proxy":

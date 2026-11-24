@@ -144,10 +144,11 @@ and re-run `backup-setup`.
 
 | Command | Does |
 | --- | --- |
-| `/status` | five or six lines: services, last good backup and the next one, last check and verify, disk/RAM/uptime, bucket usage (measured by each good backup), proxy |
+| `/status` | five or six lines: services, last good backup and the next one, last check and verify, disk/RAM/uptime, bucket usage (the last measurement: monthly `verify` or `/size`), proxy |
 | `/check` | runs `ente-ops.sh check`: "✅ Check passed" or "❌ Check found problems", then each problem and a count of the rest |
 | `/backup` | runs a backup now; replies at once, then "✅ Backup done" (and how long it took) or "❌ Backup failed" with why |
 | `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |
+| `/size` | measures both buckets now (`ente-ops.sh size`): size and file count of each; `/status` and `/check` then show it |
 
 Lines that need a look start with ⚠️ or ❌. Alerts use the same style: "❌ Backup failed on <host>" or "⚠️ Daily check found
 problems on <host>", followed only by the lines that say why.
@@ -159,7 +160,7 @@ problems on <host>", followed only by the lines that say why.
 Security: the bot long-polls Telegram (no open port) as its own unprivileged user `ente-tg-bot`, acts only on private messages
 from `TG_BOT_USER_ID` (others are ignored, and you get a notice at most once an hour per sender), does not run commands older
 than a minute, and maps each command to a fixed action name: no text from Telegram reaches a shell. As root it may run exactly
-`/usr/local/sbin/ente-tg-action <one of six names>` (`/etc/sudoers.d/ente-tg-bot`); that helper runs `ente-tg-bot.sh action <name>`,
+`/usr/local/sbin/ente-tg-action <one of seven names>` (`/etc/sudoers.d/ente-tg-bot`); that helper runs `ente-tg-bot.sh action <name>`,
 so the script folder must be root's alone (`chown -R root: ente-server; chmod -R go-w ente-server`; `install` refuses otherwise).
 The token reaches the bot as a systemd credential, never on a command line. Anyone who controls your Telegram account can use the
 bot: turn on Telegram's two-step verification. `ente-ops.sh check` includes the bot's checks while it is installed.
@@ -176,7 +177,8 @@ Every FAIL is something that can break by itself and that nothing else reports:
 - photo bucket reachable, CORS for the web app (the bucket museum uses, from `museum.yaml`; a WARN if `ente-setup.env` names
   another one, i.e. `S3_*` was edited without re-running `install`); the add-ons' own checks while installed;
 - backup: the last good backup and the config copy in the photo bucket under 36 h old, the last good `verify` under 45 days, no
-  unfinished restore. A failed backup run alerts by itself, so `check` only looks at the age of the last success;
+  unfinished restore. A failed backup run alerts by itself, so `check` only looks at the age of the last success. An INFO line
+  shows the last bucket measurement (see `verify`; `/check` in Telegram shows it too);
 - system: disk of `/` (WARN at 80%, FAIL at 90%), OOM kills in the last 24 h, a reboot pending for over a day (unattended-upgrades
   reboots at 02:00).
 
@@ -189,6 +191,10 @@ Every FAIL is something that can break by itself and that nothing else reports:
   OK line counts them). Photos uploaded since the last backup started are not expected in the backup;
 - an INFO line on the backup bucket's growth: photos and their size, how many of them are no longer in the photo bucket (what the
   clean-up in "Backups" would remove), dumps and their size;
+- both buckets measured (size and file count, saved in `/var/lib/ente-backup/usage`): `check` and the bot's `/status` show the last
+  measurement. To measure now: `sudo ./ente-ops.sh size` or `/size`. S3 has no bucket-size call, so this lists every object
+  (1000 per request: a few seconds for 10 000 files); it counts current objects, while a provider that keeps old versions (B2) bills
+  those too;
 - the encrypted config backup and its copy in the photo bucket, downloaded, decrypted with the stored passphrase and compared byte for
   byte with the local copies (`museum.yaml` with the keys, compose files, image pins, dumps);
 - the newest dump (proven equal to the backed-up one by the step before) restored into a scratch database (dropped afterwards):
