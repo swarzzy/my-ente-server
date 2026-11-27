@@ -39,12 +39,18 @@ skip() { printf '%-24s %-6s %5s  %s\n' "$1" skip "" "$2"; }
 # The suites that change nothing each work in a temp dir of their own: they run side by side, JOBS at a time, and are
 # reported in this order once all are done. The server suites below change the server and run one after another.
 JOBS=${JOBS:-4}
-quiet=(test_cli test_check test_alerts test_lockdown test_update test_proxy_config test_tg_bot_config test_quickstart unittest)
+quiet=(test_cli test_check test_alerts test_lockdown test_update test_proxy_config test_tg_bot_config test_quickstart unittest
+  opsbot_unittest test_opsbot_cli)
 if command -v rclone >/dev/null; then quiet+=(test_backup_checks test_bucket_copies); fi
 for t in "${quiet[@]}"; do
   while (($(jobs -rp | wc -l) >= JOBS)); do wait -n; done
   ( t0=$SECONDS
-    if [[ $t == unittest ]]; then timeout 3600 python3 -m unittest discover -s tests; else timeout 3600 bash "tests/$t.sh"; fi >"$OUT/$t.out" 2>&1
+    case $t in # opsbot (../opsbot) has its own suites: the Ente bot and alerts build on it
+      unittest) timeout 3600 python3 -m unittest discover -s tests ;;
+      opsbot_unittest) cd ../opsbot && timeout 3600 python3 -m unittest discover -s tests ;;
+      test_opsbot_cli) timeout 3600 bash ../opsbot/tests/test_opsbot_cli.sh ;;
+      *) timeout 3600 bash "tests/$t.sh" ;;
+    esac >"$OUT/$t.out" 2>&1
     echo "$? $((SECONDS - t0))" >"$OUT/$t.rc" ) &
 done
 wait
@@ -53,6 +59,9 @@ command -v rclone >/dev/null || for t in test_backup_checks test_bucket_copies; 
 if [[ $SERVER == yes ]]; then
   if [[ -e /etc/amnezia/amneziawg/awg0.conf ]]; then run test_vpn_config bash tests/test_vpn_config.sh; else skip test_vpn_config "VPN not installed"; fi
   run proxy_e2e bash tests/proxy_e2e.sh
+  if [[ -f /etc/opsbot/opsbot.conf && -n $(sed -n 's/^USER_ID=//p' /etc/opsbot/opsbot.conf) ]]; then
+    run opsbot_e2e bash ../opsbot/tests/opsbot_e2e.sh
+  else skip opsbot_e2e "opsbot not installed with a bot"; fi
   run tg_bot_e2e bash tests/tg_bot_e2e.sh
   if [[ $BROWSER == yes ]]; then run proxy_browser_e2e bash tests/proxy_browser_e2e.sh
   else skip proxy_browser_e2e "the web app in a browser: --browser"; fi

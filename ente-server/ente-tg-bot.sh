@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# ente-tg-bot.sh - optional add-on to ente-setup.sh: a Telegram bot through which ONE person (TG_BOT_USER_ID) can
-#   /status   a short server summary          /check   run the full health check
-#   /backup   run a backup now                /proxy   the S3 proxy's state;  /proxy on | /proxy off
-#   /size     measure both buckets now
-# Usage: ente-tg-bot.sh {install|uninstall|status|check}     (and `action NAME`, used by the root helper)
+# ente-tg-bot.sh - optional add-on to ente-setup.sh: Ente's commands for opsbot (../opsbot), the Telegram bot through which ONE
+# person (TG_BOT_USER_ID) can
+#   /status   a short server summary (Ente's lines, then opsbot's system line)
+#   /check    run the full health check            /backup   run a backup now
+#   /proxy    the S3 proxy's state; /proxy on | /proxy off      /size   measure both buckets now
+# Usage: ente-tg-bot.sh {install|uninstall|status|check}     (and `action NAME`, which opsbot's root helper runs)
+#   install    installs or updates opsbot from ../opsbot (token, chat and user from Ente's config) and registers Ente as its
+#              plugin "ente". An older ente-tg-bot service (before opsbot) is removed first: both cannot poll one token.
+#   uninstall  unregisters the plugin (opsbot itself stays: other services may use it; `opsbot uninstall` removes it)
 # Config: TG_BOT_USER_ID in ente-setup.env (your Telegram user id: the same number as TG_CHAT_ID for a private chat).
-# Token: the alert bot's (TG_BOT_TOKEN in ente-setup.secrets, or the one backup-setup stored in /etc/ente-alert.env).
+# Token: TG_BOT_TOKEN in ente-setup.secrets, else the one opsbot (or the older alerts or bot) stored.
 #
-# Security: the bot (ente_tg_bot.py) runs as the unprivileged user ente-tg-bot, long-polls Telegram (no open port),
-# accepts only private messages from TG_BOT_USER_ID and maps commands to seven fixed action names. The only thing it may
-# run as root is /usr/local/sbin/ente-tg-action with one of those names (a sudo rule listing exactly those seven command
-# lines); the helper checks the name again and runs `ente-tg-bot.sh action NAME`. Both scripts must be root's alone.
-BOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) # the real path: it is embedded in the root helper
+# Security: opsbot runs as its own unprivileged user and may run as root only `opsbot-action ente ACTION` for the actions
+# registered here; the helper runs `ente-tg-bot.sh action ACTION` with the config files install used. These scripts and the
+# config must be root's alone (install and check verify it).
+BOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) # the real path: it is in the plugin file
 # shellcheck source=ente-setup.sh
 . "$BOT_DIR/ente-setup.sh" # its helpers and config; its own main does not run when sourced
-BOT_USER=ente-tg-bot
-BOT_PY=/usr/local/lib/ente-setup/ente_tg_bot.py
-BOT_UNIT=/etc/systemd/system/ente-tg-bot.service
-BOT_TOKEN_FILE=/etc/ente-tg-bot/token
-BOT_SUDOERS=/etc/sudoers.d/ente-tg-bot
-BOT_HELPER=/usr/local/sbin/ente-tg-action
 BOT_SCRIPT=${BOT_SCRIPT:-$BOT_DIR/ente-tg-bot.sh}
-ALERT_ENV=${ALERT_ENV:-/etc/ente-alert.env}
+OPSBOT_SH=${OPSBOT_SH:-$BOT_DIR/../opsbot/opsbot.sh}   # the repository's copy: installs or updates opsbot
+OPSBOT_CLI=${OPSBOT_CLI:-/usr/local/sbin/opsbot}      # the installed one
+OPSBOT_TOKEN_FILE=${OPSBOT_TOKEN_FILE:-/etc/opsbot/token}
+PLUGIN_FILE=${PLUGIN_FILE:-/etc/opsbot/plugins.d/ente.json}
+ALERT_ENV=${ALERT_ENV:-/etc/ente-alert.env}            # the alerts' token before opsbot
 PROXY_STATE=${PROXY_STATE:-/var/lib/ente-setup/s3-proxy} # ente-s3-proxy.sh's state file (on|off)
-REBOOT_FLAG=/var/run/reboot-required
-BOT_ACTIONS="status check backup proxy-on proxy-off proxy-status size"
-# How the helper starts an action: as a transient unit of its own, so it gets a clean environment and working directory
-# (nothing of the bot user's reaches root), survives a restart of the bot, and is stopped after 6 hours.
-BOT_RUN=${BOT_RUN:-systemd-run --quiet --wait --pipe --collect -p RuntimeMaxSec=21600}
+# the bot before opsbot (ente-tg-bot.service and its pieces): install removes it
+LEGACY_UNIT=/etc/systemd/system/ente-tg-bot.service
+LEGACY_FILES=("$LEGACY_UNIT" /etc/sudoers.d/ente-tg-bot /usr/local/sbin/ente-tg-action /usr/local/lib/ente-setup/ente_tg_bot.py)
+LEGACY_TOKEN=/etc/ente-tg-bot/token
 
 # bot_root_files: everything the actions run or source as root, and the link rewriter that /proxy on installs in front of the
 # API (it sees every request): anyone who could change one of these could act as root or read the apps' traffic.
@@ -47,77 +47,92 @@ bot_load_env() {
   [[ $TG_BOT_USER_ID =~ ^[1-9][0-9]*$ ]] || die "TG_BOT_USER_ID must be your Telegram user id (a positive number), not $TG_BOT_USER_ID"
 }
 
-# bot_token: print the bot token (secrets file / environment first, else the alerts' env file); die if there is none.
+# bot_token: print the bot token: the secrets file or environment, else opsbot's, the older alerts' or the older bot's stored one;
+# die if there is none.
 bot_token() {
   local t=${TG_BOT_TOKEN:-}
+  [[ -n $t || ! -f $OPSBOT_TOKEN_FILE ]] || t=$(cat "$OPSBOT_TOKEN_FILE")
   if [[ -z $t && -f $ALERT_ENV ]]; then t=$(. "$ALERT_ENV"; echo "${TG_BOT_TOKEN:-}"); fi
-  [[ -n $t ]] || die "no bot token: set TG_BOT_TOKEN in $SECRETS_FILE (or set up the alerts with backup-setup first)"
+  [[ -n $t || ! -f $LEGACY_TOKEN ]] || t=$(cat "$LEGACY_TOKEN")
+  [[ -n $t ]] || die "no bot token: set TG_BOT_TOKEN in $SECRETS_FILE"
   printf '%s\n' "$t"
 }
 
-# bot_unit: the systemd unit. No filesystem sandboxing (ProtectSystem etc.): the actions run under sudo as children of the
-# service and must write the server's files; the boundary is the separate user and the sudo rule.
-bot_unit() {
-  cat <<EOF
-[Unit]
-Description=Ente Telegram bot (commands from user $TG_BOT_USER_ID only)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=$BOT_USER
-Group=$BOT_USER
-ExecStart=/usr/bin/python3 $BOT_PY --user-id $TG_BOT_USER_ID --state-dir /var/lib/ente-tg-bot --action-cmd "sudo -n $BOT_HELPER"
-LoadCredential=token:$BOT_TOKEN_FILE
-StateDirectory=ente-tg-bot
-StateDirectoryMode=0700
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-# bot_sudoers: the only commands the bot user may run as root.
-bot_sudoers() {
-  local a list=''
-  for a in $BOT_ACTIONS; do list+="${list:+, }$BOT_HELPER $a"; done
-  echo "# Managed by ente-tg-bot.sh: the Telegram bot may run exactly these, as root, without a password."
-  echo "$BOT_USER ALL=(root) NOPASSWD: $list"
-}
-
-# bot_helper: the root helper; checks the action name again and runs `ente-tg-bot.sh action NAME`, with the config and secrets
-# files the install used.
-bot_helper() {
+# plugin_json: Ente's plugin file for opsbot: the commands, what each action is called and says, and how the helper runs it
+# (this script, with the config files this run reads).
+plugin_json() {
   local ce; ce=$(config_env)
-  cat <<EOF
-#!/bin/bash
-# Managed by ente-tg-bot.sh. The only command the Telegram bot may run as root (see $BOT_SUDOERS).
-[[ \$# -eq 1 ]] || { echo "usage: ente-tg-action ACTION" >&2; exit 2; }
-case \$1 in
-  status | check | backup | proxy-on | proxy-off | proxy-status | size) ;;
-  *) echo "unknown action" >&2; exit 2 ;;
-esac
-cd / || exit 1
-exec $BOT_RUN /usr/bin/env $ce /bin/bash "$BOT_SCRIPT" action "\$1"
-EOF
+  python3 -I - "$BOT_SCRIPT" "$ce" <<'PY'
+import json, sys
+script, ce = sys.argv[1], sys.argv[2]
+env = dict(kv.split("=", 1) for kv in ce.split())
+busy_proxy = "⏳ Busy: the last /proxy command hasn't finished yet."
+print(json.dumps({
+    "name": "ente",
+    "exec": ["/bin/bash", script, "action"],
+    "env": env,
+    "status": "status",
+    "commands": [
+        {"command": "check", "description": "Full health check (about 30 s)", "action": "check"},
+        {"command": "backup", "description": "Back up now", "action": "backup"},
+        {"command": "proxy", "description": "S3 proxy: state, /proxy on, /proxy off",
+         "args": {"": "proxy-status", "status": "proxy-status", "on": "proxy-on", "off": "proxy-off"},
+         "usage": "Send /proxy, /proxy on or /proxy off."},
+        {"command": "size", "description": "Measure both buckets now", "action": "size"},
+    ],
+    "actions": {
+        "status": {"fail": "❌ Could not get Ente's status"},
+        "check": {"started": "⏳ Checking (about 30 s)...", "ok": "✅ Check passed", "fail": "❌ Check found problems",
+                  "busy": "⏳ A check is already running."},
+        "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed",
+                   "busy": "⏳ A backup is already running."},
+        "proxy-status": {"started": "⏳ Checking the S3 proxy...", "ok": "🔀 S3 proxy", "fail": "❌ S3 proxy has problems",
+                         "lock": "proxy", "busy": busy_proxy},
+        "proxy-on": {"started": "⏳ Turning the S3 proxy on...", "ok": "✅ S3 proxy is on",
+                     "fail": "❌ Could not turn the S3 proxy on", "lock": "proxy", "busy": busy_proxy},
+        "proxy-off": {"started": "⏳ Turning the S3 proxy off...", "ok": "✅ S3 proxy is off",
+                      "fail": "❌ Could not turn the S3 proxy off", "lock": "proxy", "busy": busy_proxy},
+        "size": {"started": "⏳ Measuring the buckets (lists every object: a minute for a big library)...",
+                 "ok": "🪣 Bucket usage", "fail": "❌ Could not measure the buckets",
+                 "busy": "⏳ The buckets are already being measured."},
+    },
+}, indent=2, ensure_ascii=False))
+PY
 }
 
-# bot_checks: OK/FAIL lines (counted in FAILS).
+# remove_legacy: the bot before opsbot (its service, user, sudo rule, helper and token). It polled the same token, which
+# Telegram allows only once at a time.
+remove_legacy() {
+  local f found=no
+  for f in "${LEGACY_FILES[@]}" "$LEGACY_TOKEN"; do [[ ! -e $f ]] || found=yes; done
+  id ente-tg-bot >/dev/null 2>&1 && found=yes
+  [[ $found == yes ]] || return 0
+  if systemctl cat ente-tg-bot.service >/dev/null 2>&1; then systemctl disable --now ente-tg-bot.service >/dev/null 2>&1 || true; fi
+  rm -f "${LEGACY_FILES[@]}"
+  rm -rf "$(dirname "$LEGACY_TOKEN")" /var/lib/ente-tg-bot /var/lib/private/ente-tg-bot
+  systemctl daemon-reload
+  if id ente-tg-bot >/dev/null 2>&1; then
+    pkill -TERM -u ente-tg-bot 2>/dev/null && sleep 2
+    pkill -KILL -u ente-tg-bot 2>/dev/null && sleep 1
+    userdel ente-tg-bot || die "could not remove the old bot's user ente-tg-bot (ps -u ente-tg-bot)"
+  fi
+  log "removed the older ente-tg-bot service: opsbot takes over"
+}
+
+# bot_checks: OK/FAIL lines (counted in FAILS): registered, opsbot's own checks, and that Ente's scripts root runs are root's
 bot_checks() {
   local out n
-  if systemctl is-active --quiet ente-tg-bot.service; then ok "telegram bot running (commands from user $TG_BOT_USER_ID only)"
-  else bad "telegram bot not running (journalctl -u ente-tg-bot)"; fi
-  if runuser -u "$BOT_USER" -- sudo -n -l "$BOT_HELPER" status >/dev/null 2>&1; then ok "bot may run its actions through sudo"
-  else bad "bot may not run its actions (sudo rule $BOT_SUDOERS)"; fi
-  if runuser -u "$BOT_USER" -- sudo -n -l /bin/bash >/dev/null 2>&1 || runuser -u "$BOT_USER" -- sudo -n -l "$BOT_HELPER" rm >/dev/null 2>&1
-  then bad "bot may run more than its actions as root (check $BOT_SUDOERS)"; else ok "bot may run nothing else as root"; fi
+  if [[ -f $PLUGIN_FILE ]]; then ok "registered with opsbot (/check, /backup, /proxy, /size and /status lines)"
+  else bad "Ente is not registered with opsbot ($0 install)"; fi
+  if [[ -x $OPSBOT_CLI ]]; then
+    out=$("$OPSBOT_CLI" check 2>&1) || true
+    printf '%s\n' "$out" | grep -E '^  (OK|FAIL)' || true
+    n=$(grep -c '^  FAIL' <<<"$out" || true); FAILS=$((FAILS + n))
+  else bad "opsbot is not installed ($0 install)"; fi
   # shellcheck disable=SC2046
-  if out=$(root_only_writable "$BOT_HELPER" $(bot_root_files) 2>&1); then ok "scripts run as root are root's alone"
-  else bad "scripts the bot runs as root are writable by others: $out"; fi
-  n=$(journalctl -u ente-tg-bot.service --since -1h -q -o cat 2>/dev/null | grep -cE '^[0-9-]+ [0-9:]+ Telegram API:' || true)
-  if ((n <= 5)); then ok "bot reaches Telegram ($n errors in the last hour)"; else bad "bot cannot reach Telegram reliably: $n errors in the last hour"; fi
+  if out=$(root_only_writable $(bot_root_files) 2>&1); then ok "Ente's scripts the bot runs as root are root's alone"
+  else bad "Ente's scripts the bot runs as root are writable by others: $out"; fi
+  [[ ! -e $LEGACY_UNIT ]] || bad "the older ente-tg-bot service is still installed ($0 install moves to opsbot)"
 }
 
 # ---------------------------------------------------------------- actions (run as root by the helper)
@@ -136,8 +151,8 @@ bucket_usage() {
   else echo "🪣 Buckets: not measured yet (/size)"; fi
 }
 
-# act_status: five or six short lines (proxy only when installed): services, backup, checks, system, buckets, proxy. ⚠️/❌ mark
-# what needs a look.
+# act_status: Ente's lines of /status (opsbot adds the system line): services, backup, checks, buckets, and the proxy when
+# installed. ⚠️/❌ mark what needs a look.
 act_status() {
   local s cid st down='' a b last line ts res nxt
   local state=$BACKUP_STATE
@@ -169,7 +184,6 @@ act_status() {
   else line="⚠️ Check: found problems $(ago "$ts") (/check)"; fi
   if [[ -e $state/verify-ok ]]; then line+=" · verify: passed $(ago "$(cat "$state/verify-ok")")"; else line+=" · verify: not passed yet"; fi
   echo "$line"
-  echo "🖥 Disk $(df -h / | awk 'NR == 2 {print $5 " used (" $4 " free)"}') · RAM $(free -m | awk '/^Mem:/ {print $7}') MB free · up $(dur "$(cut -d. -f1 /proc/uptime)")$([[ -e $REBOOT_FLAG ]] && echo ' · reboot pending')"
   bucket_usage "$state/usage"
   [[ ! -e $CADDY_SITES/s3-proxy.caddy ]] || echo "🔀 S3 proxy: $([[ $(cat "$PROXY_STATE" 2>/dev/null) == on ]] && echo on || echo off)"
 }
@@ -237,62 +251,41 @@ bot_cmd_action() {
 
 # ---------------------------------------------------------------- commands
 bot_cmd_install() {
-  local token h0 h1 tmp
+  local token tmp
   bot_load_env
   token=$(bot_token)
-  command -v sudo >/dev/null || die "sudo is not installed (run ente-setup.sh bootstrap)"
-  [[ -f $BOT_DIR/ente_tg_bot.py ]] || die "ente_tg_bot.py is missing next to $0 (copy the whole ente-server folder)"
+  [[ -f $OPSBOT_SH ]] || die "opsbot is missing: $OPSBOT_SH (copy the repository's opsbot folder next to ente-server)"
   # shellcheck disable=SC2046
   root_only_writable $(bot_root_files) ||
     die "the files the bot's actions run as root must be owned by root and writable by root only (chown -R root: $BOT_DIR; chmod -R go-w $BOT_DIR)"
-  TG_BOT_TOKEN=$token tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
-  id "$BOT_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$BOT_USER"
-  h0=$({ cat "$BOT_PY" "$BOT_UNIT" "$BOT_TOKEN_FILE" 2>/dev/null || true; } | sha256sum)
-  install -d -m 755 "$(dirname "$BOT_PY")"
-  write_file "$BOT_PY" 644 <"$BOT_DIR/ente_tg_bot.py"
-  install -d -m 700 "$(dirname "$BOT_TOKEN_FILE")"
-  printf '%s\n' "$token" | write_file "$BOT_TOKEN_FILE" 600
-  bot_helper | write_file "$BOT_HELPER" 755
-  tmp=$(mktemp); bot_sudoers >"$tmp"
-  visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "generated sudo rule is invalid; not installed"; }
-  write_file "$BOT_SUDOERS" 440 <"$tmp"; rm -f "$tmp"
-  bot_unit | write_file "$BOT_UNIT"
-  h1=$(cat "$BOT_PY" "$BOT_UNIT" "$BOT_TOKEN_FILE" | sha256sum)
-  systemctl daemon-reload
-  systemctl enable ente-tg-bot.service >/dev/null 2>&1
-  if [[ $h0 != "$h1" ]] || ! systemctl is-active --quiet ente-tg-bot.service; then systemctl restart ente-tg-bot.service; fi
-  sleep 3
-  systemctl is-active --quiet ente-tg-bot.service || die "the bot does not stay up (journalctl -u ente-tg-bot)"
-  log "telegram bot installed: send /status to it from your Telegram account (user $TG_BOT_USER_ID)"
+  remove_legacy
+  OPSBOT_TOKEN=$token OPSBOT_CHAT_ID=${TG_CHAT_ID:-$TG_BOT_USER_ID} OPSBOT_USER_ID=$TG_BOT_USER_ID bash "$OPSBOT_SH" install ||
+    die "opsbot install failed (see above)"
+  tmp=$(mktemp -d)
+  plugin_json >"$tmp/ente.json" || { rm -rf "$tmp"; die "could not write the plugin file"; }
+  "$OPSBOT_CLI" plugin add "$tmp/ente.json" || { rm -rf "$tmp"; die "opsbot refused the plugin (see above)"; }
+  rm -rf "$tmp"
+  log "telegram bot ready: send /status to it from your Telegram account (user $TG_BOT_USER_ID)"
 }
 
 bot_cmd_uninstall() {
   load_env
-  if systemctl cat ente-tg-bot.service >/dev/null 2>&1; then systemctl disable --now ente-tg-bot.service >/dev/null 2>&1 || true; fi
-  rm -f "$BOT_UNIT" "$BOT_PY" "$BOT_SUDOERS" "$BOT_HELPER"
-  rm -rf "$(dirname "$BOT_TOKEN_FILE")" /var/lib/ente-tg-bot /var/lib/private/ente-tg-bot
-  systemctl daemon-reload
-  if id "$BOT_USER" >/dev/null 2>&1; then
-    # anything else still running as the bot user (a test instance, a stuck action) would block userdel
-    pkill -TERM -u "$BOT_USER" 2>/dev/null && sleep 2
-    pkill -KILL -u "$BOT_USER" 2>/dev/null && sleep 1
-    userdel "$BOT_USER" || die "could not remove the user $BOT_USER (ps -u $BOT_USER); everything else is removed"
-  fi
-  log "telegram bot uninstalled"
+  if [[ -x $OPSBOT_CLI ]]; then "$OPSBOT_CLI" plugin remove ente; else rm -f "$PLUGIN_FILE"; fi
+  remove_legacy
+  log "Ente's bot commands removed (opsbot stays for its notifications and other plugins: '$OPSBOT_CLI uninstall' removes it)"
 }
 
 bot_cmd_status() {
   bot_load_env
-  [[ -e $BOT_UNIT ]] || { echo "the telegram bot is not installed ($0 install)"; return 1; }
+  [[ -e $PLUGIN_FILE || -e $LEGACY_UNIT ]] || { echo "the telegram bot is not installed ($0 install)"; return 1; }
   bot_checks
-  echo "recent activity:"; journalctl -u ente-tg-bot.service -q -o cat -n 8 --no-pager 2>/dev/null | sed 's/^/  /'
+  echo "recent activity:"; journalctl -u opsbot.service -q -o cat -n 8 --no-pager 2>/dev/null | sed 's/^/  /'
   ((FAILS == 0))
 }
 
 # check: only the OK/FAIL lines (for ente-ops.sh check); exit 1 on any FAIL.
 bot_cmd_check() {
   bot_load_env
-  [[ -e $BOT_UNIT ]] || { bad "telegram bot is not installed"; return 1; }
   bot_checks
   ((FAILS == 0))
 }

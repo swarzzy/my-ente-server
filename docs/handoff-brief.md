@@ -9,6 +9,7 @@ Nov 20, 2026 · @Dmitrii
 - `ente-setup.sh` builds the server: `deploy` (= `bootstrap` + `install` or `restore` + `backup-setup`), `codes`, `lockdown`, `update`.
 - `ente-ops.sh` runs it: `check` (daily; every FAIL is something nothing else reports) and `verify` (monthly; also reports the backup bucket's growth).
 - Add-ons: `ente-s3-proxy.sh`, `ente-tg-bot.sh`, `ente-vpn.sh`.
+- `opsbot/` (next to `ente-server/`, independent of Ente): the Telegram bot and notifications. Ente's alerts go through it and `ente-tg-bot.sh` registers Ente's commands as its plugin; other services can add their own ([`opsbot/README.md`](../opsbot/README.md)).
 
 [`ente-server/README.md`](../ente-server/README.md) is the runbook and the source of truth for how everything works. Read it first. [`functions-and-tests.md`](functions-and-tests.md) is the one-page overview of every function and what must be tested.
 
@@ -21,6 +22,8 @@ Nov 20, 2026 · @Dmitrii
 - **Server access:** only the admin key in `ente-setup.env` (`ADMIN_SSH_PUBKEY`) can log in, as `ops` on port 42876. Root and passwords are off.
 
 ## Open items
+
+- Production still runs the bot from before opsbot until it is moved: pull, then `sudo ./ente-setup.sh backup-setup` and `sudo ./ente-tg-bot.sh install` (README, "Telegram bot"). Tested on a fresh server, including a deleted secrets file.
 
 - The backup never deletes in the backup bucket (B2), but the server's key still could: swap it for a key without `deleteFiles`. The bucket still has the lifecycle rule `ente-setup-keep-deleted` (old versions expire after 60 days) from the earlier design; harmless, remove it if unwanted.
 - Do the yearly read-only restore drill from the PC (README, "Moving to a new VPS"): it proves the offline copies of the keys and `BACKUP_PASSPHRASE` open the backup. A full `restore` needs the same domain, so it is tested for real only by tests and the next server move.

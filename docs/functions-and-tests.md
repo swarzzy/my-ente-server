@@ -2,7 +2,7 @@
 
 As of 2026-11-20.
 
-Scripts in `ente-server/` turn a Debian VPS into a self-hosted Ente Photos server with photos in an S3 bucket, nightly encrypted backups to a second bucket, health checks, Telegram alerts and three optional add-ons. Each section lists what a function does and what a tester must prove. The runbook is [`ente-server/README.md`](../ente-server/README.md); this is the overview.
+Scripts in `ente-server/` turn a Debian VPS into a self-hosted Ente Photos server with photos in an S3 bucket, nightly encrypted backups to a second bucket, health checks, Telegram alerts and three optional add-ons. Telegram goes through `opsbot/`, a separate bot and notification service that Ente plugs into (its own [README](../opsbot/README.md)). Each section lists what a function does and what a tester must prove. The runbook is [`ente-server/README.md`](../ente-server/README.md); this is the overview.
 
 ## How it fits together
 
@@ -43,7 +43,7 @@ The apps upload and download photos directly to the photo bucket; the server han
 | `install` | Installs Docker and Caddy; fetches Ente's quickstart and edits it: ports on 127.0.0.1 only, the domain's URLs, the external photo bucket; pins the Ente images by digest; writes the Caddyfile (TLS, security headers) with `web.`, `albums.` and any `WEB_APPS` (`auth.`, `locker.`); sets CORS on the bucket (the web apps and `ente://app`, the desktop apps); starts the containers. | `https://api.<domain>/ping` answers; ports 8080/3000/3002 local only; images pinned; a changed quickstart layout is refused. |
 | `codes` | Prints sign-up verification codes from the last 24 h of museum logs (no mail server). | A sign-up's code shows up. |
 | `lockdown` | After a yes, makes the oldest user the admin and closes sign-ups; restarts museum. | Only after `y`; deleted accounts skipped; re-run changes nothing; new sign-ups refused. |
-| `backup-setup` | Creates the rclone remotes, refuses a bucket holding another instance's backup, installs the backup and verify timers, Telegram alerts (sends a test message), starts a first backup. Backup bucket keys in the secrets file replace the remote's (rotation); the passphrase is never replaced. | Foreign or unreadable backup refused; script folder writable by others refused; test message arrives; new keys applied, none given keeps the old. |
+| `backup-setup` | Creates the rclone remotes, refuses a bucket holding another instance's backup, installs the backup and verify timers, Telegram alerts (installs or updates opsbot with the config's token and chat, sends a test message, removes the alerts from before opsbot), starts a first backup. Backup bucket keys in the secrets file replace the remote's (rotation); the passphrase is never replaced. | Foreign or unreadable backup refused; script folder writable by others refused; test message arrives; new keys applied, none given keeps the old. |
 | `restore` | On a fresh server: takes config and database from whichever bucket has the newer dump, restores the newest dump, copies missing photos back from the backup bucket. Resumes if interrupted. | Restore from each bucket alone; wrong passphrase refused; interrupted at each stage, then re-run. |
 | `update` | Backs up first, moves the image pins to Ente's latest builds, recreates what changed, keeps the old pins in `image-pins.prev`. | Failed download or failed backup changes nothing; museum not answering points to `image-pins.prev`. |
 | `deploy` | `bootstrap` + `install` (or `restore` with `RESTORE=yes`) + `backup-setup` in one go. | A clean VPS ends with `check` passing. |
@@ -104,29 +104,41 @@ All three are optional and installed separately; each has `install`, `uninstall`
 | Add-on | What it does | What to test |
 | --- | --- | --- |
 | S3 proxy (`ente-s3-proxy.sh install / on / off`) | For devices that reach the bucket badly: a link rewriter in front of museum swaps the bucket host in its signed links for `S3_PROXY_HOST`; Caddy forwards only the bucket path and the apps' methods to the real endpoint with its own Host, so signatures stay valid. Bucket host and name come from `museum.yaml`. If the rewriter dies, Caddy falls back to museum. | `on` self-tests before going live; any failed step rolls everything back; links handed out while on keep working after off; uploads incl. multipart work both ways (browser test). |
-| Telegram bot (`ente-tg-bot.sh install`) | One person's commands by private message: `/status` (five or six lines, incl. the last bucket measurement), `/check`, `/backup`, `/proxy [on\|off]`, `/size` (measure both buckets now). Runs as its own user, long-polls (no open port); may run as root only seven fixed actions through a sudo rule. Strangers are ignored, the owner told at most hourly; commands older than a minute are skipped. | Only the owner's private messages act; injection refused; replies short with ✅/❌ titles; an action survives a bot restart; uninstall removes user, rule and token. |
+| Telegram bot (`ente-tg-bot.sh install`) | Registers Ente as the opsbot plugin `ente` (installing or updating opsbot with the bot on, and removing the bot from before opsbot): `/status` lines (services, backup, checks, last bucket measurement, proxy), `/check`, `/backup`, `/proxy [on\|off]`, `/size`. opsbot may run as root only these seven actions, through its helper. `uninstall` unregisters them; opsbot stays. | The plugin passes opsbot's validator; the seven actions and nothing else are allowed; every reply; the older bot is gone before opsbot polls; `check` includes the bot. |
 | AmneziaWG VPN (`ente-vpn.sh install`) | An obfuscated WireGuard VPN on `AWG_PORT` (UDP 1024–65535) with one shared client config; NAT, IPv4 only. Independent of Ente. | Self-test from a network namespace: handshake, exit address, no IPv6 leak, 20 MB download. |
+
+## opsbot (`opsbot/`, independent of Ente)
+
+| Part | What it does | What to test |
+| --- | --- | --- |
+| `opsbot.sh install` | Notifications (`opsbot-notify`, `opsbot-notify-unit`, `opsbot-alert@.service`) to `OPSBOT_CHAT_ID`, and with `OPSBOT_USER_ID` the bot service as the unprivileged user `opsbot`. Token in `/etc/opsbot/token` (600), a test message when token or chat change; re-runs keep stored values. | Bad token, ids or an unsendable test message stop it before anything is written; re-run changes nothing; emptying the user id removes the bot only. |
+| `opsbot.sh plugin add/remove` | Validates a plugin file (names, commands not taken, files it runs root's alone), copies it to `/etc/opsbot/plugins.d`, regenerates the sudo rule (exactly the registered plugin-action pairs), reloads the bot. | Conflicts, broken files and writable scripts refused; the rule follows the registry. |
+| The bot (`opsbot.py bot`) | Long-polls; only the owner's private messages; commands older than a minute skipped; strangers noticed at most hourly. Commands come from the plugins: quick actions reply with their output, long ones say they started, then the result, one at a time per lock. `/status`: each plugin's status, then a disk/RAM/uptime line. SIGHUP reloads the plugins and menu. | Every reply kind; injection refused; locks; a broken plugin skipped; reload; the token never logged. |
+| The root helper (`opsbot-action PLUGIN ACTION`) | Re-reads the root-owned plugin file, refuses unknown pairs and files others could change, runs the action as a transient unit from `/` with a clean environment. | Refusals; planted Python modules not loaded; an action outlives the bot. |
 
 ## Tests
 
-All suites live in `ente-server/tests/` and must pass on the server before a commit; there is no CI. `bash tests/run_all.sh` runs every suite that can run where it is; `sudo bash tests/run_all.sh --server` on the server adds the VPN and the proxy and bot end-to-end suites (about 3.5 min), and `--browser` also the browser test (about 4.5 min more; after proxy or web app changes and Ente updates). Counts are from the last full run on the server.
+All suites live in `ente-server/tests/` and `opsbot/tests/` and must pass on the server before a commit; there is no CI. `bash tests/run_all.sh` runs every suite that can run where it is; `sudo bash tests/run_all.sh --server` on the server adds the VPN and the proxy, opsbot and bot end-to-end suites (about 4.5 min), and `--browser` also the browser test (about 4.5 min more; after proxy or web app changes and Ente updates). Counts are from the last full run on the server.
 
 | Suite | Runs | Covers | Checks |
 | --- | --- | --- | --- |
 | `test_cli.sh` | anywhere | command lines, config value checks, `AWG_PORT`, safe `museum.yaml` write, photo bucket source, config paths, unattended-upgrade origins, the bucket CORS origins, LLMNR off | 63 (+3 on the server) |
-| `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 38 |
+| `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 39 |
 | `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults, growth line and bucket measurement, `size`, backup part of `check`, the backup following a bucket switch | 44 |
 | `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation, timer units | 63 |
-| `test_alerts.sh` | anywhere (fake Telegram) | every alert's text, limits, test message, alerts off, news unit | 22 |
+| `test_alerts.sh` | anywhere (fake Telegram) | alerts through opsbot: install, test message, the older alerts moved, every alert's text, alerts off, news unit | 25 |
 | `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning; `pg-update`, `rclone-update`, `news` | 45 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
 | `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |
-| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, sudo rule, every reply (stubbed server) | 75 |
+| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, token sources, the plugin file and its sudo rule, install/uninstall and the move from the older bot, every reply (stubbed server) | 69 |
 | `test_vpn_config.sh` | server, after VPN install | VPN key and obfuscation config | 13 |
-| `python3 -m unittest discover -s tests` | anywhere | link rewriter, bot against a fake Telegram | 50 |
+| `python3 -m unittest discover -s tests` | anywhere | link rewriter | 23 |
 | `proxy_e2e.sh` | server | the proxy end to end, real signed links | 42 |
-| `tg_bot_e2e.sh` | server | the real bot, sudo rule and actions; runs a real backup | 54 |
+| `tg_bot_e2e.sh` | server | Ente's plugin through the real opsbot; runs a real backup | 38 |
+| `opsbot/tests`: unittest | anywhere | the bot against a fake Telegram, plugin checks, helper, sudo rule | 44 |
+| `opsbot/tests/test_opsbot_cli.sh` | anywhere | install, plugins, checks, notification scripts, command line | 72 |
+| `opsbot/tests/opsbot_e2e.sh` | server, opsbot with a bot | a test plugin through the real sudo rule and helper, a second bot against a fake Telegram | 50 |
 | `proxy_browser_e2e.sh` | server | the web app in Chromium: sign-up, uploads incl. multipart, viewing, proxy on and off | 17 |
 
 Still manual:

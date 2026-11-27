@@ -38,7 +38,8 @@ REBOOT_FLAG=/var/run/reboot-required
 CERT_MIN_DAYS=20 # Caddy renews at 30 days left: fewer means renewal is failing
 IMAGE_MAX_DAYS=60
 DISK_WARN=80 DISK_FAIL=90
-BOT_UNIT_FILE=/etc/systemd/system/ente-tg-bot.service # the telegram bot add-on is installed when this exists
+BOT_MARKER=/etc/opsbot/plugins.d/ente.json # the telegram bot add-on (Ente as an opsbot plugin) is installed when this exists
+BOT_LEGACY=/etc/systemd/system/ente-tg-bot.service # the bot before opsbot
 
 # hours_since STAMP: whole hours since the date in STAMP
 hours_since() { echo $((($(date +%s) - $(date -d "$1" +%s)) / 3600)); }
@@ -138,10 +139,10 @@ check_bucket() {
 
 # check_addons: each installed add-on's own check (name, script, the file that marks it installed); its FAIL lines count here
 check_addons() {
-  local addon name script marker out rc
-  for addon in "s3 proxy|ente-s3-proxy.sh|$CADDY_SITES/s3-proxy.caddy" "telegram bot|ente-tg-bot.sh|$BOT_UNIT_FILE"; do
-    IFS='|' read -r name script marker <<<"$addon"
-    [[ -e $marker ]] || continue
+  local addon name script marker legacy out rc
+  for addon in "s3 proxy|ente-s3-proxy.sh|$CADDY_SITES/s3-proxy.caddy" "telegram bot|ente-tg-bot.sh|$BOT_MARKER|$BOT_LEGACY"; do
+    IFS='|' read -r name script marker legacy <<<"$addon"
+    [[ -e $marker || ( -n $legacy && -e $legacy ) ]] || continue
     echo "== $name"
     if [[ ! -f $SCRIPT_DIR/$script ]]; then bad "the $name is installed but $script is not next to $0"; continue; fi
     out=$(bash "$SCRIPT_DIR/$script" check 2>&1) && rc=0 || rc=$?
@@ -395,7 +396,7 @@ cmd_rclone_update() {
 }
 
 # ---------------------------------------------------------------- news
-ALERT_BIN=/usr/local/bin/ente-alert # installed by setup_alerts
+ALERT_BIN=/usr/local/bin/opsbot-notify # installed by setup_alerts (opsbot)
 # reg_info REF: "DIGEST DATE" of REF in the registry: the image index digest (what image-pins hold) and the amd64 build date.
 # Asks the registry only; nothing is downloaded.
 reg_info() {

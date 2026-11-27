@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Tests for ente-tg-bot.sh: config validation, the token source, the generated unit, sudo rule and root helper, and the
-# command line. Runs anywhere bash is; where visudo is installed (the server) the sudo rule is also validated. Changes
-# nothing on the machine: when run as root, the command-line checks run as an unprivileged user on a copy.
-# Run: bash tests/test_tg_bot_config.sh
+# Tests for ente-tg-bot.sh, Ente's plugin for opsbot: config validation, the token sources, the plugin file (checked by opsbot's
+# own validator, and the sudo rule opsbot makes of it), install/uninstall with opsbot and the older bot stubbed, the checks,
+# what each action replies, and the command line. Runs anywhere bash and python3 are; where visudo is installed (the server)
+# the sudo rule is also validated. Changes nothing on the machine: when run as root, the command-line checks run as an
+# unprivileged user on a copy. Run: bash tests/test_tg_bot_config.sh
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+OPSBOT_PY=$HERE/../../opsbot/opsbot.py
 
 TOKEN=123456789:AAH-test_token-abcdefghijklmnopqrstuv
 base_env() {
@@ -20,17 +22,37 @@ BACKUP_S3_REGION=us-east-005
 BACKUP_S3_BUCKET=ente-backup
 X
 }
-# in_bot ENV_EXTRA SECRETS CODE: source ente-tg-bot.sh with a config, a secrets file and a private alert env, run CODE
+# in_bot ENV_EXTRA SECRETS CODE: source ente-tg-bot.sh with a config, a secrets file and every outside path in $T, run CODE
 in_bot() {
   base_env >"$T/env"; printf '%s\n' "$1" >>"$T/env"
   printf '%s\n' "$2" >"$T/secrets"; chmod 600 "$T/secrets"
-  ( ENV_FILE=$T/env SECRETS_FILE=$T/secrets ALERT_ENV=$T/alert.env CMD=test
+  ( ENV_FILE=$T/env SECRETS_FILE=$T/secrets ALERT_ENV=$T/alert.env OPSBOT_TOKEN_FILE=$T/opsbot-token PLUGIN_FILE=$T/plugins/ente.json \
+      OPSBOT_SH=$T/fake/opsbot.sh OPSBOT_CLI=$T/fake/opsbot CMD=test
     # shellcheck source=/dev/null
     . "$HERE/../ente-tg-bot.sh"
+    LEGACY_UNIT=$T/legacy/ente-tg-bot.service LEGACY_TOKEN=$T/legacy/tok/token
+    LEGACY_FILES=("$LEGACY_UNIT" "$T/legacy/sudoers" "$T/legacy/helper" "$T/legacy/ente_tg_bot.py")
+    id() { [[ -n ${LEGACY_USER:-} ]]; }; userdel() { echo "userdel $*"; }; pkill() { return 1; }
+    systemctl() { echo "systemctl $*" >>"$T/systemctl.log"; }
     set +e
     eval "$3" )
 }
 U=TG_BOT_USER_ID=376193354
+mkdir -p "$T/fake" "$T/plugins"
+# a fake opsbot.sh (records how it was run) and installed opsbot CLI (records its arguments; plugin add copies the file)
+printf '#!/bin/bash\n{ echo "args=$*"; echo "token=${OPSBOT_TOKEN-unset}"; echo "chat=${OPSBOT_CHAT_ID-unset}"; echo "user=${OPSBOT_USER_ID-unset}"; } >"%s"\nexit "${OPSBOT_FAILS:-0}"\n' \
+  "$T/opsbot.log" >"$T/fake/opsbot.sh"
+cat >"$T/fake/opsbot" <<X
+#!/bin/bash
+echo "cli \$*" >>"$T/cli.log"
+case "\$1 \$2" in
+  "plugin add") cp "\$3" "$T/plugins/ente.json" ;;
+  "plugin remove") rm -f "$T/plugins/\$3.json" ;;
+  "check "*) printf '  OK    opsbot fine\n  FAIL  opsbot broken\n' ;;
+esac
+exit "\${CLI_FAILS:-0}"
+X
+chmod 755 "$T/fake/opsbot.sh" "$T/fake/opsbot"
 
 echo "== config validation"
 out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" 'bot_load_env && echo "LOADED $TG_BOT_USER_ID"' 2>&1)
@@ -41,55 +63,77 @@ for bad in "TG_BOT_USER_ID=" "TG_BOT_USER_ID='1 --api-base http://evil.example'"
 done
 
 echo "== bot token"
-rm -f "$T/alert.env"
 out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" 'bot_load_env; bot_token' 2>&1); check "token from the secrets file" '[[ $out == "$TOKEN" ]]' "$out"
-printf "TG_BOT_TOKEN='%s'\nTG_CHAT_ID='1'\n" "$TOKEN" >"$T/alert.env"
-out=$(in_bot "$U" "" 'bot_load_env; bot_token' 2>&1); check "token from the alerts' env file when the secrets file has none" '[[ $out == "$TOKEN" ]]' "$out"
-rm -f "$T/alert.env"
+echo "$TOKEN" >"$T/opsbot-token"
+out=$(in_bot "$U" "" 'bot_load_env; bot_token' 2>&1); check "else opsbot's stored token" '[[ $out == "$TOKEN" ]]' "$out"
+rm "$T/opsbot-token"; printf "TG_BOT_TOKEN='%s'\nTG_CHAT_ID='1'\n" "$TOKEN" >"$T/alert.env"
+out=$(in_bot "$U" "" 'bot_load_env; bot_token' 2>&1); check "else the token of the alerts from before opsbot" '[[ $out == "$TOKEN" ]]' "$out"
+rm "$T/alert.env"; mkdir -p "$T/legacy/tok"; echo "$TOKEN" >"$T/legacy/tok/token"
+out=$(in_bot "$U" "" 'bot_load_env; bot_token' 2>&1); check "else the token of the bot from before opsbot" '[[ $out == "$TOKEN" ]]' "$out"
+rm -r "$T/legacy"
 out=$(in_bot "$U" "" 'bot_load_env; bot_token </dev/null && echo GOT' 2>&1); check "no token anywhere is an error" '[[ $out != *GOT* && $out == *TG_BOT_TOKEN* ]]' "$out"
 
-echo "== service unit"
-out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" 'bot_load_env; bot_unit')
-check "runs as its own unprivileged user" '[[ $out == *"User=ente-tg-bot"* && $out == *"Group=ente-tg-bot"* && $out != *"User=root"* ]]' "$out"
-check "gets the token as a systemd credential, never on the command line" '[[ $out == *"LoadCredential=token:/etc/ente-tg-bot/token"* && $out != *"$TOKEN"* ]]' "$out"
-check "serves only the configured user" '[[ $out == *"--user-id 376193354"* ]]' "$out"
-check "runs actions only through sudo and the helper" '[[ $out == *"--action-cmd \"sudo -n /usr/local/sbin/ente-tg-action\""* ]]' "$out"
-check "keeps its state in its own directory and restarts on failure" '[[ $out == *"StateDirectory=ente-tg-bot"* && $out == *"Restart=always"* ]]' "$out"
-check "does not set NoNewPrivileges (sudo needs it)" '[[ $out != *"NoNewPrivileges=yes"* ]]' "$out"
-
-echo "== sudo rule"
-in_bot "$U" "" 'bot_sudoers' >"$T/sudoers"
-check "allows exactly the seven actions, as root, for the bot user only" \
-  '[[ $(grep -c "^ente-tg-bot ALL=(root) NOPASSWD:" "$T/sudoers") == 1 && $(grep -o "/usr/local/sbin/ente-tg-action [a-z-]*" "$T/sudoers" | sort | tr "\n" " ") == "/usr/local/sbin/ente-tg-action backup /usr/local/sbin/ente-tg-action check /usr/local/sbin/ente-tg-action proxy-off /usr/local/sbin/ente-tg-action proxy-on /usr/local/sbin/ente-tg-action proxy-status /usr/local/sbin/ente-tg-action size /usr/local/sbin/ente-tg-action status " ]]' "$(cat "$T/sudoers")"
+echo "== the plugin file"
+mkdir -p "$T/pj"
+in_bot "$U" "" 'bot_load_env; plugin_json' >"$T/pj/ente.json" 2>"$T/pj.err"
+out=$(python3 -I "$OPSBOT_PY" validate "$T/pj/ente.json" --plugins "$T/none" 2>&1)
+check "opsbot's validator accepts it" '[[ $out == ente ]]' "$out $(cat "$T/pj.err")"
+pj() { python3 -I -c "import json, sys; d = json.load(open(sys.argv[1])); print($1)" "$T/pj/ente.json"; }
+check "the helper runs this script's action command" '[[ $(pj "d[\"exec\"]") == "[$(printf "%s" "'"'"'/bin/bash'"'"', '"'"'$(realpath "$HERE/..")/ente-tg-bot.sh'"'"', '"'"'action'"'"'")]" ]]' "$(pj 'd["exec"]')"
+check "... with the config and secrets files this install used" \
+  '[[ $(pj "d[\"env\"]") == "{'"'"'ENV_FILE'"'"': '"'"'$(realpath "$T/env")'"'"', '"'"'SECRETS_FILE'"'"': '"'"'$(realpath "$T/secrets")'"'"'}" ]]' "$(pj 'd["env"]')"
+check "commands: /check /backup /proxy /size, and Ente's /status lines" \
+  '[[ $(pj "\" \".join(c[\"command\"] for c in d[\"commands\"]), d[\"status\"]") == "check backup proxy size status" ]]' "$(pj 'd["commands"]')"
+check "the seven actions, exactly those the script accepts" \
+  '[[ $(pj "\" \".join(sorted(d[\"actions\"]))") == "backup check proxy-off proxy-on proxy-status size status" ]] &&
+   [[ $(grep -o "\"action [a-z-]*\"" "$HERE/../ente-tg-bot.sh" | tr -d "\"" | sed "s/action //" | sort | paste -sd" ") == "backup check proxy-off proxy-on proxy-status size status" ]]'
+check "/proxy on and off share one lock with /proxy" '[[ $(pj "{d[\"actions\"][a].get(\"lock\") for a in (\"proxy-on\", \"proxy-off\", \"proxy-status\")}") == "{'"'"'proxy'"'"'}" ]]'
+check "every long action says it started, and how it ended" \
+  '[[ $(pj "all({\"started\", \"ok\", \"fail\", \"busy\"} <= set(a) for n, a in d[\"actions\"].items() if n != \"status\")") == True ]]'
+python3 -I "$OPSBOT_PY" sudoers opsbot /usr/local/sbin/opsbot-action --plugins "$T/pj" >"$T/sudoers"
+check "opsbot's sudo rule for it: exactly the seven actions, as root, for the bot user only" \
+  '[[ $(grep -c "^opsbot ALL=(root) NOPASSWD:" "$T/sudoers") == 1 && $(grep -o "/usr/local/sbin/opsbot-action ente [a-z-]*" "$T/sudoers" | sort | sed "s|.* ||" | paste -sd" ") == "backup check proxy-off proxy-on proxy-status size status" ]]' "$(cat "$T/sudoers")"
 check "no wildcard and no other command" '! grep -qE "\*|ALL$|ALL,|/bin/|/usr/bin/" <(grep -v "^#" "$T/sudoers")' "$(cat "$T/sudoers")"
 if command -v visudo >/dev/null; then
   out=$(visudo -cf "$T/sudoers" 2>&1); rc=$?; check "visudo accepts the rule" '[[ $rc -eq 0 ]]' "$out"
-  printf 'ente-tg-bot ALL=(root NOPASSWD /x\n' >"$T/bad.sudoers"; visudo -cf "$T/bad.sudoers" >/dev/null 2>&1; rc=$?
-  check "a broken rule is seen as broken (harness self-test)" '[[ $rc -ne 0 ]]'
 else
   echo "  skip  visudo not installed here (run on the server)"
 fi
 
-echo "== root helper"
-printf '#!/bin/bash\necho "forwarded: $*"\n' >"$T/fake-bot.sh"
-in_bot "$U" "" "bot_helper" >"$T/helper.real"
-check "the real helper starts actions as a transient unit, from /, with a time limit" 'grep -q "^cd / " "$T/helper.real" && grep -q "^exec systemd-run .*--wait --pipe.*RuntimeMaxSec=" "$T/helper.real"' "$(cat "$T/helper.real")"
-( cd "$T" && BOT_RUN="env -i" in_bot "$U" "" "BOT_SCRIPT=$T/fake-bot.sh bot_helper" ) >"$T/helper"; chmod 755 "$T/helper"
-printf '#!/bin/bash\necho "forwarded: $* cwd=$PWD leak=${LEAK:-none}"\n' >"$T/fake-bot.sh"
-out=$(cd "$T" && LEAK=secret "$T/helper" status 2>&1); check "helper passes on neither the working directory nor the environment" '[[ $out == "forwarded: action status cwd=/ leak=none" ]]' "$out"
-printf '#!/bin/bash\necho "forwarded: $*"\n' >"$T/fake-bot.sh"
-for a in status check backup proxy-on proxy-off proxy-status size; do
-  out=$("$T/helper" "$a" 2>&1); check "helper forwards '$a'" '[[ $out == "forwarded: action $a" ]]' "$out"
-done
-for a in "rm" "status;id" "" "../x" "--help" "STATUS"; do
-  out=$("$T/helper" "$a" 2>&1); rc=$?; check "helper refuses '$a'" '[[ $rc -eq 2 && $out != *forwarded* ]]' "$out"
-done
-out=$("$T/helper" status check 2>&1); rc=$?; check "helper refuses two arguments" '[[ $rc -eq 2 && $out != *forwarded* ]]' "$out"
-printf '#!/bin/bash\necho "files: $ENV_FILE $SECRETS_FILE"\n' >"$T/fake-bot.sh"
-( cd "$T" && BOT_RUN="env -i" in_bot "$U" "" "BOT_SCRIPT=$T/fake-bot.sh bot_helper" ) >"$T/helper2"; chmod 755 "$T/helper2"
-out=$("$T/helper2" status 2>&1)
-check "helper runs the actions with the config and secrets files the install used" '[[ $out == "files: $(realpath "$T/env") $(realpath "$T/secrets")" ]]' "$out"
-check "helper does not pass the environment through (absolute paths only)" '! grep -qE "\\\$[A-Z_]+[^0-9]" <(grep -v "^#" "$T/helper" | grep -v "\\\$1\|\\\$#")' "$(cat "$T/helper")"
+echo "== install and uninstall"
+root_ok='root_only_writable() { :; }'
+out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
+check "install: opsbot with the token, the user, and the user as chat when TG_CHAT_ID is empty" \
+  '[[ $(cat "$T/opsbot.log") == "$(printf "args=install\ntoken=%s\nchat=376193354\nuser=376193354" "$TOKEN")" ]]' "$(cat "$T/opsbot.log"; echo "$out")"
+check "... then registers the plugin" '[[ $(cat "$T/cli.log") == "cli plugin add "*"/ente.json" && -s $T/plugins/ente.json ]] && grep -q "telegram bot ready" <<<"$out"' "$out"
+out=$(in_bot "$U
+TG_CHAT_ID=-1001234567" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
+check "... alerts to TG_CHAT_ID when it is set" 'grep -qx "chat=-1001234567" "$T/opsbot.log"' "$(cat "$T/opsbot.log")"
+rm -f "$T/cli.log"
+out=$(OPSBOT_FAILS=1 in_bot "$U" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
+check "a failed opsbot install stops it: nothing registered" '[[ $out == *"opsbot install failed"* && ! -e $T/cli.log ]]' "$out"
+out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" 'root_only_writable() { return 1; }; bot_cmd_install' 2>&1)
+check "scripts others can write: refused before anything is done" '[[ $out == *"must be owned by root"* && ! -e $T/cli.log ]]' "$out"
+mkdir -p "$T/legacy/tok"; touch "$T/legacy/ente-tg-bot.service" "$T/legacy/sudoers" "$T/legacy/helper" "$T/legacy/ente_tg_bot.py" "$T/legacy/tok/token"
+rm -f "$T/systemctl.log"
+out=$(LEGACY_USER=1 in_bot "$U" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
+check "the bot from before opsbot is removed first: service, files, token, user" \
+  '[[ -z $(find "$T/legacy" -type f) && $(cat "$T/systemctl.log") == *"disable --now ente-tg-bot.service"* && $out == *"userdel ente-tg-bot"* && $out == *"opsbot takes over"* ]]' "$out"
+check "... before opsbot starts polling the same token" '[[ $(grep -n "opsbot takes over" <<<"$out" | cut -d: -f1) -lt $(grep -n "telegram bot ready" <<<"$out" | cut -d: -f1) ]]' "$out"
+rm -f "$T/cli.log"
+out=$(in_bot "$U" "" 'bot_cmd_uninstall' 2>&1)
+check "uninstall: unregisters the plugin, opsbot stays" '[[ $(cat "$T/cli.log") == "cli plugin remove ente" && ! -e $T/plugins/ente.json && $out == *"opsbot stays"* ]]' "$out"
+
+echo "== checks"
+out=$(in_bot "$U" "" "$root_ok; bot_checks; echo FAILS=\$FAILS" 2>&1)
+check "not registered: a FAIL, and opsbot's own lines with their FAILs counted" \
+  '[[ $out == *"FAIL  Ente is not registered with opsbot"* && $out == *"OK    opsbot fine"* && $out == *"FAIL  opsbot broken"* && $out == *FAILS=2 ]]' "$out"
+touch "$T/plugins/ente.json"; mkdir -p "$T/legacy"; touch "$T/legacy/ente-tg-bot.service"
+out=$(in_bot "$U" "" "$root_ok; bot_checks; echo FAILS=\$FAILS" 2>&1)
+check "registered, but the older bot still there: says to move it" '[[ $out == *"OK    registered with opsbot"* && $out == *"FAIL  the older ente-tg-bot service is still installed"* && $out == *FAILS=2 ]]' "$out"
+rm -r "$T/legacy"
+out=$(in_bot "$U" "" 'root_only_writable() { echo "group/world-writable: /x" >&2; return 1; }; bot_checks; echo FAILS=$FAILS' 2>&1)
+check "scripts others can write are a FAIL" '[[ $out == *"FAIL  Ente'"'"'s scripts the bot runs as root are writable by others: group/world-writable: /x"* ]]' "$out"
 
 echo "== failing actions still report"
 if [[ $EUID -ne 0 ]]; then # here ente-ops.sh check fails with "run as root": the reply must carry that, not be empty
@@ -102,14 +146,14 @@ check "the root-only check covers the scripts, the link rewriter, the env file a
 
 echo "== what the actions reply"
 # act CODE: run CODE (act_* calls) with the server stubbed: three containers (DOWN / EXITED), systemd (BRES, BTS: the last
-# backup run; CRES, CTS: the last daily check; BRC: what starting a backup returns), df, free, the journal ($T/journal), and
+# backup run; CRES, CTS: the last daily check; BRC: what starting a backup returns), the journal ($T/journal), and
 # fake ente-ops.sh / ente-s3-proxy.sh in $T/fake (their output in $T/fake.out, exit code in FAKE_RC)
 mkdir -p "$T/fake" "$T/st" "$T/sites"
 for f in ente-ops.sh ente-s3-proxy.sh; do printf '#!/bin/bash\ncat "%s"\nexit "${FAKE_RC:-0}"\n' "$T/fake.out" >"$T/fake/$f"; done
 # the bot shows timer times in the server's zone: pin it, so "03:00 CET" reads 03:00 on a server in any zone
 act() {
   TZ=Europe/Berlin in_bot "$U" "" '
-    BOT_DIR=$T/fake BACKUP_STATE=$T/st PROXY_STATE=$T/proxy-state REBOOT_FLAG=$T/reboot CADDY_SITES=$T/sites
+    BOT_DIR=$T/fake BACKUP_STATE=$T/st PROXY_STATE=$T/proxy-state CADDY_SITES=$T/sites
     bot_load_env
     dc() { [[ $1 == ps && " ${DOWN:-} " != *" $3 "* ]] && echo "cid-$3"; return 0; }
     docker() { local c=${4#cid-}; if [[ " ${EXITED:-} " == *" $c "* ]]; then echo exited; elif [[ $c == web ]]; then echo running; else echo healthy; fi; }
@@ -125,29 +169,26 @@ act() {
       esac
     }
     journalctl() { cat "$T/journal"; }
-    df() { printf "Filesystem Size Used Avail Use%% Mounted\n/dev/x 24G 5.7G 17G 26%% /\n"; }
-    free() { printf "              total used free shared buff/cache available\nMem: 1973 564 968 33 654 1408\n"; }
     '"$1" 2>&1
 }
 stamps() { date -Is -d "$1 ago" >"$T/st/last-ok-s3"; date -Is -d "${2:-$1} ago" >"$T/st/last-ok-photo-config"; date -Is -d "3 days ago" >"$T/st/verify-ok"; }
 out=$(act 'dur 45; dur 600; dur 7200; dur 200000' | tr '\n' '|'); check "dur: s, min, h, days" '[[ $out == "45 s|10 min|2 h|2 days|" ]]' "$out"
-stamps "2 hours"; rm -f "$T/st/hc-fail" "$T/reboot"
+stamps "2 hours"; rm -f "$T/st/hc-fail"
 printf 'date %s\nphoto 886046720 360\nbackup 2684354560 371\n' "$(date -Is -d "3 hours ago")" >"$T/st/usage"
 out=$(act act_status)
-check "status, all well: five lines, no warnings" '[[ $(wc -l <<<"$out") -eq 5 && $out != *"⚠️"* && $out != *"❌"* ]]' "$out"
+check "status, all well: Ente's four lines (opsbot adds the system line), no warnings" '[[ $(wc -l <<<"$out") -eq 4 && $out != *"⚠️"* && $out != *"❌"* && $out != *"Disk"* ]]' "$out"
 check "... services" '[[ $(sed -n 1p <<<"$out") == "✅ Ente is up (museum, web, postgres)" ]]' "$out"
 check "... backup: last good and next run" '[[ $(sed -n 2p <<<"$out") == "💾 Backup: last good 2 h ago · next Tue 03:00" ]]' "$out"
 check "... check and verify" '[[ $(sed -n 3p <<<"$out") == "🩺 Check: passed 5 h ago · verify: passed 3 days ago" ]]' "$out"
-check "... disk, RAM, uptime" '[[ $(sed -n 4p <<<"$out") == "🖥 Disk 26% used (17G free) · RAM 1408 MB free · up "* ]]' "$out"
 check "... both buckets as last measured (verify or /size)" \
-  '[[ $(sed -n 5p <<<"$out") == "🪣 Buckets: photos 845.0MiB, 360 files · backup 2.5GiB, 371 files · measured 3 h ago" ]]' "$out"
-touch "$T/sites/s3-proxy.caddy"; echo on >"$T/proxy-state"; touch "$T/reboot"; date >"$T/st/hc-fail"
+  '[[ $(sed -n 4p <<<"$out") == "🪣 Buckets: photos 845.0MiB, 360 files · backup 2.5GiB, 371 files · measured 3 h ago" ]]' "$out"
+touch "$T/sites/s3-proxy.caddy"; echo on >"$T/proxy-state"; date >"$T/st/hc-fail"
 out=$(EXITED=web DOWN=postgres BRES=exit-code CRES=exit-code act act_status)
 check "status, problems: a container exited, one missing" '[[ $(sed -n 1p <<<"$out") == "❌ Down: web (exited), postgres (not running)" ]]' "$out"
 check "... a failed last run and a failed heartbeat ping" '[[ $(sed -n 2p <<<"$out") == "💾 Backup: last good 2 h ago, the last run failed · next Tue 03:00 · heartbeat ping failed" ]]' "$out"
 check "... a check that found problems" '[[ $(sed -n 3p <<<"$out") == "⚠️ Check: found problems 5 h ago (/check)"* ]]' "$out"
-check "... a pending reboot, and the proxy last" '[[ $(sed -n 4p <<<"$out") == *" · reboot pending" && $(sed -n 6p <<<"$out") == "🔀 S3 proxy: on" ]]' "$out"
-rm -f "$T/sites/s3-proxy.caddy" "$T/reboot" "$T/st/hc-fail"
+check "... and the proxy last" '[[ $(sed -n 5p <<<"$out") == "🔀 S3 proxy: on" ]]' "$out"
+rm -f "$T/sites/s3-proxy.caddy" "$T/st/hc-fail"
 stamps "2 hours" "40 hours"; out=$(act act_status | sed -n 2p)
 check "status: the older part of the backup counts, over 36 h is a warning" '[[ $out == "⚠️ Backup: last good 40 h ago · next Tue 03:00" ]]' "$out"
 stamps "40 hours" "2 hours"; out=$(act act_status | sed -n 2p)
@@ -155,8 +196,8 @@ check "... whichever part it is" '[[ $out == "⚠️ Backup: last good 40 h ago 
 rm "$T/st/last-ok-photo-config" "$T/st/verify-ok" "$T/st/usage"; out=$(BTS= CTS= act act_status)
 check "status after a fresh install: no good backup yet, nothing run, buckets not measured" \
   '[[ $(sed -n 2p <<<"$out") == "⚠️ Backup: no good backup yet · next Tue 03:00" && $(sed -n 3p <<<"$out") == "🩺 Check: not run since boot · verify: not passed yet" &&
-     $(sed -n 5p <<<"$out") == "🪣 Buckets: not measured yet (/size)" ]]' "$out"
-printf 'date %s\nphoto 1 1\n' "$(date -Is)" >"$T/st/usage"; out=$(act act_status | sed -n 5p)
+     $(sed -n 4p <<<"$out") == "🪣 Buckets: not measured yet (/size)" ]]' "$out"
+printf 'date %s\nphoto 1 1\n' "$(date -Is)" >"$T/st/usage"; out=$(act act_status | sed -n 4p)
 check "a usage file without the backup bucket counts as not measured" '[[ $out == "🪣 Buckets: not measured yet"* ]]' "$out"
 
 printf '%s\n' "photo bucket p: 1.0KiB, 2 files" >"$T/fake.out"

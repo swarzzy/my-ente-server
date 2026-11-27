@@ -1061,20 +1061,20 @@ EOF
 }
 
 # ---------------------------------------------------------------- telegram alerts
-# setup_alerts: with TG_CHAT_ID set, install /usr/local/bin/ente-alert (send a message), ente-alert@.service (sends the log of a
-# failed unit), and ente-check.timer (daily `check` at 09:00; a FAIL triggers an alert). Sets ALERT_ONFAIL for ente-backup.service.
-# Each run first sends a test message, so a wrong token or chat id stops it here, not on the day a backup fails.
-# The bot token lives only in /etc/ente-alert.env (600) and is passed to curl on stdin, never on a command line.
-# Without TG_CHAT_ID the alert units are removed.
+# setup_alerts: with TG_CHAT_ID set, Telegram alerts through opsbot (../opsbot, installed or updated here with the token and
+# chat from this config): ente-alert@.service runs ente-alert-unit (the title and the lines that say why, for Ente's units),
+# ente-check.timer runs the daily `check` at 09:00 and ente-news.timer the monthly news, each alerting when it fails. Sets
+# ALERT_ONFAIL for ente-backup.service. Each run sends a test message, so a wrong token or chat id stops it here, not on the
+# day a backup fails. Without TG_CHAT_ID Ente's alert units are removed (opsbot stays: other services may use it).
 ALERT_ONFAIL=
-tg_api() { # tg_api METHOD [curl args...]: call the Bot API with TG_BOT_TOKEN
-  local m=$1; shift
-  curl -fsS -m 20 --retry 3 -o /dev/null -K - "$@" <<<"url = \"https://api.telegram.org/bot$TG_BOT_TOKEN/$m\""
-}
+OPSBOT_SH=${OPSBOT_SH:-$SCRIPT_DIR/../opsbot/opsbot.sh}
+OPSBOT_NOTIFY=${OPSBOT_NOTIFY:-/usr/local/bin/opsbot-notify}
+OPSBOT_TOKEN_FILE=${OPSBOT_TOKEN_FILE:-/etc/opsbot/token}
+# the alerts before opsbot: their token file (read once more, then removed) and sender
+ALERT_LEGACY=(/etc/ente-alert.env /usr/local/bin/ente-alert)
 # the files setup_alerts installs, removed again when TG_CHAT_ID is emptied
 ALERT_FILES=(/etc/systemd/system/ente-check.timer /etc/systemd/system/ente-check.service /etc/systemd/system/ente-alert@.service
-  /etc/ente-alert.env /usr/local/bin/ente-alert /usr/local/bin/ente-alert-unit /etc/systemd/system/ente-news.timer
-  /etc/systemd/system/ente-news.service)
+  /usr/local/bin/ente-alert-unit /etc/systemd/system/ente-news.timer /etc/systemd/system/ente-news.service "${ALERT_LEGACY[@]}")
 setup_alerts() {
   local f ce
   if [[ -z $TG_CHAT_ID ]]; then
@@ -1088,46 +1088,30 @@ setup_alerts() {
     done
     return 0
   fi
-  if [[ -z $TG_BOT_TOKEN && -f /etc/ente-alert.env ]]; then TG_BOT_TOKEN=$(. /etc/ente-alert.env; echo "$TG_BOT_TOKEN"); fi
-  need_secret TG_BOT_TOKEN
+  # the token: the secrets file, else what opsbot (or the alerts before it) stored
+  if [[ -z $TG_BOT_TOKEN && -f ${ALERT_LEGACY[0]} ]]; then TG_BOT_TOKEN=$(. "${ALERT_LEGACY[0]}"; echo "$TG_BOT_TOKEN"); fi
+  [[ -n $TG_BOT_TOKEN || -f $OPSBOT_TOKEN_FILE ]] || need_secret TG_BOT_TOKEN
+  [[ -f $OPSBOT_SH ]] || die "opsbot is missing: $OPSBOT_SH (copy the repository's opsbot folder next to ente-server)"
   ce=$(config_env)
-  tg_api getMe 2>/dev/null || die "Telegram rejected the bot token, or api.telegram.org is unreachable"
-  tg_api sendMessage --data-urlencode "chat_id=$TG_CHAT_ID" \
-    --data-urlencode "text=🔔 Ente alerts on $(hostname) ($DOMAIN) are set up. Alerts arrive here when a backup or the daily check fails." 2>/dev/null ||
+  # OPSBOT_USER_ID unset: opsbot keeps its bot as it is (ente-tg-bot.sh install sets it up)
+  env -u OPSBOT_USER_ID OPSBOT_TOKEN="$TG_BOT_TOKEN" OPSBOT_CHAT_ID="$TG_CHAT_ID" bash "$OPSBOT_SH" install ||
+    die "opsbot install failed (see above): alerts are not set up"
+  "$OPSBOT_NOTIFY" "🔔 Ente alerts on $(hostname) ($DOMAIN) are set up. Alerts arrive here when a backup or the daily check fails." </dev/null ||
     die "could not send to TG_CHAT_ID: wrong chat id, or nobody pressed Start in the bot / the bot is not in the group"
-  write_file /etc/ente-alert.env 600 <<EOF
-TG_BOT_TOKEN='$TG_BOT_TOKEN'
-TG_CHAT_ID='$TG_CHAT_ID'
-EOF
-  write_file /usr/local/bin/ente-alert 755 <<'EOF'
+  if [[ -e ${ALERT_LEGACY[0]} || -e ${ALERT_LEGACY[1]} ]]; then rm -f "${ALERT_LEGACY[@]}"; log "removed the alerts from before opsbot"; fi
+  write_file /usr/local/bin/ente-alert-unit 755 <<EOF
 #!/usr/bin/env bash
-# Managed by ente-setup.sh. ente-alert TITLE < BODY: send TITLE and the end of BODY (Telegram allows 4096 chars) as one message.
+# Managed by ente-setup.sh. ente-alert-unit UNIT: the alert for a failed Ente unit, sent by opsbot: its title, and which lines
+# of its log say why (FAIL lines are shown as "❌ ...").
 set -euo pipefail
-. /etc/ente-alert.env
-body=$(tail -c 3500 | iconv -c -f utf-8 -t utf-8 || true)
-text="$1"
-[[ -z $body ]] || text+=$'\n\n'"$body"
-curl -fsS -m 20 --retry 3 -o /dev/null -K - --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$text" \
-  <<<"url = \"https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage\""
-EOF
-  write_file /usr/local/bin/ente-alert-unit 755 <<'EOF'
-#!/usr/bin/env bash
-# Managed by ente-setup.sh. ente-alert-unit UNIT: tell Telegram that UNIT's last run failed, with the lines that say why.
-set -euo pipefail
-u=$1 h=$(hostname)
-id=$(systemctl show -p InvocationID --value "$u" 2>/dev/null || true)
-if [[ -n $id ]]; then out=$(journalctl -q -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$id" || true)
-else out=$(journalctl -q -o cat --no-pager -u "$u" -n 40 || true); fi
-case $u in
-  ente-check.service) title="⚠️ Daily check found problems on $h"; why='^  FAIL|ERROR' ;;
-  ente-verify.service) title="⚠️ Monthly backup verify found problems on $h"; why='^  FAIL|ERROR' ;;
-  ente-backup.service) title="❌ Backup failed on $h"; why='ERROR|WARNING' ;;
-  *) title="❌ $u failed on $h"; why='ERROR' ;;
+u=\$1 h=\$(hostname)
+case \$u in
+  ente-check.service) title="⚠️ Daily check found problems on \$h"; why='^  FAIL|ERROR' ;;
+  ente-verify.service) title="⚠️ Monthly backup verify found problems on \$h"; why='^  FAIL|ERROR' ;;
+  ente-backup.service) title="❌ Backup failed on \$h"; why='ERROR|WARNING' ;;
+  *) title="❌ \$u failed on \$h"; why='ERROR' ;;
 esac
-# the lines that say why (FAIL lines as "❌ ..."), else the end of the log. -a: a stray non-UTF-8 byte must not make it "binary"
-if grep -aqE "$why" <<<"$out"; then out=$(grep -aE "$why" <<<"$out" | sed -E 's/^  FAIL  /❌ /' | tail -n 30)
-else out=$(tail -n 15 <<<"$out"); fi
-printf '%s\n' "$out" | /usr/local/bin/ente-alert "$title"
+exec $OPSBOT_NOTIFY-unit "\$u" "\$title" "\$why"
 EOF
   write_file /etc/systemd/system/ente-alert@.service <<'EOF'
 [Unit]
@@ -1186,7 +1170,7 @@ EOF
   systemctl daemon-reload
   systemctl enable --now ente-check.timer ente-news.timer >/dev/null 2>&1
   ALERT_ONFAIL='OnFailure=ente-alert@%n.service'
-  log "telegram alerts on (failed backup, daily check at 09:00, newer Ente builds on the 2nd), test message sent. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
+  log "telegram alerts on through opsbot (failed backup, daily check at 09:00, newer Ente builds on the 2nd), test message sent. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
 }
 
 # backup-setup: rclone remotes, refuse a foreign backup, install the timer and start a first backup.
@@ -1305,7 +1289,8 @@ cmd_deploy() {
   # fail now, not after a 10-minute bootstrap
   need ADMIN_USER ADMIN_SSH_PUBKEY
   need_secret S3_ACCESS_KEY S3_SECRET_KEY BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY BACKUP_PASSPHRASE
-  [[ -z $TG_CHAT_ID || -f /etc/ente-alert.env ]] || need_secret TG_BOT_TOKEN
+  [[ -z $TG_CHAT_ID || -f $OPSBOT_TOKEN_FILE || -f ${ALERT_LEGACY[0]} ]] || need_secret TG_BOT_TOKEN
+  [[ -z $TG_CHAT_ID || -f $OPSBOT_SH ]] || die "TG_CHAT_ID is set but opsbot is missing: $OPSBOT_SH (copy the repository's opsbot folder next to ente-server)"
   cmd_bootstrap
   if [[ $RESTORE == yes ]]; then cmd_restore; else cmd_install; fi
   cmd_backup_setup

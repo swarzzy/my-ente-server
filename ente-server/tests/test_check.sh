@@ -157,10 +157,10 @@ mv "$T/m.bak" "$T/ente/museum.yaml"
 
 echo "== add-ons"
 mkdir -p "$T/addons" "$T/sites"
-addons() { run 'SCRIPT_DIR=$T/addons CADDY_SITES=$T/sites BOT_UNIT_FILE=$T/bot.service; check_addons; echo "FAILS=$FAILS"'; }
-rm -f "$T/sites/s3-proxy.caddy" "$T/bot.service"; addons
+addons() { run 'SCRIPT_DIR=$T/addons CADDY_SITES=$T/sites BOT_MARKER=$T/ente.json BOT_LEGACY=$T/legacy.service; check_addons; echo "FAILS=$FAILS"'; }
+rm -f "$T/sites/s3-proxy.caddy" "$T/ente.json" "$T/legacy.service"; addons
 check "none installed: nothing shown" '[[ $(cat "$T/out") == "FAILS=0" ]]' "$(cat "$T/out")"
-touch "$T/sites/s3-proxy.caddy" "$T/bot.service"
+touch "$T/sites/s3-proxy.caddy" "$T/ente.json"
 printf '#!/bin/bash\necho "  OK    proxy fine"\n' >"$T/addons/ente-s3-proxy.sh"
 printf '#!/bin/bash\necho "  OK    bot fine"; echo "  FAIL  bot not running"; echo "  FAIL  bot token"; exit 1\n' >"$T/addons/ente-tg-bot.sh"
 addons
@@ -169,6 +169,11 @@ check "both installed: their sections, the bot's two FAIL lines counted" \
 printf '#!/bin/bash\necho "S3_PROXY_HOST is not set"; exit 1\n' >"$T/addons/ente-s3-proxy.sh"; rm "$T/addons/ente-tg-bot.sh"; addons
 check "a check that did not run, a script that is missing: one FAIL each" \
   '[[ $(fails) -eq 2 ]] && grep -q "FAIL  the s3 proxy check did not run (exit 1): S3_PROXY_HOST is not set" "$T/out" && grep -q "FAIL  the telegram bot is installed but ente-tg-bot.sh is not next to" "$T/out"' "$(cat "$T/out")"
+
+rm -f "$T/sites/s3-proxy.caddy" "$T/ente.json"; touch "$T/legacy.service"
+printf '#!/bin/bash\necho "  FAIL  the older ente-tg-bot service is still installed"; exit 1\n' >"$T/addons/ente-tg-bot.sh"; addons
+check "only the bot from before opsbot: its section is shown, so check says to move it" \
+  '[[ $(fails) -eq 1 ]] && grep -q "^== telegram bot" "$T/out" && grep -q "older ente-tg-bot service" "$T/out"' "$(cat "$T/out")"
 
 echo "== check runs every section and fails on any FAIL"
 run 'for f in check_services check_web check_security check_bucket check_addons check_backup check_system; do eval "$f() { echo $f; }"; done

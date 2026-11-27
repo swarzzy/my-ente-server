@@ -22,7 +22,8 @@ Every subcommand is safe to re-run. Log: `/var/log/ente-setup.log` (no secrets).
 | `ente-setup.secrets.example` | bucket keys + backup passphrase → copy to `ente-setup.secrets`, `chmod 600` |
 | `ente-s3-proxy.sh`, `ente_s3_rewrite.py` | optional add-on: route photo traffic through the server (see "S3 proxy") |
 | `ente-vpn.sh` | optional, independent of Ente: an AmneziaWG VPN (see "AmneziaWG VPN") |
-| `ente-tg-bot.sh`, `ente_tg_bot.py` | optional add-on: a Telegram bot for status, checks, backups and the proxy (see "Telegram bot") |
+| `ente-tg-bot.sh` | optional add-on: Ente's commands for the Telegram bot (status, checks, backups, the proxy; see "Telegram bot") |
+| `../opsbot/` | the Telegram bot and notifications the alerts and the bot use (independent of Ente: `../opsbot/README.md`) |
 | `tests/` | tests; `run_all.sh` runs them (see "Tests") |
 | `../docs/functions-and-tests.md` | overview for others: every function, what it does and what must be tested (not needed on the server) |
 
@@ -36,7 +37,8 @@ them) and stops naming any that a command needs but is missing; it never logs th
    Backup bucket: the backup only adds to it, so its key needs read/write (no delete). It grows: clean it up by hand (see "Backups").
 2. **DNS.** A (and AAAA) records for `api.`, `web.` and `albums.` under your domain → the VPS, TTL 300. For the Ente Auth and
    Locker web apps also `auth.` and `locker.`, with `WEB_APPS="auth locker"` in `ente-setup.env` (either one alone works too).
-3. **Config.** Copy `ente-server/` to the VPS, create `ente-setup.env` and `ente-setup.secrets` from the examples.
+3. **Config.** Copy the repository (`ente-server/` and, for Telegram, `opsbot/` next to it) to the VPS, create
+   `ente-setup.env` and `ente-setup.secrets` from the examples.
    `BACKUP_PASSPHRASE` encrypts the config backup: keep it in a password manager, without it the backup is unreadable.
 4. **As root:** `./ente-setup.sh deploy` = `bootstrap` + `install` + `backup-setup`. About 5 minutes. Run it in `tmux` (or `nohup`):
    bootstrap moves sshd, and a dropped SSH session would stop it half-way (re-running it is safe).
@@ -115,7 +117,8 @@ What survives what (you also need each provider's account to create new keys, an
 
 ## Telegram alerts (optional)
 
-With `TG_CHAT_ID` set, `backup-setup` installs alerts that need no other service:
+With `TG_CHAT_ID` set, `backup-setup` installs alerts that need no other service. They go through opsbot (`../opsbot`), which
+`backup-setup` installs or updates with the token and chat from your config:
 - a failed backup sends "❌ Backup failed on <host>" with its ERROR lines (or the last 15 log lines);
 - `check` runs daily at 09:00 (`ente-check.timer`) and sends "⚠️ Daily check found problems on <host>" with one ❌ line per
   problem (a stale backup, a container down, the disk nearly full, ...); the monthly `verify` does the same;
@@ -135,16 +138,17 @@ The daily check and the monthly verify run the scripts from where `backup-setup`
 re-run `backup-setup` after moving it), owned by root and writable by root only (`backup-setup` refuses otherwise).
 Config values that end up in generated files (domain, buckets, `HC_URL`, the Telegram ids and token) must not contain spaces,
 quotes, `$`, backticks or backslashes; the scripts refuse them.
-The token is stored only in `/etc/ente-alert.env` (mode 600) and passed to curl on stdin. To turn alerts off, empty `TG_CHAT_ID`
-and re-run `backup-setup`.
+The token is stored only in `/etc/opsbot/token` (mode 600) and passed to curl on stdin. To turn alerts off, empty `TG_CHAT_ID`
+and re-run `backup-setup` (opsbot itself stays: `sudo opsbot uninstall` removes it).
 
 ### Telegram bot (optional add-on): commands from your phone
 
-`ente-tg-bot.sh` adds a bot that takes commands from **one** Telegram account and from nobody else:
+`ente-tg-bot.sh` registers Ente's commands with opsbot (`../opsbot`), a bot that takes commands from **one** Telegram account
+and from nobody else:
 
 | Command | Does |
 | --- | --- |
-| `/status` | five or six lines: services, last good backup and the next one, last check and verify, disk/RAM/uptime, bucket usage (the last measurement: monthly `verify` or `/size`), proxy |
+| `/status` | services, last good backup and the next one, last check and verify, bucket usage (the last measurement: monthly `verify` or `/size`), proxy; then opsbot's disk/RAM/uptime line |
 | `/check` | runs `ente-ops.sh check`: "✅ Check passed" or "❌ Check found problems", then each problem and a count of the rest |
 | `/backup` | runs a backup now; replies at once, then "✅ Backup done" (and how long it took) or "❌ Backup failed" with why |
 | `/proxy`, `/proxy on`, `/proxy off` | the S3 proxy's state, or switch it (needs `ente-s3-proxy.sh install`) |
@@ -154,16 +158,23 @@ Lines that need a look start with ⚠️ or ❌. Alerts use the same style: "❌
 problems on <host>", followed only by the lines that say why.
 
 1. `TG_BOT_USER_ID=<your Telegram user id>` in `ente-setup.env` (for a private chat it is the same number as `TG_CHAT_ID`).
-   The bot uses the alert bot's token (`TG_BOT_TOKEN` in the secrets file, or the one `backup-setup` stored).
-2. `sudo ./ente-tg-bot.sh install`, then send `/status` to the bot. `status`, `check` and `uninstall` as usual.
+   The bot uses the alert bot's token (`TG_BOT_TOKEN` in the secrets file, or the one opsbot stored).
+2. `sudo ./ente-tg-bot.sh install`: installs or updates opsbot with the bot on, and registers Ente as its plugin `ente`. Then
+   send `/status` to the bot. `status` and `check` as usual; `uninstall` removes Ente's commands (opsbot stays).
 
-Security: the bot long-polls Telegram (no open port) as its own unprivileged user `ente-tg-bot`, acts only on private messages
+Security: opsbot long-polls Telegram (no open port) as its own unprivileged user `opsbot`, acts only on private messages
 from `TG_BOT_USER_ID` (others are ignored, and you get a notice at most once an hour per sender), does not run commands older
-than a minute, and maps each command to a fixed action name: no text from Telegram reaches a shell. As root it may run exactly
-`/usr/local/sbin/ente-tg-action <one of seven names>` (`/etc/sudoers.d/ente-tg-bot`); that helper runs `ente-tg-bot.sh action <name>`,
+than a minute, and maps each command to a fixed plugin action: no text from Telegram reaches a shell. As root it may run exactly
+`/usr/local/sbin/opsbot-action ente <one of seven names>` (`/etc/sudoers.d/opsbot`); that helper runs `ente-tg-bot.sh action <name>`,
 so the script folder must be root's alone (`chown -R root: ente-server; chmod -R go-w ente-server`; `install` refuses otherwise).
 The token reaches the bot as a systemd credential, never on a command line. Anyone who controls your Telegram account can use the
-bot: turn on Telegram's two-step verification. `ente-ops.sh check` includes the bot's checks while it is installed.
+bot: turn on Telegram's two-step verification. `ente-ops.sh check` includes the bot's and opsbot's checks while it is installed.
+More in `../opsbot/README.md`; other services can add their own commands as opsbot plugins.
+
+**From the older bot (before opsbot).** After updating the repository (with `opsbot/` next to `ente-server/`):
+`sudo ./ente-setup.sh backup-setup` (the alerts move to opsbot; it also starts a backup) and `sudo ./ente-tg-bot.sh install`
+(stops and removes `ente-tg-bot.service`, its user, sudo rule and token, and turns on opsbot's bot). Either order works; the
+token is taken from where the older setup stored it, so a deleted secrets file is fine. The commands in Telegram stay the same.
 
 ## Daily, automatic: `check`
 
@@ -306,27 +317,27 @@ and `/etc/caddy/ente.d/sites/s3-proxy.caddy` (the proxy site). `ente-setup.sh in
 
 `bash tests/run_all.sh` runs every suite that changes nothing (the two bucket suites only where rclone is) and prints one line
 per suite, with its time; the suites that change nothing run side by side (about 15 s). On the live server
-`sudo bash tests/run_all.sh --server` adds the VPN config test and the proxy and bot end-to-end tests (about 3.5 min);
+`sudo bash tests/run_all.sh --server` adds the VPN config test and the proxy, opsbot and bot end-to-end tests (about 4.5 min);
 `--browser` also runs the web app in a real browser (about 4.5 min more): after touching the proxy or the web apps, and
 after an Ente update.
-Each suite also runs on its own:
+It also runs opsbot's suites (`../opsbot/tests`, see `../opsbot/README.md`). Each suite also runs on its own:
 
 | Command | Where | What |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum (incl. chunked responses and a stalled client), the bot against a fake Telegram (every reply) |
-| `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token source, unit, sudo rule, root helper, ownership check, every reply of `/status`, `/check`, `/backup`, `/proxy` (stubbed server), command lines |
+| `python3 -m unittest discover -s tests -v` | anywhere (Python 3 stdlib) | the link rewriter against a fake museum (incl. chunked responses and a stalled client) |
+| `bash tests/test_tg_bot_config.sh` | anywhere; on the server also validated by visudo (changes nothing there) | bot config, token sources (incl. the older bot's), the plugin file checked by opsbot's validator and the sudo rule opsbot makes of it, install/uninstall and the move from the older bot (opsbot stubbed), the checks, every reply of `/status`, `/check`, `/backup`, `/proxy`, `/size` (stubbed server), command lines |
 | `bash tests/test_bucket_copies.sh` | anywhere with rclone (the server; changes nothing there) | the config copy in the photo bucket: the real backup script on local "buckets", the copy's exclusion, restore fetching only the newest dump, check/verify, ownership check, restore's choice of bucket incl. lost buckets and a wrong passphrase, restore interrupted at each stage, the atomic `rclone.conf` write |
 | `bash tests/test_backup_checks.sh` | anywhere with rclone (the server; changes nothing there) | the backup never deletes in the backup bucket (photos or dumps gone from the server stay there), `verify` catching a bad dump, empty tables, a damaged photo or missing config files, its growth line, every FAIL in the backup part of `check`, and `install` moving the backup to a new photo bucket |
 | `bash tests/test_check.sh` | anywhere (system tools stubbed) | the rest of `check`: services and image age, web and certificates, open ports, sshd/UFW, the photo bucket and CORS, the add-ons' checks, disk, OOM, pending reboot; each FAIL once, nothing on a healthy server |
 | `bash tests/test_cli.sh` | anywhere (as an unprivileged user when run as root) | the command lines of `ente-setup.sh`, `ente-ops.sh`, `ente-vpn.sh`; config values refused (quotes, `$`, spaces, bad ids, `AWG_PORT`); the in-place `museum.yaml` write on a full disk; `backup-setup` refusing a script folder others can write; the bucket CORS origins (incl. `ente://app`); bootstrap turning LLMNR off; the unattended-upgrade config, and on the server that each repository's origin is the allowed one |
 | `bash tests/test_quickstart.sh` | anywhere with network (fetches Ente's current quickstart; docker stubbed) | `install`'s edits against today's quickstart: ports on 127.0.0.1, URLs, the external bucket, keys kept, in place, idempotent; a full disk leaves `museum.yaml` untouched; a changed layout is refused |
 | `bash tests/test_lockdown.sh` | anywhere (Postgres stubbed) | `lockdown`: oldest user becomes admin only after `y`, re-runs change nothing, install keeps the block, a hand-made `internal:` is refused, edited in place |
-| `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | the real alert scripts: what a failed check, verify or backup sends, to which chat, the length limit, broken UTF-8, Telegram down; the test message of `backup-setup`; emptying `TG_CHAT_ID` removes every alert file |
+| `bash tests/test_alerts.sh` | anywhere (Telegram faked on 127.0.0.1) | `backup-setup`'s alerts: opsbot installed with this config's token and chat (bot left alone), the test message, the older alerts' token moved over and their files removed; then Ente's real alert script with opsbot's real notification scripts: what a failed check, verify or backup sends, to which chat, Telegram down; emptying `TG_CHAT_ID` removes every alert file |
 | `sudo bash tests/test_vpn_config.sh` | the server, after `ente-vpn.sh install` | the VPN config generator: keys pair up, same obfuscation on both sides within AmneziaWG's rules, mode 600, never overwrites, refuses a busy port |
 | `bash tests/test_update.sh` | anywhere (docker and systemd stubbed) | `update`: a failed download (museum, web, postgres) or a failed backup first changes nothing; a real update moves the pins and keeps the old ones in `image-pins.prev`; museum not answering afterwards points there; pinned builds gone from the registry are re-pinned to the running or latest ones; `pg-update` and `rclone-update`: current version left alone, a newer one applied in order (postgres, museum restart, check), refused without a recent good backup (Postgres), postponed while a backup or verify runs, a failed download or a silent museum, an rclone that cannot read a bucket rolled back, a packaged rclone left to apt |
 | `bash tests/test_proxy_config.sh` | anywhere; on the server also validated by Caddy (changes nothing there) | config checks, the Caddyfile hooks, the add-on's files in each state, the bucket taken from `museum.yaml`, the rollback of a failed install or switch, unit, command lines |
 | `sudo bash tests/proxy_e2e.sh` | the server, `S3_PROXY_HOST` set | `ente-s3-proxy.sh` end to end (install, on/off, fallback, rollback, uninstall), plus `tests/proxy_e2e_s3.py`: real signed links through the proxy |
-| `sudo bash tests/tg_bot_e2e.sh` | the server, `TG_BOT_USER_ID` set | the real bot as its real user with the real sudo rule and actions, against a fake Telegram (`tests/fake_telegram.py`): every command, strangers, groups, old messages, privileges, uninstall; runs a real backup |
+| `sudo bash tests/tg_bot_e2e.sh` | the server, `TG_BOT_USER_ID` set | Ente's plugin through the real opsbot, its user, sudo rule and helper, against a fake Telegram (`../opsbot/tests/fake_telegram.py`): every command, strangers, `check` including the bot, uninstall and install again; runs a real backup |
 | `sudo bash tests/proxy_browser_e2e.sh` | the server, `S3_PROXY_HOST` set | the real web app in Chromium (Playwright container): sign-up, uploads incl. multipart, viewing, with the proxy on and off |
 
 `proxy_e2e.sh` and `tg_bot_e2e.sh` leave their add-on as they found it (installed or not, on or off). The browser test opens registration for a throwaway account, deletes it

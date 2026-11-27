@@ -1,4 +1,4 @@
-"""A fake Telegram Bot API for tests/tg_bot_e2e.sh and tests/test_alerts.sh. Python stdlib only.
+"""A fake Telegram Bot API for the opsbot tests and the services' bot tests. Python stdlib only.
 
     python3 tests/fake_telegram.py PORT_FILE
 Listens on 127.0.0.1 (free port, written to PORT_FILE) and implements getUpdates, sendMessage, setMyCommands, getMe for
@@ -6,6 +6,7 @@ any token, with JSON or form-encoded bodies. Test control (plain HTTP, also on 1
     POST /control/message   {"text": ..., "from": ID, "chat": ID, "type": "private", "age": 0}  -> queues a message
     GET  /control/sent                                                                       -> the bot's messages so far
     GET  /control/tokens                                                                     -> sha256 of tokens seen
+    GET  /control/commands                                                                   -> the last command menu set
 """
 import hashlib
 import json
@@ -16,7 +17,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
-UPDATES, SENT, TOKENS = [], [], set()
+UPDATES, SENT, TOKENS, MENU = [], [], set(), []
 NEXT = [1000]
 
 
@@ -40,6 +41,8 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, SENT)
             if self.path == "/control/tokens":
                 return self._send(200, sorted(TOKENS))
+            if self.path == "/control/commands":
+                return self._send(200, MENU)
         self._send(404, {})
 
     def do_POST(self):
@@ -75,6 +78,9 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 SENT.append({"chat_id": body.get("chat_id"), "text": body.get("text"), "t": time.time()})
             return self._send(200, {"ok": True, "result": {"message_id": len(SENT)}})
+        if method == "setMyCommands":
+            with LOCK:
+                MENU[:] = [c.get("command") for c in body.get("commands", [])]
         if method in ("setMyCommands", "getMe", "deleteMyCommands"):
             return self._send(200, {"ok": True, "result": True})
         return self._send(404, {"ok": False, "description": "Not Found"})
