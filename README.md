@@ -2,7 +2,8 @@
 
 Scripts that turn a fresh Debian VPS into a self-hosted [Ente Photos](https://ente.com) server: photos in an S3 bucket,
 nightly encrypted backups to a second bucket, daily health checks and Telegram alerts, plus three optional add-ons
-(an S3 proxy, a Telegram bot, an AmneziaWG VPN).
+(an S3 proxy, a Telegram bot, an AmneziaWG VPN). Next to it, independent of Ente: `opsbot/` (the Telegram bot and alerts) and
+`drive-backup/` (a backup of a Mountain Duck / Cryptomator drive bucket).
 
 ## Layout
 
@@ -14,19 +15,20 @@ ente-server/            the deployable folder: copy it whole to the server (e.g.
   ente-backup.sh        one backup run (installed by backup-setup, run daily by systemd)
   ente-s3-proxy.sh      add-on: photo traffic through the server
   ente_s3_rewrite.py      its link rewriter
-  ente-tg-bot.sh        add-on: Telegram bot
-  ente_tg_bot.py          the bot itself
+  ente-tg-bot.sh        add-on: Ente's Telegram commands (an opsbot plugin)
   ente-vpn.sh           add-on: AmneziaWG VPN (independent of Ente)
   ente-setup.env.example       config template     -> ente-setup.env (git-ignored)
   ente-setup.secrets.example   secrets template    -> ente-setup.secrets (git-ignored, chmod 600)
   tests/                test suites; run_all.sh runs them
+opsbot/                 the Telegram bot and notifications (Ente's alerts and commands use it): opsbot.sh, opsbot.py, README.md
+drive-backup/           nightly backup of a drive bucket to B2, with a guard against mass changes (an opsbot plugin)
 docs/
   functions-and-tests.md   one-page overview: every function and what must be tested
   handoff-brief.md         current state, open items and ground rules for whoever takes over
 ```
 
 The scripts in `ente-server/` stay side by side on purpose: they source `ente-setup.sh` from their own folder, and the
-units they install run them from there.
+units they install run them from there. Copy the whole repository to the server: `ente-server/` finds `opsbot/` next to it.
 
 ## Start here
 
@@ -36,4 +38,5 @@ units they install run them from there.
 - Testing: `bash ente-server/tests/run_all.sh` (anywhere, ~15 s), `sudo bash tests/run_all.sh --server` from the folder on the
   server (~3.5 min), `--browser` for the full browser test too.
 
-Never commit `ente-setup.env`, `ente-setup.secrets` or any key; `.gitignore` covers the usual names.
+Never commit `ente-setup.env`, `ente-setup.secrets`, `drive-backup.env`, `drive-backup.secrets` or any key; `.gitignore`
+covers them.

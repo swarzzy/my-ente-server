@@ -116,6 +116,15 @@ All three are optional and installed separately; each has `install`, `uninstall`
 | The bot (`opsbot.py bot`) | Long-polls; only the owner's private messages (anything else ignored and logged); commands older than a minute skipped. Commands come from the plugins: each says it started, then its result; one command runs one at a time. `/status`: each plugin's `status` action, then a disk/RAM/uptime line. SIGHUP reloads the plugins and menu. | Every reply kind; injection refused; one at a time; a broken plugin skipped; reload; the token never logged. |
 | The root helper (`opsbot-action PLUGIN ACTION`) | Re-reads the root-owned plugin file, refuses unknown pairs and files others could change (its `exec` and `root_files`, symlinks included), runs the action as a transient unit from `/` with a clean environment. | Refusals; planted Python modules not loaded; an action outlives the bot. |
 
+## drive-backup (`drive-backup/`, independent of Ente)
+
+| Part | What it does | What to test |
+| --- | --- | --- |
+| `run` (nightly 04:00, `/drive_sync`) | The guard first: `rclone check` of the drive against the backup; more than `DRIVE_MAX_CHANGE` % (10) of the backup's files would change or go: stop, alert, change nothing. Else `rclone sync` to B2 (its own API: deleted files are hidden, old versions kept by the bucket's lifecycle), `--max-delete` as a second stop. `run --force` / `/drive_force` (only while the guard holds) syncs anyway. | New files never trip it; changes and deletions over the limit do; nothing is synced then; force clears it; an unreadable side is an error. |
+| `verify` (monthly) | Every drive file in the backup at the same size, 5 random ones byte for byte. | A differing file fails it. |
+| `restore TIME [PATH]` | The backup as it was at TIME (`--b2-version-at`) into `/var/tmp/drive-restore-*`. | A changed and a deleted file come back as they were (end to end, real B2). |
+| `install` | rclone.conf (600) from the secrets file, tries both keys (warns if the drive key may write or the backup key may delete), timers, the opsbot plugin `drive`, a first sync. | Keys kept when the secrets file is gone; the plugin passes opsbot's validator. |
+
 ## Tests
 
 All suites live in `ente-server/tests/` and `opsbot/tests/` and must pass on the server before a commit; there is no CI. `bash tests/run_all.sh` runs every suite that can run where it is; `sudo bash tests/run_all.sh --server` on the server adds the VPN and the proxy, opsbot and bot end-to-end suites (about 4.5 min), and `--browser` also the browser test (about 4.5 min more; after proxy or web app changes and Ente updates). Counts are from the last full run on the server.
