@@ -3,7 +3,8 @@
 # an env and a secrets file for TEST buckets; the test works in a fresh folder in each (DRIVE_S3_PREFIX, DRIVE_B2_PREFIX) and
 # removes them, with every version, at the end. Needs opsbot with its bot. Refuses to run where drive-backup is installed.
 # Installs, syncs, changes and deletes a file and restores the backup as of before, trips the guard and forces past it through
-# opsbot's real helper, verifies, uninstalls. The guard is tripped by hand (not by the service), so no alert is sent.
+# opsbot's real helper, verifies, runs the daily check unit, uninstalls. The guard is tripped by hand (not by the service), so
+# no alert is sent.
 # Run: sudo DRIVE_E2E_ENV=... DRIVE_E2E_SECRETS=... bash tests/drive_e2e.sh
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -37,9 +38,10 @@ echo "== install"
 mkdir -p "$T/seed/d"; for i in $(seq 1 20); do head -c $((1000 + i)) /dev/urandom >"$T/seed/d/f$i.c9r"; done
 adm copy "$T/seed" "$SRC" || { echo "cannot seed the drive" >&2; exit 1; }
 DB install; check "install succeeds" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
-check "... it tried the keys (the test keys may do more: warned)" 'grep -q "the backup can be written" "$T/out" && grep -qE "(OK|WARN)  .*(cannot delete for good|can delete for good)" "$T/out" && ! adm lsf "$SRC" | grep -q key-test' "$(cat "$T/out")"
+check "... it tried the keys (the test keys may do more: warned) and left no test file" 'grep -q "the backup can be written" "$T/out" && grep -qE "(OK|WARN)  .*(cannot delete for good|can delete for good)" "$T/out" && grep -qE "(OK|WARN)  the drive key (is read-only|may write)" "$T/out" && ! adm lsf "${SRC%/*}" | grep -q key-test' "$(cat "$T/out")"
+check "... and read the lifecycle rules (30 days, or none: a warning)" 'grep -qE "OK    the backup keeps old versions 30 days|WARN  the backup bucket has no lifecycle rule" "$T/out"' "$(cat "$T/out")"
 check "... the keys are in a root-only rclone.conf" '[[ $(stat -c "%U %a" /etc/drive-backup/rclone.conf) == "root 600" ]]'
-check "... registered with opsbot, the timer on" '/usr/local/sbin/opsbot plugin list | grep -qw drive && systemctl is-enabled --quiet drive-backup.timer'
+check "... registered with opsbot, the timers on" '/usr/local/sbin/opsbot plugin list | grep -qw drive && systemctl is-enabled --quiet drive-backup.timer && systemctl is-enabled --quiet drive-check.timer'
 # the first run has ended once its main process has an exit time
 for _ in $(seq 1 90); do [[ $(systemctl show -p ExecMainExitTimestampMonotonic --value drive-backup.service) == 0 ]] || break; sleep 2; done
 check "the first sync (started by install) copied the drive and verified it" '[[ $(adm lsf -R --files-only "$DST" | wc -l) == 20 && $(systemctl show -p Result --value drive-backup.service) == success ]] && journalctl -u drive-backup.service --no-pager | grep -q "verify passed"' "$(journalctl -u drive-backup.service -n 5 --no-pager)"
@@ -56,16 +58,18 @@ check "restore as of before: both files as they were" '[[ $RC -eq 0 && -n $out &
 
 echo "== the guard, and opsbot"
 for i in $(seq 3 16); do head -c 2000 /dev/urandom | adm rcat "$SRC/d/f$i.c9r"; done
-DB run; check "14 of 19 files rewritten: the guard stops it, nothing synced" '[[ $RC -ne 0 ]] && grep -q "guard: 14 of 19" "$T/out" && [[ $(adm cat "$DST/d/f3.c9r" | wc -c) == 1003 ]]' "$(cat "$T/out")"
-out=$(runuser -u opsbot -- sudo -n "$HELPER" drive status 2>&1); check "/status through opsbot's helper: the guard" '[[ $out == "⚠️ Drive: the guard stopped the sync: 14 of 19"* ]]' "$out"
+head -c 500 /dev/urandom | adm rcat "$SRC/d/new.c9r"
+DB run; check "14 of 19 files rewritten: held back (exit 3), the new file copied" '[[ $RC -eq 3 ]] && grep -q "WARN: guard: 14 of 19" "$T/out" && [[ $(adm cat "$DST/d/f3.c9r" | wc -c) == 1003 && $(adm cat "$DST/d/new.c9r" | wc -c) == 500 ]]' "$(cat "$T/out")"
+out=$(runuser -u opsbot -- sudo -n "$HELPER" drive status 2>&1); check "/status through opsbot's helper: held back" '[[ $out == "⚠️ Drive: 14 of 19 files would change or go: held back"* ]]' "$out"
 out=$(runuser -u opsbot -- sudo -n "$HELPER" drive force 2>&1); RC=$?
-check "/drive_force through opsbot's helper: synced past it" '[[ $RC -eq 0 && $out == *"(forced)"* && $(adm cat "$DST/d/f3.c9r" | wc -c) == 2000 ]]' "$out"
-out=$(runuser -u opsbot -- sudo -n "$HELPER" drive status 2>&1); check "... /status: a recent sync, 19 files" '[[ $out == "🗂 Drive: last sync "*" · 19 files, "* ]]' "$out"
+check "/drive_force through opsbot's helper: synced everything" '[[ $RC -eq 0 && $out == *"(forced)"* && $(adm cat "$DST/d/f3.c9r" | wc -c) == 2000 ]]' "$out"
+out=$(runuser -u opsbot -- sudo -n "$HELPER" drive status 2>&1); check "... /status: a recent sync, 20 files" '[[ $out == "🗂 Drive: last sync "*" · 20 files, "* ]]' "$out"
 runuser -u opsbot -- sudo -n -l "$HELPER" drive sync >/dev/null 2>&1; RC=$?; check "the bot may run /drive_sync" '[[ $RC -eq 0 ]]'
 
 echo "== verify, check, uninstall"
 DB verify; check "verify passes" '[[ $RC -eq 0 ]] && grep -q "verify passed" "$T/out"' "$(cat "$T/out")"
 DB check; check "check passes" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
-DB uninstall; check "uninstall: units, keys and plugin gone" '[[ $RC -eq 0 && ! -e /etc/drive-backup && ! -e /etc/systemd/system/drive-backup.service ]] && ! /usr/local/sbin/opsbot plugin list | grep -qw drive' "$(cat "$T/out")"
+systemctl start drive-check.service; check "the daily check unit passes" '[[ $(systemctl show -p Result --value drive-check.service) == success ]]' "$(journalctl -u drive-check.service -n 10 --no-pager)"
+DB uninstall; check "uninstall: units, keys and plugin gone" '[[ $RC -eq 0 && ! -e /etc/drive-backup && ! -e /etc/systemd/system/drive-backup.service && ! -e /etc/systemd/system/drive-check.timer ]] && ! /usr/local/sbin/opsbot plugin list | grep -qw drive' "$(cat "$T/out")"
 
 summary

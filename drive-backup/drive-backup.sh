@@ -13,6 +13,7 @@ RCLONE_CONF=${RCLONE_CONF:-$ETC/rclone.conf}
 STATE=${STATE:-/var/lib/drive-backup}   # last-ok, verify-ok, guard, and the last run's plan
 UNITS=${UNITS:-/etc/systemd/system}
 OPSBOT_CLI=${OPSBOT_CLI:-/usr/local/sbin/opsbot}
+NOTIFY_UNIT=${NOTIFY_UNIT:-/usr/local/bin/opsbot-notify-unit}
 LOG=${LOG:-/var/log/drive-backup.log}
 STALE_H=36       # a last good sync older than this is a problem
 VERIFY_H=720     # a sync verifies the backup when the last verify is older than this (30 days)
@@ -21,7 +22,8 @@ FAILS=0
 
 # ---------------------------------------------------------------- helpers
 log()  { printf '%s [%s] %s\n' "$(date '+%F %T')" "$CMD" "$*"; }
-die()  { printf '%s [%s] ERROR: %s\n' "$(date '+%F %T')" "$CMD" "$*" >&2; exit 1; }
+# die MESSAGE [STATUS]: 1 an error, 3 the guard held changes back, 4 the verify failed (each has its own alert title)
+die()  { log "ERROR: $1" >&2; exit "${2:-1}"; }
 ok()   { printf '  OK    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
 warn() { printf '  WARN  %s\n' "$*"; }
@@ -79,11 +81,11 @@ preflight() {
 # ---------------------------------------------------------------- sync
 # cmd_run [force]: the guard, then the sync. The guard is the sync's own dry run (rclone's report: + new, * overwritten,
 # - removed, = same), so both judge each file the same way. It stops when more than DRIVE_MAX_CHANGE % of the backup's files
-# would be overwritten or removed: a ransomware-encrypted or wiped drive must not replace the backup unnoticed; new files are
-# still copied. FORCE (after a look, only while the guard holds) accepts the count the guard recorded (the one you were told
-# first), and a little more as the drive keeps changing; not more. Once a month the sync then verifies the backup.
+# would be overwritten or removed: a ransomware-encrypted or wiped drive must not replace the backup unnoticed. Then it copies
+# only the new files and holds the rest back (exit 3: a warning). FORCE (after a look, only while the guard holds) syncs
+# everything. Once a month the sync then verifies the backup.
 cmd_run() {
-  local force=${1:-} new changed gone total allowed seen n b
+  local force=${1:-} new changed gone total n b
   load_config
   lock -n || die "a sync is already running"
   preflight
@@ -93,19 +95,14 @@ cmd_run() {
   grep -q '^[+*=] ' "$STATE/plan" || die "the drive $SRC has no files (DRIVE_S3_BUCKET, DRIVE_S3_PREFIX?): nothing synced"
   new=$(grep -c '^+ ' "$STATE/plan" || true) changed=$(grep -c '^[*-] ' "$STATE/plan" || true)
   gone=$(grep -c '^- ' "$STATE/plan" || true) total=$(grep -c '^[=*-] ' "$STATE/plan" || true)
-  allowed=$((total * DRIVE_MAX_CHANGE / 100))
-  if [[ $force == force ]]; then
-    [[ -f $STATE/guard ]] || die "nothing to force: the guard has not stopped a sync"
-    read -r seen _ <"$STATE/guard"
-    allowed=$((seen + seen / 10 + 1))
-  fi
-  if ((changed > allowed)); then
-    # the recorded count changes only when you are told the new one in reply to forcing
-    [[ -f $STATE/guard && $force != force ]] || echo "$changed $total" >"$STATE/guard"
+  [[ $force != force || -f $STATE/guard ]] || die "nothing to force: the guard holds nothing back"
+  if [[ $force != force ]] && ((changed * 100 > total * DRIVE_MAX_CHANGE)); then
+    echo "$changed $total" >"$STATE/guard"
     sed -n 's/^+ //p' "$STATE/plan" >"$STATE/new"
     [[ ! -s $STATE/new ]] || rc copy "$SRC" "$DST" --files-from "$STATE/new" --no-traverse --ignore-existing ||
       die "guard: $changed of $total files would change or go, and copying the $new new ones failed"
-    die "guard: $changed of $total files in the backup would change or go ($((changed * 100 / total))%, more than the $allowed allowed): none changed or removed, $new new copied. Look at the drive; if it is right: /drive_force (or $0 run --force)"
+    log "WARN: guard: $changed of $total files in the backup would change or go ($((changed * 100 / total))% > $DRIVE_MAX_CHANGE%): held back, $new new copied. Look at the drive; if it is right: /drive_force (or $0 run --force) applies them" >&2
+    exit 3
   fi
   if ((new + changed)); then
     log "syncing: $new new, $changed changed or gone, $((total - changed)) unchanged${force:+ (forced)}"
@@ -131,10 +128,10 @@ cmd_verify() {
 verify() {
   local out
   out=$(rc check "$SRC" "$DST" --one-way --fast-list --match "$STATE/match" 2>&1) ||
-    die "the backup differs from the drive: $(grep -E 'ERROR|differences' <<<"$out" | tail -3)"
+    die "the backup differs from the drive: $(grep -E 'ERROR|differences' <<<"$out" | tail -3)" 4
   shuf -n 5 "$STATE/match" >"$STATE/sample"
   if [[ -s $STATE/sample ]]; then
-    out=$(rc check "$SRC" "$DST" --download --files-from "$STATE/sample" 2>&1) || die "a sampled file differs byte for byte: $(tail -2 <<<"$out")"
+    out=$(rc check "$SRC" "$DST" --download --files-from "$STATE/sample" 2>&1) || die "a sampled file differs byte for byte: $(tail -2 <<<"$out")" 4
   fi
   date -Is >"$STATE/verify-ok"
   log "verify passed: every file of the drive is in the backup, $(wc -l <"$STATE/sample") sampled byte for byte"
@@ -162,7 +159,7 @@ act_status() {
   local d n b g
   if [[ -f $STATE/guard ]]; then
     read -r n b <"$STATE/guard"
-    echo "⚠️ Drive: the guard stopped the sync: $n of $b files would change (/drive_force once the drive looks right)"
+    echo "⚠️ Drive: $n of $b files would change or go: held back, new files copied (/drive_force once the drive looks right)"
   elif [[ -f $STATE/last-ok ]]; then
     read -r d n b <"$STATE/last-ok"
     g=🗂; (($(hours_since "$d") < STALE_H)) || g=⚠️
@@ -174,7 +171,7 @@ act_status() {
 bot_action() {
   case $1 in
     status) act_status ;;
-    sync | force) cmd_run "${1#sync}" 2>&1 | tee -a "$LOG" | sed -E 's/^[0-9-]+ [0-9:]+ \[[^]]*\] //; s/^ERROR: /❌ /' ;;
+    sync | force) cmd_run "${1#sync}" 2>&1 | tee -a "$LOG" | sed -E 's/^[0-9-]+ [0-9:]+ \[[^]]*\] //; s/^ERROR: /❌ /; s/^WARN: /⚠️ /' ;;
     *) usage ;;
   esac
 }
@@ -211,10 +208,13 @@ key = $DRIVE_B2_KEY
 EOF
 }
 
-# key_checks: the backup can be written, and whether its key could delete for good (WARN: still safe, less so). Whether the
-# drive key could write is not tried: that would put a file into the vault.
+# key_checks: the backup can be written; whether its key could delete for good, or the drive key write (WARN: still safe,
+# less so). The drive's test file goes to the bucket's top, outside the vault's folders (Cryptomator ignores it).
 key_checks() {
   local t=.drive-backup-key-test
+  if echo test | rc rcat "drive:$DRIVE_S3_BUCKET/$t" 2>/dev/null; then
+    warn "the drive key may write: the server needs it read-only (README)"; rc deletefile "drive:$DRIVE_S3_BUCKET/$t" 2>/dev/null || true
+  else ok "the drive key is read-only"; fi
   if echo test | rc rcat "$DST/$t" 2>/dev/null; then ok "the backup can be written"
   else bad "cannot write the backup $DST (key?)"; return; fi
   if rc deletefile --b2-hard-delete "$DST/$t" 2>/dev/null; then warn "the backup key can delete for good: give it no deleteFiles (README)"
@@ -222,31 +222,77 @@ key_checks() {
     rc deletefile "$DST/$t" 2>/dev/null || true; fi # hidden; the lifecycle removes it
 }
 
-# units: the nightly sync, alerting through opsbot when it fails
-units() {
-  write_file "$UNITS/drive-backup.service" <<EOF
+# lifecycle_check: the backup bucket's lifecycle rules keep a replaced or deleted file 30 days or more. A rule that hides
+# files by age, or deletes hidden ones sooner, is a FAIL; no rule (kept for good, the bill grows) a WARN.
+lifecycle_check() {
+  local out
+  out=$(rc backend lifecycle "drivebak:$DRIVE_B2_BUCKET" 2>&1) || { warn "cannot read the backup bucket's lifecycle rules: $(tail -1 <<<"$out")"; return 0; }
+  case $(python3 -I -c '
+import json, sys
+p = sys.argv[1].strip("/") + "/" if sys.argv[1] else ""
+rules = [r for r in json.loads(sys.stdin.read()) if p.startswith(r.get("fileNamePrefix") or "") or (r.get("fileNamePrefix") or "").startswith(p)]
+short = any(r.get("daysFromUploadingToHiding") or (r.get("daysFromHidingToDeleting") or 30) < 30 for r in rules)
+print("short" if short else "ok" if rules else "none")' "$DRIVE_B2_PREFIX" <<<"$out" 2>/dev/null) in
+    ok) ok "the backup keeps old versions 30 days or more (lifecycle)" ;;
+    none) warn "the backup bucket has no lifecycle rule: old versions are kept for good (README: 30 days)" ;;
+    short) bad "the backup bucket's lifecycle hides files by age or deletes old versions within 30 days: $(tr -d '\n ' <<<"$out")" ;;
+    *) warn "cannot read the backup bucket's lifecycle rules: $(tail -1 <<<"$out")" ;;
+  esac
+}
+
+# unit NAME DESCRIPTION SUBCOMMAND CALENDAR: a service that runs this script, alerting through drive-alert@ when it fails, and
+# its timer
+unit() {
+  write_file "$UNITS/$1.service" <<EOF
 [Unit]
-Description=Nightly drive backup (drive-backup.sh run)
+Description=$2 (drive-backup.sh $3)
 After=network-online.target
 Wants=network-online.target
-OnFailure=opsbot-alert@%n.service
+OnFailure=drive-alert@%n.service
 
 [Service]
 Type=oneshot
 Environment=ENV_FILE=$ENV_FILE SECRETS_FILE=$SECRETS_FILE
-ExecStart=/bin/bash $DB_DIR/drive-backup.sh run
+ExecStart=/bin/bash $DB_DIR/drive-backup.sh $3
 EOF
-  write_file "$UNITS/drive-backup.timer" <<EOF
+  write_file "$UNITS/$1.timer" <<EOF
 [Unit]
-Description=Nightly drive backup
+Description=$2
 
 [Timer]
-OnCalendar=*-*-* 04:00:00
+OnCalendar=$4
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+}
+
+# units: the nightly sync, the daily check, and the alert for either
+units() {
+  unit drive-backup "Nightly drive backup" run "*-*-* 04:00:00"
+  unit drive-check "Daily drive backup check" check "*-*-* 09:30:00"
+  write_file "$UNITS/drive-alert@.service" <<EOF
+[Unit]
+Description=Telegram alert for a failed %i (drive-backup)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $DB_DIR/drive-backup.sh alert %i
+EOF
+}
+
+# cmd_alert UNIT: the alert for a failed drive unit, sent by opsbot, its title from how the unit ended
+cmd_alert() {
+  local h t
+  h=$(hostname)
+  case $1:$(systemctl show -p ExecMainStatus --value "$1" 2>/dev/null) in
+    drive-backup.service:3) t="⚠️ Drive backup held changes back on $h (new files copied)" ;;
+    *:4) t="❌ Drive backup verify failed on $h" ;;
+    drive-check.service:*) t="⚠️ Drive backup check found problems on $h" ;;
+    *) t="❌ Drive backup failed on $h" ;;
+  esac
+  exec "$NOTIFY_UNIT" "$1" "$t" 'ERROR|WARN|FAIL'
 }
 
 plugin_json() {
@@ -261,8 +307,8 @@ plugin_json() {
   ],
   "actions": {
     "status": {},
-    "sync": {"started": "⏳ Backing up the drive...", "ok": "✅ Drive backed up", "fail": "❌ Drive backup failed"},
-    "force": {"started": "⏳ Backing up the drive past the guard...", "ok": "✅ Drive backed up (forced)", "fail": "❌ Drive backup failed"}
+    "sync": {"started": "⏳ Backing up the drive...", "ok": "✅ Drive backed up", "fail": "⚠️ Drive backup did not finish"},
+    "force": {"started": "⏳ Backing up the drive past the guard...", "ok": "✅ Drive backed up (forced)", "fail": "⚠️ Drive backup did not finish"}
   }
 }
 EOF
@@ -279,35 +325,36 @@ cmd_install() {
   write_remotes
   install -d -m 700 "$STATE"
   preflight
-  key_checks; ((FAILS == 0)) || die "the backup bucket does not answer as it should (see above)"
+  key_checks; lifecycle_check; ((FAILS == 0)) || die "the backup bucket is not set up as it should be (see above)"
   units
   tmp=$(mktemp -d)
   plugin_json >"$tmp/drive.json"
   "$OPSBOT_CLI" plugin add "$tmp/drive.json" || { rm -rf "$tmp"; die "opsbot refused the plugin (see above)"; }
   rm -rf "$tmp"
   systemctl daemon-reload
-  systemctl enable --now drive-backup.timer >/dev/null 2>&1
+  systemctl enable --now drive-backup.timer drive-check.timer >/dev/null 2>&1
   systemctl start --no-block drive-backup.service
-  log "drive backup installed: nightly at 04:00, verified monthly; first run started (journalctl -fu drive-backup). Bot: /drive_sync, /drive_force"
+  log "drive backup installed: nightly at 04:00, verified monthly, checked daily at 09:30; first run started (journalctl -fu drive-backup). Bot: /drive_sync, /drive_force"
 }
 
 cmd_uninstall() {
-  systemctl disable --now drive-backup.timer >/dev/null 2>&1 || true
-  rm -f "$UNITS"/drive-backup.{service,timer}
+  systemctl disable --now drive-backup.timer drive-check.timer >/dev/null 2>&1 || true
+  rm -f "$UNITS"/drive-{backup,check}.{service,timer} "$UNITS/drive-alert@.service"
   systemctl daemon-reload
   [[ ! -x $OPSBOT_CLI ]] || "$OPSBOT_CLI" plugin remove drive
   rm -rf "$ETC" "$STATE"
   log "drive backup uninstalled (the buckets are untouched)"
 }
 
-# check: OK/FAIL lines; exit 1 on a FAIL
+# check (daily by drive-check.timer, alerting): OK/FAIL lines; exit 1 on a FAIL
 cmd_check() {
   local d n
   load_config
-  if systemctl is-enabled --quiet drive-backup.timer 2>/dev/null; then ok "nightly timer on"
-  else bad "the nightly timer drive-backup.timer is off ($0 install)"; fi
+  for d in drive-backup.timer drive-check.timer; do
+    if systemctl is-enabled --quiet "$d" 2>/dev/null; then ok "$d on"; else bad "$d is off ($0 install)"; fi
+  done
   [[ $(stat -c '%U %a' "$RCLONE_CONF" 2>/dev/null) == "root 600" ]] && ok "keys root-only" || bad "$RCLONE_CONF is missing or not root's alone (600)"
-  if [[ -f $STATE/guard ]]; then read -r d n <"$STATE/guard"; bad "the guard stopped the last sync: $d of $n files would change (/drive_force)"
+  if [[ -f $STATE/guard ]]; then read -r d n <"$STATE/guard"; bad "the guard holds back changes: $d of $n files would change or go (/drive_force once the drive looks right)"
   elif [[ ! -f $STATE/last-ok ]]; then bad "no good sync yet (journalctl -u drive-backup)"
   else
     read -r d _ <"$STATE/last-ok"
@@ -316,6 +363,7 @@ cmd_check() {
   d=$(cat "$STATE/verify-ok" 2>/dev/null) || d=
   if [[ -n $d ]] && (($(hours_since "$d") < VERIFY_H + 48)); then ok "last verify passed $d"
   else bad "the backup has not passed a verify in 32 days${d:+ (last: $d)} (journalctl -u drive-backup; $0 verify)"; fi
+  lifecycle_check
   ((FAILS == 0))
 }
 
@@ -324,7 +372,7 @@ usage() { echo "usage: $0 {install|uninstall|check|run [--force]|verify|restore 
 # sourced (tests): define the functions only
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case "$#:${1:-}:${2:-}" in
-    1:install: | 1:uninstall: | 1:check: | 1:run: | 2:run:--force | 1:verify: | 2:restore:* | 2:action:*) ;;
+    1:install: | 1:uninstall: | 1:check: | 1:run: | 2:run:--force | 1:verify: | 2:restore:* | 2:action:* | 2:alert:*) ;;
     *) usage ;;
   esac
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }
@@ -332,6 +380,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case $1 in
     check) cmd_check; exit ;;
     action) load_config; bot_action "$2"; exit ;; # set -e: a failed action exits with its status
+    alert) cmd_alert "$2" ;;
   esac
   case $1 in
     install) cmd_install ;;

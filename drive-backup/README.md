@@ -7,17 +7,19 @@ It plugs into [opsbot](../opsbot/README.md) for alerts and Telegram commands; it
 - **Nightly at 04:00** (`drive-backup.timer`): `rclone sync` of the drive bucket to the backup bucket. A file changed or deleted
   on the drive is changed or hidden in the backup, and B2 keeps the old version for the lifecycle's days.
 - **The guard:** before syncing, it plans the sync (a dry run, so it judges each file exactly as the sync will). If more than `DRIVE_MAX_CHANGE` % (default 10) of the backup's files would
-  be overwritten or removed (a wiped drive, or ransomware that re-encrypted it), it stops, changes nothing and alerts you.
-  New files do not count, and are still copied while the guard holds. A drive with no files at all is an error (a wrong
-  bucket or folder). After a look at the drive: `/drive_force` in Telegram (or `drive-backup.sh run --force`). Forcing
-  accepts the count of the first alert (and 10% more, as the drive keeps changing), not more: if the drive changed further
-  meanwhile, it stops again with the new numbers, and forcing again accepts those.
+  be overwritten or removed (a wiped drive, or ransomware that re-encrypted it), it copies only the new files, holds every
+  change and deletion back and warns you (⚠️), each night until you act. New files do not count. A drive with no files at
+  all is an error (a wrong bucket or folder). After a look at the drive: `/drive_force` in Telegram (or
+  `drive-backup.sh run --force`) syncs everything, deletions included.
 - **The keys cannot destroy the backup:** the server's drive key only reads; its backup key has no `deleteFiles`, so the worst
-  it can do is hide files, which B2 keeps for 30 days (the lifecycle rule, which this key cannot change).
+  it can do is hide files, which B2 keeps for 30 days (the lifecycle rule, which this key cannot change; `install` and the
+  daily check read it and fail if it keeps old versions less than 30 days).
 - **Verify, every 30 days** (right after a sync, so no edits slip in between): every file of the drive is in the backup at
   the same size, and 5 random ones are the same byte for byte. `check` fails if none passed in 32 days.
-- **Telegram** (through opsbot): `/drive_sync`, `/drive_force`, a 🗂 line in `/status`; a failed sync, the guard or a failed
-  verify sends an alert.
+- **Daily check at 09:30** (`drive-check.timer`): alerts if the last good sync is over 36 h old, the guard holds changes
+  back, no verify passed in 32 days, a timer is off, the keys are not root's alone or the lifecycle rule is wrong.
+- **Telegram** (through opsbot): `/drive_sync`, `/drive_force`, a 🗂 line in `/status`; alerts with their own titles: ❌ a
+  failed sync, ⚠️ changes held back, ❌ a failed verify, ⚠️ the daily check's problems.
 
 ## Buckets and keys
 
@@ -32,8 +34,8 @@ pip install b2
 b2 account authorize                 # your master key, only here
 b2 key create --bucket my-drive-backup drive-backup-server listBuckets,listFiles,readFiles,writeFiles
 ```
-`install` tries the backup key and warns if it may delete for good. It does not try whether the drive key may write (that
-would put a file into your vault): give it read rights only.
+`install` tries the keys and warns if the backup key may delete for good or the drive key may write (its test file goes to
+the bucket's top, outside the vault's folders, and is removed).
 
 ## Install
 
@@ -45,7 +47,7 @@ cp drive-backup.secrets.example drive-backup.secrets  # the two keys; chmod 600
 sudo ./drive-backup.sh install
 ```
 It writes the keys to `/etc/drive-backup/rclone.conf` (600; the secrets file may be deleted afterwards), tests both buckets,
-installs the timer, registers the opsbot plugin `drive` and starts a first sync (and verify). After editing the env file, run
+installs the timers, registers the opsbot plugin `drive` and starts a first sync (and verify). After editing the env file, run
 `install` again: it rewrites rclone.conf, keeping the keys. The folder must be root's alone (opsbot
 checks this script, the config and the keys before each action). `check` (OK/FAIL lines), `uninstall` (the buckets stay).
 
