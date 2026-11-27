@@ -7,15 +7,18 @@ It plugs into [opsbot](../opsbot/README.md) for alerts and Telegram commands; it
 - **Nightly at 04:00** (`drive-backup.timer`): `rclone sync` of the drive bucket to the backup bucket. A file changed or deleted
   on the drive is changed or hidden in the backup, and B2 keeps the old version for the lifecycle's days.
 - **The guard:** before syncing, it plans the sync (a dry run, so it judges each file exactly as the sync will). If more than `DRIVE_MAX_CHANGE` % (default 10) of the backup's files would
-  be overwritten or removed (a wiped drive, or ransomware that re-encrypted it), it copies only the new files, holds every
-  change and deletion back and warns you (⚠️), each night until you act. New files do not count. A drive with no files at
-  all is an error (a wrong bucket or folder). After a look at the drive: `/drive_force` in Telegram (or
-  `drive-backup.sh run --force`) syncs everything, deletions included.
+  be overwritten or removed (a wiped drive, or ransomware that re-encrypted it), it copies only that night's new files, holds
+  every change and deletion back and warns you (⚠️). From then on nothing is synced (it warns each night) until you act:
+  after a look at the drive, `/drive_force` in Telegram (or `drive-backup.sh run --force`) syncs everything, deletions
+  included; or put the drive back as the backup has it, and syncing goes on by itself. New files do not count. During the
+  sync, deletions stop at what is left of the limit (a second stop, for changes after its plan). A drive with no files at
+  all is an error (a wrong bucket or folder).
 - **The keys cannot destroy the backup:** the server's drive key only reads; its backup key has no `deleteFiles`, so the worst
   it can do is hide files, which B2 keeps for 30 days (the lifecycle rule, which this key cannot change; `install` and the
   daily check read it and fail if it keeps old versions less than 30 days).
 - **Verify, every 30 days** (right after a sync, so no edits slip in between): every file of the drive is in the backup at
-  the same size, and 5 random ones are the same byte for byte. `check` fails if none passed in 32 days.
+  the same size, and 5 random ones are the same byte for byte. A failure alerts only the second time in a row (a file a
+  device changes while it runs makes it fail once); `check` fails if none passed in 32 days.
 - **Daily check at 09:30** (`drive-check.timer`): alerts if the last good sync is over 36 h old, the guard holds changes
   back, no verify passed in 32 days, a timer is off, the keys are not root's alone or the lifecycle rule is wrong.
 - **Telegram** (through opsbot): `/drive_sync`, `/drive_force`, a 🗂 line in `/status`; alerts with their own titles: ❌ a

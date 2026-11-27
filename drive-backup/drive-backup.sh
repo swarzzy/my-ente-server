@@ -82,10 +82,10 @@ preflight() {
 # cmd_run [force]: the guard, then the sync. The guard is the sync's own dry run (rclone's report: + new, * overwritten,
 # - removed, = same), so both judge each file the same way. It stops when more than DRIVE_MAX_CHANGE % of the backup's files
 # would be overwritten or removed: a ransomware-encrypted or wiped drive must not replace the backup unnoticed. Then it copies
-# only the new files and holds the rest back (exit 3: a warning). FORCE (after a look, only while the guard holds) syncs
-# everything. Once a month the sync then verifies the backup.
+# only the new files and holds the rest back (exit 3: a warning). From then on nothing is synced, until FORCE (after a look)
+# syncs everything, or the drive is back as the backup has it. Once a month the sync then verifies the backup.
 cmd_run() {
-  local force=${1:-} new changed gone total n b
+  local force=${1:-} new changed gone total n b limit=()
   load_config
   lock -n || die "a sync is already running"
   preflight
@@ -96,6 +96,11 @@ cmd_run() {
   new=$(grep -c '^+ ' "$STATE/plan" || true) changed=$(grep -c '^[*-] ' "$STATE/plan" || true)
   gone=$(grep -c '^- ' "$STATE/plan" || true) total=$(grep -c '^[=*-] ' "$STATE/plan" || true)
   [[ $force != force || -f $STATE/guard ]] || die "nothing to force: the guard holds nothing back"
+  if [[ $force != force && -f $STATE/guard ]] && ((changed)); then
+    echo "$changed $total" >"$STATE/guard"
+    log "WARN: guard: $changed of $total files in the backup would change or go: nothing synced until /drive_force (or $0 run --force), or until the drive is back as the backup has it" >&2
+    exit 3
+  fi
   if [[ $force != force ]] && ((changed * 100 > total * DRIVE_MAX_CHANGE)); then
     echo "$changed $total" >"$STATE/guard"
     sed -n 's/^+ //p' "$STATE/plan" >"$STATE/new"
@@ -104,10 +109,12 @@ cmd_run() {
     log "WARN: guard: $changed of $total files in the backup would change or go ($((changed * 100 / total))% > $DRIVE_MAX_CHANGE%): held back, $new new copied. Look at the drive; if it is right: /drive_force (or $0 run --force) applies them" >&2
     exit 3
   fi
+  # a second stop for what changes after the plan: deletions only up to what is left of the guard's budget (overwrites cannot
+  # be limited; they keep their old version). A forced run has no limit.
+  [[ $force == force ]] || limit=(--max-delete $((total * DRIVE_MAX_CHANGE / 100 - (changed - gone))))
   if ((new + changed)); then
     log "syncing: $new new, $changed changed or gone, $((total - changed)) unchanged${force:+ (forced)}"
-    # --max-delete: no more deletions than planned. What changes after the plan is not stopped, but keeps its old version.
-    rc sync "$SRC" "$DST" --fast-list --max-delete "$gone" --dest-after "$STATE/after" --format sp ||
+    rc sync "$SRC" "$DST" --fast-list "${limit[@]}" --dest-after "$STATE/after" --format sp ||
       die "sync failed partway (what it overwrote or removed keeps its old version in B2; the next run continues)"
   else log "nothing to sync: the backup has every file"; fi
   rm -f "$STATE/guard"
@@ -115,25 +122,32 @@ cmd_run() {
   echo "$(date -Is) $n $b" >"$STATE/last-ok"
   log "synced: the backup holds $n files"
   [[ -z $DRIVE_HC_URL ]] || curl -fsS -m 20 --retry 3 -o /dev/null "$DRIVE_HC_URL" || log "heartbeat ping failed"
-  [[ -f $STATE/verify-ok ]] && (($(hours_since "$(cat "$STATE/verify-ok")") < VERIFY_H)) || verify
+  [[ -f $STATE/verify-ok ]] && (($(hours_since "$(cat "$STATE/verify-ok")") < VERIFY_H)) && return 0
+  # a file a device changes while it runs makes it fail once: only a second failure in a row alerts
+  verify && return 0
+  [[ ! -f $STATE/verify-failed ]] || die "verify failed twice in a row (see above)" 4
+  touch "$STATE/verify-failed"
+  log "WARN: verify failed (a file changed while it ran?): it runs again after the next sync" >&2
 }
 
 cmd_verify() {
   load_config
   lock -w 21600 || die "a sync has run for 6 hours: verify skipped"
-  verify
+  verify || exit 4
 }
 
 # verify (holding the lock): the backup has every file of the drive at the same size, and 5 of them, at random, byte for byte
 verify() {
   local out
-  out=$(rc check "$SRC" "$DST" --one-way --fast-list --match "$STATE/match" 2>&1) ||
-    die "the backup differs from the drive: $(grep -E 'ERROR|differences' <<<"$out" | tail -3)" 4
+  if ! out=$(rc check "$SRC" "$DST" --one-way --fast-list --match "$STATE/match" 2>&1); then
+    log "ERROR: the backup differs from the drive: $(grep -E 'ERROR|differences' <<<"$out" | tail -3)" >&2; return 1
+  fi
   shuf -n 5 "$STATE/match" >"$STATE/sample"
-  if [[ -s $STATE/sample ]]; then
-    out=$(rc check "$SRC" "$DST" --download --files-from "$STATE/sample" 2>&1) || die "a sampled file differs byte for byte: $(tail -2 <<<"$out")" 4
+  if [[ -s $STATE/sample ]] && ! out=$(rc check "$SRC" "$DST" --download --files-from "$STATE/sample" 2>&1); then
+    log "ERROR: a sampled file differs byte for byte: $(tail -2 <<<"$out")" >&2; return 1
   fi
   date -Is >"$STATE/verify-ok"
+  rm -f "$STATE/verify-failed"
   log "verify passed: every file of the drive is in the backup, $(wc -l <"$STATE/sample") sampled byte for byte"
 }
 
@@ -226,7 +240,8 @@ key_checks() {
 # files by age, or deletes hidden ones sooner, is a FAIL; no rule (kept for good, the bill grows) a WARN.
 lifecycle_check() {
   local out
-  out=$(rc backend lifecycle "drivebak:$DRIVE_B2_BUCKET" 2>&1) || { warn "cannot read the backup bucket's lifecycle rules: $(tail -1 <<<"$out")"; return 0; }
+  out=$(rc backend lifecycle "drivebak:$DRIVE_B2_BUCKET" 2>"$STATE/plan.err") ||
+    { warn "cannot read the backup bucket's lifecycle rules: $(tail -1 "$STATE/plan.err")"; return 0; }
   case $(python3 -I -c '
 import json, sys
 p = sys.argv[1].strip("/") + "/" if sys.argv[1] else ""
@@ -284,9 +299,12 @@ EOF
 
 # cmd_alert UNIT: the alert for a failed drive unit, sent by opsbot, its title from how the unit ended
 cmd_alert() {
-  local h t
+  local h t st
   h=$(hostname)
-  case $1:$(systemctl show -p ExecMainStatus --value "$1" 2>/dev/null) in
+  st=$(systemctl show -p ExecMainStatus --value "$1" 2>/dev/null)
+  # 1: it exited (else a signal killed it, and the status is the signal's number)
+  [[ $(systemctl show -p ExecMainCode --value "$1" 2>/dev/null) == 1 ]] || st=signal
+  case $1:$st in
     drive-backup.service:3) t="⚠️ Drive backup held changes back on $h (new files copied)" ;;
     *:4) t="❌ Drive backup verify failed on $h" ;;
     drive-check.service:*) t="⚠️ Drive backup check found problems on $h" ;;
@@ -339,6 +357,7 @@ cmd_install() {
 
 cmd_uninstall() {
   systemctl disable --now drive-backup.timer drive-check.timer >/dev/null 2>&1 || true
+  systemctl stop drive-backup.service drive-check.service 2>/dev/null || true # a run in progress
   rm -f "$UNITS"/drive-{backup,check}.{service,timer} "$UNITS/drive-alert@.service"
   systemctl daemon-reload
   [[ ! -x $OPSBOT_CLI ]] || "$OPSBOT_CLI" plugin remove drive

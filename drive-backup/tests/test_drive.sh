@@ -25,6 +25,8 @@ in_db() {
     eval "$1" ) 2>&1
 }
 files() { find "$1" -type f | wc -l; }
+# SPY: in in_db, prints the real sync's arguments ("SYNC ...")
+SPY='eval "$(declare -f rc | sed "1s/^rc/rc_real/")"; rc() { [[ $1 == sync && " $* " != *" --dry-run "* ]] && echo "SYNC $*"; rc_real "$@"; };'
 for i in $(seq 1 20); do head -c $((100 + i)) /dev/urandom >"$T/src/vault/d/f$i.c9r"; done
 
 echo "== config"
@@ -42,7 +44,8 @@ check "first run (an empty backup): everything copied, then verified" '[[ $out =
 check "... and recorded: time, files, bytes" '[[ $(cut -d" " -f2 "$T/st/last-ok") == 20 && $(cut -d" " -f3 "$T/st/last-ok") == $(du -cb "$T"/src/vault/d/* | tail -1 | cut -f1) ]]' "$(cat "$T/st/last-ok")"
 out=$(in_db act_status); check "/status: when, how many files, how big" '[[ $out == "🗂 Drive: last sync "*" ago · 20 files, "*B ]]' "$out"
 head -c 500 /dev/urandom >"$T/src/vault/d/f1.c9r"; rm "$T/src/vault/d/f2.c9r"
-out=$(in_db 'cmd_run; echo "rc=$?"')
+out=$(in_db "$SPY"' cmd_run; echo "rc=$?"')
+check "... deletions limited to what is left of the 10%: 2 of 20, minus 1 overwrite" '[[ $out == *"SYNC sync"*"--max-delete 1 "* ]]' "$out"
 check "2 of 20 changed or gone (10%): synced (verified a month ago: not again)" '[[ $out == *"2 changed or gone"* && $out != *"verify passed"* && $out == *"rc=0" && $(files "$T/dst/bak/drive") == 19 ]]' "$out"
 out=$(in_db 'cmd_run; echo "rc=$?"'); check "nothing changed: nothing to sync, still a good sync" '[[ $out == *"nothing to sync"* && $out == *"rc=0" ]]' "$out"
 for i in $(seq 21 80); do head -c 50 /dev/urandom >"$T/src/vault/d/n$i.c9r"; done
@@ -61,15 +64,19 @@ out=$(in_db act_status); check "... /status says so and what to do" '[[ $out == 
 out=$(in_db cmd_check); check "... check fails on it (the daily check alerts)" '[[ $out == *"FAIL  the guard holds back changes: 60 of 79 files would change or go"* ]]' "$out"
 head -c 70 /dev/urandom >"$T/src/vault/d/f3.c9r"; head -c 70 /dev/urandom >"$T/src/vault/d/new1.c9r"
 out=$(in_db '(cmd_run); echo "rc=$?"')
-check "... the next nightly run holds them back again, but copies the new file" '[[ $out == *"guard: 61 of 79"*"1 new copied"* && $out == *"rc=3" && -f $T/dst/bak/drive/d/new1.c9r && $(head -c 70 "$T/dst/bak/drive/d/f3.c9r" | cmp -s - "$T/src/vault/d/f3.c9r"; echo $?) != 0 ]]' "$out"
-out=$(in_db 'bot_action sync; echo "rc=$?"'); check "... /drive_sync: the same, as a warning" '[[ $out == *"⚠️ guard: 61 of 80"* && $out == *"rc=3" ]]' "$out"
-out=$(in_db 'bot_action force; echo "rc=$?"')
-check "/drive_force: synced everything, the guard cleared" '[[ $out == *"syncing:"*"(forced)"* && $out == *"rc=0" && ! -e $T/st/guard ]] && diff -r "$T/src/vault" "$T/dst/bak/drive" >/dev/null' "$out"
+check "... while it holds, nothing is synced at all, new files neither" '[[ $out == *"WARN: guard: 61 of 79 files in the backup would change or go: nothing synced until /drive_force"* && $out == *"rc=3" && ! -e $T/dst/bak/drive/d/new1.c9r ]] && diff -r "$T/dst" "$T/dst.before" >/dev/null' "$out"
+out=$(in_db 'bot_action sync; echo "rc=$?"'); check "... /drive_sync: the same, as a warning" '[[ $out == *"⚠️ guard: 61 of 79"* && $out == *"rc=3" ]]' "$out"
+out=$(in_db "$SPY"' bot_action force; echo "rc=$?"')
+check "/drive_force: synced everything (no deletion limit), the guard cleared" '[[ $out == *"syncing:"*"(forced)"* && $out == *"rc=0" && $out != *"--max-delete"* && ! -e $T/st/guard ]] && diff -r "$T/src/vault" "$T/dst/bak/drive" >/dev/null' "$out"
 check "... its reply without timestamps, and it is in the log" '[[ $out != *"[test]"* ]] && grep -q "(forced)" "$T/log"' "$out"
 out=$(in_db 'bot_action force; echo "rc=$?"'); check "/drive_force without a stopped sync: nothing to force" '[[ $out == "❌ nothing to force"*"rc=1" ]]' "$out"
 rm "$T"/src/vault/d/n2*.c9r "$T"/src/vault/d/n3*.c9r
 head -c 50 /dev/urandom >"$T/src/vault/d/new2.c9r"
 out=$(in_db 'cmd_run; echo "rc=$?"'); check "19 of 80 deleted (23%): held back too, the new file copied" '[[ $out == *"guard: 19 of 80"*"1 new copied"* && $(files "$T/dst/bak/drive") == 81 ]]' "$out"
+cp "$T"/dst/bak/drive/d/n2*.c9r "$T"/dst/bak/drive/d/n3*.c9r "$T/src/vault/d/"
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "... the drive put back as the backup has it: the guard clears, syncing goes on" '[[ $out == *"rc=0" && ! -e $T/st/guard ]]' "$out"
+rm "$T"/src/vault/d/n2*.c9r "$T"/src/vault/d/n3*.c9r
+out=$(in_db '(cmd_run); echo "rc=$?"'); check "... deleted again: held back again" '[[ $out == *"guard: 19 of 81"* && $out == *"rc=3" ]]' "$out"
 for i in $(seq 41 50); do rm "$T/src/vault/d/n$i.c9r"; done # 10 more gone since
 out=$(in_db 'cmd_run force; echo "rc=$?"'); check "forcing applies every deletion, also those since the alert" '[[ $out == *"29 changed or gone"*"(forced)"* && $out == *"rc=0" && $(files "$T/dst/bak/drive") == 52 ]]' "$out"
 echo "DRIVE_MAX_CHANGE=50" >>"$T/env"; for f in "$T"/src/vault/d/n5*.c9r; do head -c 90 /dev/urandom >"$f"; done
@@ -88,6 +95,10 @@ out=$(in_db 'cmd_check; echo "rc=$?"'); check "check: a recent good sync and ver
 date -Is -d '33 days ago' >"$T/st/verify-ok"
 out=$(in_db cmd_check); check "... a verify over 32 days old is a FAIL" '[[ $out == *"FAIL  the backup has not passed a verify in 32 days (last: "* ]]' "$out"
 out=$(in_db 'cmd_run; echo "rc=$?"'); check "... and the next sync verifies" '[[ $out == *"verify passed"* && $out == *"rc=0" && $(cut -c1-10 "$T/st/verify-ok") == $(date +%F) ]]' "$out"
+date -Is -d '31 days ago' >"$T/st/verify-ok"; FAILV='verify() { log "ERROR: the backup differs" >&2; return 1; };'
+out=$(in_db "$FAILV"' (cmd_run); echo "rc=$?"'); check "a failed verify in a sync: only a warning the first time (a file in flight?)" '[[ $out == *"WARN: verify failed"*"runs again after the next sync"* && $out == *"rc=0" && -e $T/st/verify-failed ]]' "$out"
+out=$(in_db "$FAILV"' (cmd_run); echo "rc=$?"'); check "... twice in a row: an error, exit 4 (its own alert)" '[[ $out == *"verify failed twice in a row"* && $out == *"rc=4" ]]' "$out"
+out=$(in_db '(cmd_run); echo "rc=$?"'); check "... passing again clears it" '[[ $out == *"verify passed"* && $out == *"rc=0" && ! -e $T/st/verify-failed ]]' "$out"
 echo "$(date -Is -d '40 hours ago') 52 1000" >"$T/st/last-ok"
 out=$(in_db act_status); check "/status: a sync over 36 h old is a warning" '[[ $out == "⚠️ Drive: last sync 40 h ago"* ]]' "$out"
 out=$(in_db cmd_check); check "... and a FAIL in check" '[[ $out == *"FAIL  last good sync is older than 36 h"* ]]' "$out"
@@ -118,15 +129,16 @@ mkdir -p "$T/pj"; in_db 'load_config >/dev/null; plugin_json' >"$T/pj/drive.json
 out=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import opsbot; p = opsbot.read_plugin(sys.argv[2]); print(p["name"], " ".join(c["command"] for c in p["commands"]), " ".join(sorted(p["actions"])), len(p["root_files"]))' \
   "$(dirname "$OPSBOT_PY")" "$T/pj/drive.json" 2>&1)
 check "the plugin: opsbot accepts it; /drive_sync, /drive_force, a /status line; its config and keys are root_files" '[[ $out == "drive drive_sync drive_force force status sync 3" ]]' "$out"
-lc() { in_db "load_config; rc() { echo '$1'; }; lifecycle_check"; }
+lc() { in_db "load_config; rc() { echo 'NOTICE: a note' >&2; echo '$1'; }; lifecycle_check"; } # a notice on stderr does not matter
 out=$(lc '[{"daysFromHidingToDeleting": 30, "daysFromUploadingToHiding": null, "fileNamePrefix": ""}]'); check "lifecycle: 30 days: OK" '[[ $out == *"OK    the backup keeps old versions 30 days"* ]]' "$out"
 out=$(lc '[{"daysFromHidingToDeleting": 1, "daysFromUploadingToHiding": null, "fileNamePrefix": "drive/"}]'); check "lifecycle: 1 day on the folder: FAIL" '[[ $out == *"FAIL  the backup bucket'"'"'s lifecycle"* ]]' "$out"
 out=$(lc '[{"daysFromHidingToDeleting": 1, "daysFromUploadingToHiding": null, "fileNamePrefix": "other/"}]'); check "... on another folder only: no rule here (WARN)" '[[ $out == *"WARN  the backup bucket has no lifecycle rule"* ]]' "$out"
 out=$(lc '[{"daysFromHidingToDeleting": 30, "daysFromUploadingToHiding": 60, "fileNamePrefix": ""}]'); check "lifecycle: hides files by age: FAIL" '[[ $out == *"FAIL"* ]]' "$out"
 out=$(lc '[]'); check "no rule: WARN (kept for good)" '[[ $out == *"WARN  the backup bucket has no lifecycle rule"* ]]' "$out"
-al() { in_db "systemctl() { echo $2; }; NOTIFY_UNIT=echo; cmd_alert $1"; }
+al() { in_db "systemctl() { case \$* in *ExecMainCode*) echo ${3:-1} ;; *) echo $2 ;; esac; }; NOTIFY_UNIT=echo; cmd_alert $1"; }
 out=$(al drive-backup.service 3); check "the alert: the guard is a warning" '[[ $out == "drive-backup.service ⚠️ Drive backup held changes back on "*" (new files copied) ERROR|WARN|FAIL" ]]' "$out"
 out=$(al drive-backup.service 4); check "... a failed verify says so" '[[ $out == *"❌ Drive backup verify failed on "* ]]' "$out"
+out=$(al drive-backup.service 3 2); check "... killed by signal 3: a failure, not the guard" '[[ $out == *"❌ Drive backup failed on "* ]]' "$out"
 out=$(al drive-backup.service 1); check "... a failed sync" '[[ $out == *"❌ Drive backup failed on "* ]]' "$out"
 out=$(al drive-check.service 1); check "... the daily check" '[[ $out == *"⚠️ Drive backup check found problems on "* ]]' "$out"
 for at in "" tomorrow "2026-11-20"; do
