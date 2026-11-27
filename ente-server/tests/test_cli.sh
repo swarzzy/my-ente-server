@@ -51,6 +51,14 @@ echo new >"$T/new"
 out=$(in_setup 'overwrite_in_place "$T/new" /dev/full; echo "rc=$?"')
 check "overwrite_in_place on a full disk: dies, keeps the new content and says where" \
   '[[ $out == *"could not write /dev/full"*"its new content is in $T/new"* && $out != *"rc=0"* && $(cat "$T/new") == new ]]' "$out"
+# llmnr ACTIVE: no_llmnr with systemd-resolved active (yes) or not; prints the systemctl calls and the drop-in
+llmnr() { in_setup "RESOLVED_DIR=\$T/rd; systemctl() { echo \"systemctl \$*\"; [[ \$1 != is-active || $1 == yes ]]; }; no_llmnr; cat \$T/rd/ente.conf 2>/dev/null"; }
+out=$(llmnr yes)
+check "no_llmnr: with systemd-resolved, LLMNR and mDNS off in a drop-in, resolved restarted" \
+  '[[ $out == *"systemctl restart systemd-resolved"* ]] && grep -qx "LLMNR=no" <<<"$out" && grep -qx "MulticastDNS=no" <<<"$out"' "$out"
+out=$(llmnr yes); check "... a second run changes nothing and restarts nothing" '[[ $out != *restart* && $out != *wrote* ]]' "$out"
+rm -rf "$T/rd"; out=$(llmnr no)
+check "... without systemd-resolved: no drop-in, no restart" '[[ ! -e $T/rd && $out != *restart* ]]' "$out"
 out=$(in_setup 'cd "$T"; ENV_FILE=rel.env SECRETS_FILE=$T/s.secrets config_env')
 check "config_env: absolute paths of both files, for the units" '[[ $out == "ENV_FILE=$(realpath "$T")/rel.env SECRETS_FILE=$(realpath "$T")/s.secrets" ]]' "$out"
 out=$(in_setup 'ENV_FILE="$T/my env" config_env; echo "rc=$?"')

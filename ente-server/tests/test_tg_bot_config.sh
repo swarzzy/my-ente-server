@@ -106,8 +106,9 @@ echo "== what the actions reply"
 # fake ente-ops.sh / ente-s3-proxy.sh in $T/fake (their output in $T/fake.out, exit code in FAKE_RC)
 mkdir -p "$T/fake" "$T/st" "$T/sites"
 for f in ente-ops.sh ente-s3-proxy.sh; do printf '#!/bin/bash\ncat "%s"\nexit "${FAKE_RC:-0}"\n' "$T/fake.out" >"$T/fake/$f"; done
+# the bot shows timer times in the server's zone: pin it, so "03:00 CET" reads 03:00 on a server in any zone
 act() {
-  in_bot "$U" "" '
+  TZ=Europe/Berlin in_bot "$U" "" '
     BOT_DIR=$T/fake BACKUP_STATE=$T/st PROXY_STATE=$T/proxy-state REBOOT_FLAG=$T/reboot CADDY_SITES=$T/sites
     bot_load_env
     dc() { [[ $1 == ps && " ${DOWN:-} " != *" $3 "* ]] && echo "cid-$3"; return 0; }

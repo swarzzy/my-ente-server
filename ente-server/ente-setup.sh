@@ -262,6 +262,17 @@ EOF
 }
 
 # bootstrap: upgrade packages, admin user + sshd hardening, ufw, unattended upgrades, swap, fail2ban.
+# no_llmnr: some images run systemd-resolved with LLMNR on, listening on 0.0.0.0:5355 (TCP/UDP), which `check` reports as
+# open. Nothing here uses LLMNR or mDNS (local-network name lookup), so both are turned off. Without systemd-resolved: nothing.
+RESOLVED_DIR=/etc/systemd/resolved.conf.d
+no_llmnr() {
+  systemctl is-active --quiet systemd-resolved 2>/dev/null || return 0
+  mkdir -p "$RESOLVED_DIR"
+  local before; before=$(cat "$RESOLVED_DIR/ente.conf" 2>/dev/null || true)
+  printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' | write_file "$RESOLVED_DIR/ente.conf"
+  [[ $(cat "$RESOLVED_DIR/ente.conf") == "$before" ]] || systemctl restart systemd-resolved
+}
+
 cmd_bootstrap() {
   load_env; need ADMIN_USER ADMIN_SSH_PUBKEY
   [[ $ADMIN_USER != root ]] || die "ADMIN_USER must not be root (bootstrap turns root login off: it would lock you out)"
@@ -299,6 +310,7 @@ EOF
     systemctl enable fail2ban >/dev/null 2>&1
     systemctl restart fail2ban
   fi
+  no_llmnr
   log "bootstrap done. Test a second login as $ADMIN_USER (ssh -p $SSH_PORT $ADMIN_USER@<ip>) before closing this session."
   [[ $SSH_PORT == 22 ]] || log "if your provider has its own firewall (security group), allow TCP $SSH_PORT there too."
   local newest; newest=$(find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' | sed 's/^vmlinuz-//' | sort -V | tail -1)

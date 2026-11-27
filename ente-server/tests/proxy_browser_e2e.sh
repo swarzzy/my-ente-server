@@ -88,4 +88,5 @@ if [[ ${MODE:-} != delete ]]; then
   if [[ $b == PASS* ]]; then echo "  ok    ${b#PASS }"; else echo "  FAIL  ${b#FAIL }"; rc=1; fi
 fi
 [[ ! -e $W/upload-failed.png ]] || cp "$W/upload-failed.png" /root/proxy-e2e-upload-failed.png
+[[ ! -e $W/view-failed.png ]] || cp "$W/view-failed.png" /root/proxy-e2e-view-failed.png
 exit $rc

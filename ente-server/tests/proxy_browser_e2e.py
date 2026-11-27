@@ -154,7 +154,16 @@ def upload(pg, files):
 
 def open_first_photo(pg):
     """Click the first thumbnail, wait for the full file to load, close the viewer."""
-    pg.locator("img[src^='blob:']").first.click()
+    # newer web builds give the thumbnail <img> pointer-events: none (its tile takes the click) and park a small blob: icon
+    # off-screen, so click like a user: the middle of the first thumbnail that is on screen
+    box = pg.evaluate("""() => { for (const i of document.querySelectorAll("img[src^='blob:']")) {
+        const r = i.getBoundingClientRect();
+        if (r.x >= 0 && r.y >= 0 && r.width > 50 && r.height > 50) return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+      } return null; }""")
+    if not box:
+        pg.screenshot(path="/w/view-failed.png")
+        raise RuntimeError("no thumbnail on screen to open")
+    pg.mouse.click(box["x"], box["y"])
     time.sleep(12)
     pg.keyboard.press("Escape")
     time.sleep(2)
