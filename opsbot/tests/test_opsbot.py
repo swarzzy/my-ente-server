@@ -20,15 +20,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 import opsbot as ob  # noqa: E402
 
+SETTINGS = (ob.PLUGINS_DIR, ob.REBOOT_FLAG)  # the module settings the bot tests change
+
 TOKEN = "123456:TEST-token_abcdefghijklmnopqrstuvwxyz"
 OWNER = 376193354
 STRANGER = 555000111
 
-# a plugin like a real service's: a quick status, background actions, a command with arguments sharing one lock
+# a plugin like a real service's: a status action, background actions, a command with arguments (one lock: one command)
 DEMO = {
     "name": "demo",
     "exec": ["/bin/sh", "/nonexistent/demo.sh"],
-    "status": "status",
     "commands": [
         {"command": "check", "description": "Full health check", "action": "check"},
         {"command": "backup", "description": "Back up now", "action": "backup"},
@@ -42,10 +43,9 @@ DEMO = {
         "uptime": {"ok": "⏱ Uptime"},
         "check": {"started": "⏳ Checking...", "ok": "✅ Check passed", "fail": "❌ Check found problems"},
         "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed"},
-        "proxy-status": {"started": "⏳ Checking the S3 proxy...", "ok": "🔀 S3 proxy", "fail": "❌ S3 proxy has problems",
-                         "lock": "proxy"},
-        "proxy-on": {"started": "⏳ Turning the S3 proxy on...", "ok": "✅ S3 proxy is on", "lock": "proxy"},
-        "proxy-off": {"started": "⏳ Turning the S3 proxy off...", "ok": "✅ S3 proxy is off", "lock": "proxy"},
+        "proxy-status": {"started": "⏳ Checking the S3 proxy...", "ok": "🔀 S3 proxy", "fail": "❌ S3 proxy has problems"},
+        "proxy-on": {"started": "⏳ Turning the S3 proxy on...", "ok": "✅ S3 proxy is on"},
+        "proxy-off": {"started": "⏳ Turning the S3 proxy off...", "ok": "✅ S3 proxy is off"},
         "size": {"started": "⏳ Measuring the buckets..."},
     },
 }
@@ -112,14 +112,15 @@ class FakeRunner:
         self.timeouts = {}
         self.lock = threading.Lock()
 
-    def __call__(self, plugin, action, timeout=ob.SLOW_TIMEOUT):
+    def __call__(self, plugin, action, timeout=ob.ACTION_TIMEOUT):
+        key = action if plugin == "demo" else "%s:%s" % (plugin, action)  # other plugins' actions: "plugin:action"
         with self.lock:
-            self.calls.append(action if plugin == "demo" else "%s:%s" % (plugin, action))
-            self.timeouts[action] = timeout
-        gate = self.gates.get(action)
+            self.calls.append(key)
+            self.timeouts[key] = timeout
+        gate = self.gates.get(key)
         if gate:
             gate.wait(10)
-        return self.out.get(action, (0, "output of " + action))
+        return self.out.get(key, (0, "output of " + key))
 
 
 class BotTest(unittest.TestCase):
@@ -138,6 +139,7 @@ class BotTest(unittest.TestCase):
         self.next_id = 100
 
     def tearDown(self):
+        ob.PLUGINS_DIR, ob.REBOOT_FLAG = SETTINGS
         self.srv.shutdown()
         self.srv.server_close()
         shutil.rmtree(self.state)
@@ -146,8 +148,8 @@ class BotTest(unittest.TestCase):
     def make_bot(self):
         # a short long-poll: a poll with nothing queued waits this long
         api = ob.TelegramAPI("http://127.0.0.1:%d" % self.srv.server_address[1], TOKEN, poll_timeout=0.1)
-        return ob.Bot(api, OWNER, self.runner, self.state, plugins_dir=self.plugins, log=self.log,
-                      reboot_flag=os.path.join(self.state, "no-reboot"))
+        ob.PLUGINS_DIR, ob.REBOOT_FLAG = self.plugins, os.path.join(self.state, "no-reboot")  # restored in tearDown
+        return ob.Bot(api, OWNER, self.runner, self.state, log=self.log)
 
     def msg(self, text, sender=OWNER, chat=None, chat_type="private", age=0, is_bot=False, edited=False):
         self.next_id += 1
@@ -184,16 +186,12 @@ class BotTest(unittest.TestCase):
         self.assertEqual(self.runner.calls, ["status"])
         self.assertEqual(self.texts()[0].splitlines()[0], "output of status")
 
-    def test_someone_else_is_ignored_and_the_owner_is_told_once(self):
+    def test_someone_else_is_ignored_and_nothing_is_sent(self):
         self.msg("/backup", sender=STRANGER)
         self.msg("/proxy on", sender=STRANGER)
         self.poll()
         self.assertEqual(self.runner.calls, [])
-        self.assertEqual([s for s in self.sent() if s["chat_id"] == STRANGER], [])  # no answer to the stranger at all
-        notices = self.texts()
-        self.assertEqual(len(notices), 1)
-        self.assertIn(str(STRANGER), notices[0])
-        self.assertIn("/backup", notices[0])
+        self.assertEqual(self.sent(), [])  # no answer to the stranger, no message to the owner
 
     def test_owner_in_a_group_is_ignored(self):
         self.msg("/backup", sender=OWNER, chat=-100123, chat_type="group")
@@ -219,11 +217,6 @@ class BotTest(unittest.TestCase):
         self.assertEqual(self.runner.calls, [])
         self.assertEqual(len(self.texts()), 1)
         self.assertTrue(self.texts()[0].startswith("⏰ Skipped /backup"), self.texts())
-
-    def test_a_stranger_notice_names_them(self):
-        self.msg("hi there", sender=STRANGER)
-        self.poll()
-        self.assertEqual(self.texts(), ["🚫 Someone else wrote, ignored: Someone @someone (id %d): 'hi there'" % STRANGER])
 
     # ---- commands from the plugins
     def test_help_and_unknown_commands_list_the_plugin_commands(self):
@@ -256,8 +249,8 @@ class BotTest(unittest.TestCase):
         t = self.texts()
         self.assertEqual(len(t), 7)
         self.assertEqual(t[0], "Send /proxy, /proxy status, /proxy on, /proxy off.")
-        self.assertEqual(t[3], "/status takes nothing after it. Just send /status.")
-        self.assertEqual(t[4], "/backup takes nothing after it. Just send /backup.")
+        self.assertEqual(t[3], "Send /status.")
+        self.assertEqual(t[4], "Send /backup.")
 
     def test_bot_name_suffix_is_accepted(self):
         self.msg("/check@ente_test_bot")
@@ -265,21 +258,20 @@ class BotTest(unittest.TestCase):
         self.wait_sent(2)
         self.assertEqual(self.runner.calls, ["check"])
 
-    def test_a_quick_action_replies_with_its_title_and_output(self):
-        self.msg("/uptime")
-        self.poll()
-        self.wait_sent(1)
-        self.assertEqual(self.texts(), ["⏱ Uptime\noutput of uptime"])
-        self.assertEqual(self.runner.timeouts["uptime"], ob.QUICK_TIMEOUT)
-        self.runner.out["uptime"] = (1, "broken")
+    def test_an_action_without_texts_says_it_started_then_its_title_and_output(self):
         self.msg("/uptime")
         self.poll()
         self.wait_sent(2)
+        self.assertEqual(self.texts(), ["⏳ /uptime...", "⏱ Uptime\noutput of uptime"])
+        self.runner.out["uptime"] = (1, "broken")
+        self.msg("/uptime")
+        self.poll()
+        self.wait_sent(4)
         self.assertEqual(self.texts()[-1], "❌ /uptime failed\nbroken")
 
     # ---- /status
     def test_status_is_each_plugins_status_then_the_system_line(self):
-        other = {"name": "other", "exec": ["/bin/true"], "status": "st", "actions": {"st": {}}}
+        other = {"name": "other", "exec": ["/bin/true"], "actions": {"status": {}}}
         write_plugin(self.plugins, other)
         self.bot.load_plugins()
         self.runner.out["status"] = (0, "✅ Demo is up\n💾 Backup: fine")
@@ -287,10 +279,11 @@ class BotTest(unittest.TestCase):
         self.poll()
         self.wait_sent(1)
         lines = self.texts()[0].splitlines()
-        self.assertEqual(lines[:3], ["✅ Demo is up", "💾 Backup: fine", "output of st"])
+        self.assertEqual(lines[:3], ["✅ Demo is up", "💾 Backup: fine", "output of other:status"])
         self.assertTrue(lines[3].startswith("🖥 Disk ") and " used (" in lines[3] and "MB free · up " in lines[3], lines)
         self.assertNotIn("reboot pending", lines[3])
-        self.assertEqual(self.runner.calls, ["status", "other:st"])
+        self.assertEqual(self.runner.calls, ["status", "other:status"])
+        self.assertEqual(self.runner.timeouts["status"], ob.STATUS_TIMEOUT)
 
     def test_status_says_when_a_plugin_has_none_and_still_shows_the_rest(self):
         self.runner.out["status"] = (1, "some noise\nERROR: database down")
@@ -316,11 +309,11 @@ class BotTest(unittest.TestCase):
         self.msg("/status")
         self.msg("/uptime")
         self.poll()
-        self.wait_sent(1)
-        self.assertEqual(self.texts(), ["⏱ Uptime\noutput of uptime"])  # answered while /status still waits
-        self.runner.gates["status"].set()
         self.wait_sent(2)
-        self.assertTrue(self.texts()[1].startswith("output of status"), self.texts())
+        self.assertEqual(self.texts(), ["⏳ /uptime...", "⏱ Uptime\noutput of uptime"])  # answered while /status waits
+        self.runner.gates["status"].set()
+        self.wait_sent(3)
+        self.assertTrue(self.texts()[2].startswith("output of status"), self.texts())
 
     # ---- long actions
     def test_backup_replies_at_once_then_with_the_result(self):
@@ -337,7 +330,7 @@ class BotTest(unittest.TestCase):
         self.runner.gates["backup"].set()
         self.wait_sent(3)
         self.assertEqual(self.texts()[2], "✅ Backup done\nbackup ok")
-        self.assertEqual(self.runner.timeouts["backup"], ob.SLOW_TIMEOUT)
+        self.assertEqual(self.runner.timeouts["backup"], ob.ACTION_TIMEOUT)
 
     def test_a_second_backup_while_one_runs_is_refused(self):
         self.runner.gates["backup"] = threading.Event()
@@ -350,7 +343,7 @@ class BotTest(unittest.TestCase):
         self.runner.gates["backup"].set()
         self.wait_sent(3)
 
-    def test_actions_sharing_a_lock_are_serialised(self):
+    def test_one_command_runs_one_at_a_time_whatever_its_argument(self):
         self.runner.gates["proxy-on"] = threading.Event()
         self.msg("/proxy on")
         self.msg("/proxy off")
@@ -404,8 +397,8 @@ class BotTest(unittest.TestCase):
         self.runner.out["uptime"] = (0, "x" * 10000 + "THE END")
         self.msg("/uptime")
         self.poll()
-        self.wait_sent(1)
-        t = self.texts()[0]
+        self.wait_sent(2)
+        t = self.texts()[1]
         self.assertLessEqual(len(t), 4096)
         self.assertTrue(t.endswith("THE END"))
 
@@ -445,7 +438,7 @@ class BotTest(unittest.TestCase):
     def test_offset_is_persisted_so_nothing_runs_twice_after_a_restart(self):
         self.msg("/uptime")
         self.poll()
-        self.wait_sent(1)
+        self.wait_sent(2)
         self.bot = self.make_bot()  # restart
         self.poll()
         self.assertEqual(self.runner.calls, ["uptime"])
@@ -458,7 +451,7 @@ class BotTest(unittest.TestCase):
                 self.bot.run_once()
             except ob.ApiError:
                 pass
-        self.wait_sent(1)
+        self.wait_sent(2)
         self.assertEqual(self.runner.calls, ["uptime"])
         self.assertNotIn(TOKEN, self.log.getvalue())
         self.assertNotIn(TOKEN.split(":")[1], self.log.getvalue())
@@ -476,9 +469,10 @@ class BotTest(unittest.TestCase):
             with self.assertRaises(ob.ApiError):
                 self.bot.api.call("getUpdates")
 
-    def test_start_registers_the_command_menu_for_the_owner_only(self):
-        self.bot.register_commands()
-        calls = [b for m, b in self.srv.calls if m == "setMyCommands"]
+    def test_the_command_menu_is_registered_for_the_owner_only_and_retried_until_it_works(self):
+        self.srv.fail_next = 1  # the first setMyCommands fails
+        self.poll(2)
+        calls = [b for m, b in self.srv.calls if m == "setMyCommands"][1:]
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["scope"], {"type": "chat", "chat_id": OWNER})
         self.assertEqual([c["command"] for c in calls[0]["commands"]], ["status", "check", "backup", "proxy", "size", "uptime"])
@@ -488,7 +482,7 @@ class BotTest(unittest.TestCase):
         self.msg("/backup", sender=STRANGER)
         self.poll()
         log = self.log.getvalue()
-        self.assertIn("accepted /uptime (demo uptime)", log)
+        self.assertIn("accepted /uptime", log)
         self.assertIn("ignored", log)
         self.assertIn(str(STRANGER), log)
 
@@ -511,16 +505,13 @@ class PluginTest(unittest.TestCase):
         self.bad(lambda d: d.update(exec=["bash", "x"]), "absolute path")
         self.bad(lambda d: d.update(exec=["/bin/sh", "a\nb"]), "exec:")
         self.bad(lambda d: d.update(exec=[]), "exec:")
-        self.bad(lambda d: d.update(env={"lower": "x"}), "env:")
-        self.bad(lambda d: d.update(env={"OK": "two\nlines"}), "env:")
+        self.bad(lambda d: d.update(env={"OK": "x"}), "unknown keys: env")
         self.bad(lambda d: d.update(actions={}), "actions:")
         self.bad(lambda d: d["actions"].update({"Bad Name": {}}), "action 'Bad Name'")
         self.bad(lambda d: d["actions"].update({"x": {"title": "?"}}), "action x: only")
-        self.bad(lambda d: d["actions"].update({"x": {"lock": "l"}}), "lock needs started")
-        self.bad(lambda d: d["actions"].update({"x": {"started": "⏳", "busy": "?"}}), "action x: only")
-        self.bad(lambda d: d["actions"].update({"x": {"started": ""}}), "must not be empty")
-        self.bad(lambda d: d.update(status="check"), "status: the name of a quick action")
-        self.bad(lambda d: d.update(status="nope"), "status:")
+        self.bad(lambda d: d["actions"].update({"x": {"lock": "l"}}), "action x: only")
+        self.bad(lambda d: d["actions"].update({"x": {"started": ""}}), "one non-empty line")
+        self.bad(lambda d: d["actions"].update({"x": {"ok": "a\nb"}}), "one non-empty line")
         self.bad(lambda d: d["commands"].append({"command": "Up", "description": "x", "action": "status"}), "command 'Up'")
         self.bad(lambda d: d["commands"].append({"command": "help", "description": "x", "action": "status"}), "/help is the bot's own")
         self.bad(lambda d: d["commands"].append({"command": "status", "description": "x", "action": "status"}), "/status is the bot's own")
@@ -532,15 +523,16 @@ class PluginTest(unittest.TestCase):
                  "either action or args")
         self.bad(lambda d: d["commands"].append({"command": "x", "description": "x", "action": "rm"}), "'rm' is not one of its actions")
         self.bad(lambda d: d["commands"].append({"command": "x", "description": "x", "args": {"a b": "status"}}), "argument 'a b'")
-        self.bad(lambda d: d.update(commands=[], status=None), "needs commands or a status")
+        self.bad(lambda d: (d.update(commands=[]), d["actions"].pop("status")), "needs commands or a status")
         # a trailing newline must not pass (it would break the sudo rule)
         self.bad(lambda d: d.update(name="demo\n"), "name:")
         self.bad(lambda d: d["actions"].update({"x\n": {}}), "action 'x\\n'")
         self.bad(lambda d: d["commands"].append({"command": "x\n", "description": "x", "action": "status"}), "command 'x\\n'")
-        self.bad(lambda d: d.update(env={"OK\n": "x"}), "env:")
         self.bad(lambda d: d.update(exec=["/bin/sh", "${HOME}/x.sh"]), "no $")
         self.bad(lambda d: d.update(exec=["/bin/sh", "/opt/link/../x.sh"]), "without ..")
         self.bad(lambda d: d.update(exec=["/bin//sh"]), "without ..")
+        self.bad(lambda d: d.update(root_files=["relative.sh"]), "root_files:")
+        self.bad(lambda d: d.update(root_files=["/opt/x/../y"]), "without ..")
 
     def test_registry_refuses_a_command_two_plugins_want(self):
         d = tempfile.mkdtemp()
@@ -548,13 +540,13 @@ class PluginTest(unittest.TestCase):
             write_plugin(d, DEMO)
             write_plugin(d, {"name": "zz", "exec": ["/bin/true"], "commands": [
                 {"command": "check", "description": "x", "action": "a"}], "actions": {"a": {}}})
-            with self.assertRaises(ob.PluginError) as cm:
-                ob.load_registry(d)
-            self.assertIn("/check is already demo's", str(cm.exception))
+            skipped = []
+            self.assertEqual([x["name"] for x in ob.load_registry(d, skipped.append)], ["demo"])
+            self.assertIn("/check is already demo's", skipped[0])
         finally:
             shutil.rmtree(d)
 
-    def test_cli_validate_sudoers_actions_list(self):
+    def test_cli_validate_sudoers_root_only(self):
         d, src = tempfile.mkdtemp(), tempfile.mkdtemp()
         py = [sys.executable, "-I", os.path.join(HERE, "..", "opsbot.py")]
         try:
@@ -577,10 +569,6 @@ class PluginTest(unittest.TestCase):
             rule = out.stdout.strip().splitlines()[1]
             self.assertTrue(rule.startswith("opsbot ALL=(root) NOPASSWD: /usr/local/sbin/opsbot-action demo status, "), rule)
             self.assertEqual(rule.count("/usr/local/sbin/opsbot-action demo "), len(DEMO["actions"]))
-            out = subprocess.run(py + ["actions", "--plugins", d], capture_output=True, text=True)
-            self.assertEqual(out.stdout.splitlines(), ["demo " + a for a in DEMO["actions"]])
-            out = subprocess.run(py + ["list", "--plugins", d], capture_output=True, text=True)
-            self.assertEqual(out.stdout, "demo: /check /backup /proxy /size /uptime (+ /status)\n")
             with open(os.path.join(d, "broken.json"), "w") as f:
                 f.write("{")
             out = subprocess.run(py + ["sudoers", "opsbot", "/h", "--plugins", d], capture_output=True, text=True)
@@ -588,8 +576,9 @@ class PluginTest(unittest.TestCase):
             self.assertIn("/h demo status", out.stdout)
             self.assertNotIn("broken", out.stdout)
             self.assertIn("skipped plugin broken.json", out.stderr)
-            out = subprocess.run(py + ["list", "--plugins", d], capture_output=True, text=True)
-            self.assertEqual((out.returncode, out.stdout), (1, "demo: /check /backup /proxy /size /uptime (+ /status)\n"))
+            out = subprocess.run(py + ["root-only", "--plugins", d], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 1)  # a broken plugin fails it (and here: these files are not root's)
+            self.assertIn("skipped plugin broken.json", out.stderr)
             os.unlink(os.path.join(d, "broken.json"))
             with open(os.path.join(d, "demo.json"), "w") as f:
                 f.write('{"name": "demo", "old_key": 1}')  # the registered copy is broken: re-adding a good one must work
@@ -610,27 +599,31 @@ class HelperTest(unittest.TestCase):
         os.mkdir(self.plugins)
         self.script = os.path.join(self.d, "plugin.sh")
         with open(self.script, "w") as f:
-            f.write('#!/bin/sh\necho "args:$#:$1 env:$GREETING cwd:$(pwd)"\n')
+            f.write('#!/bin/sh\necho "args:$#:$1 env:${GREETING:-none} cwd:$(pwd)"\n')
         os.chmod(self.script, 0o755)
         # only the script: /bin/sh is root's, and this test stands in for root with its own user
-        write_plugin(self.plugins, {"name": "t", "exec": [self.script], "env": {"GREETING": "hi"},
-                                    "status": "status", "actions": {"status": {}, "run": {"started": "⏳"}}})
+        write_plugin(self.plugins, {"name": "t", "exec": [self.script], "actions": {"status": {}, "run": {"started": "⏳"}}})
 
     def tearDown(self):
         shutil.rmtree(self.d)
 
-    def helper(self, *args):
-        code = ("import sys; sys.path.insert(0, %r); import opsbot; sys.exit(opsbot.helper(%r, plugins_dir=%r, run=[], uid=%d, top=%r))"
-                % (os.path.join(HERE, ".."), list(args), self.plugins, os.getuid(), self.d))
-        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=self.d)
+    def helper(self, *args, trusted=None, run="[]"):
+        """Run the helper in a python of its own with this user trusted like root (TRUSTED) and the action run directly
+        (RUN). GREETING comes from the caller and must not reach the action."""
+        code = ("import sys; sys.path.insert(0, %r); import opsbot; opsbot.TRUSTED_UIDS = %r; opsbot.PLUGINS_DIR = %r; "
+                "opsbot.RUN = %s; sys.exit(opsbot.helper(%r))"
+                % (os.path.join(HERE, ".."), trusted or {0, os.getuid()}, self.plugins, run, list(args)))
+        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=self.d,
+                           env=dict(os.environ, GREETING="leak"))
         return p.returncode, (p.stdout + p.stderr).strip()
 
-    def test_a_registered_action_runs_with_its_env_in_the_root_directory(self):
-        self.assertEqual(self.helper("t", "status"), (0, "args:1:status env:hi cwd:/"))
+    def test_a_registered_action_runs_in_the_root_directory(self):
+        self.assertEqual(self.helper("t", "status")[1].split(" cwd:")[1], "/")
+        self.assertTrue(self.helper("t", "status")[1].startswith("args:1:status "))
 
     def test_unknown_or_malformed_requests_are_refused(self):
         self.assertEqual(self.helper("t", "rm"), (2, "unknown action"))
-        self.assertEqual(self.helper("nope", "status"), (2, "unknown plugin"))
+        self.assertEqual(self.helper("nope", "status"), (1, "refused: not found: %s" % os.path.join(self.plugins, "nope.json")))
         for args in (("t",), ("t", "status", "x"), ("../t", "status"), ("t", "status; id"), ()):
             self.assertEqual(self.helper(*args)[0], 2, args)
 
@@ -646,11 +639,9 @@ class HelperTest(unittest.TestCase):
         self.assertIn("refused: group/world-writable", out)
 
     def test_files_of_another_owner_are_refused(self):
-        code = ("import sys; sys.path.insert(0, %r); import opsbot; sys.exit(opsbot.helper(['t', 'status'], plugins_dir=%r, run=[], uid=%d, top=%r))"
-                % (os.path.join(HERE, ".."), self.plugins, os.getuid() + 1, self.d))
-        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True)
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("not owned by root", p.stderr)
+        rc, out = self.helper("t", "status", trusted={os.getuid() + 1})
+        self.assertEqual(rc, 1)
+        self.assertIn("not owned by root", out)
 
     def test_a_symlink_root_alone_controls_runs_as_written(self):
         # e.g. a virtualenv's python: it must keep its own path (run by its target it would lose the venv)
@@ -660,7 +651,7 @@ class HelperTest(unittest.TestCase):
         os.chmod(real, 0o755)
         link = os.path.join(self.d, "link.sh")
         os.symlink(real, link)
-        write_plugin(self.plugins, {"name": "t", "exec": [link], "status": "status", "actions": {"status": {}}})
+        write_plugin(self.plugins, {"name": "t", "exec": [link], "actions": {"status": {}}})
         self.assertEqual(self.helper("t", "status"), (0, "ran:%s" % link))
 
     def test_a_symlink_in_a_directory_others_can_write_is_refused(self):
@@ -673,30 +664,43 @@ class HelperTest(unittest.TestCase):
         os.mkdir(shared)
         os.chmod(shared, 0o777)
         os.symlink(real, os.path.join(shared, "link.sh"))
-        write_plugin(self.plugins, {"name": "t", "exec": [os.path.join(shared, "link.sh")], "status": "status",
-                                    "actions": {"status": {}}})
+        write_plugin(self.plugins, {"name": "t", "exec": [os.path.join(shared, "link.sh")], "actions": {"status": {}}})
         rc, out = self.helper("t", "status")
         self.assertEqual(rc, 1)
         self.assertIn("refused: group/world-writable: %s" % shared, out)
 
-    def test_a_program_that_is_not_there_is_refused(self):
-        write_plugin(self.plugins, {"name": "t", "exec": [os.path.join(self.d, "gone.sh")], "status": "status",
+    def test_root_files_are_checked_too_and_a_missing_one_through_its_folder(self):
+        conf = os.path.join(self.d, "app.conf")
+        open(conf, "w").close()
+        write_plugin(self.plugins, {"name": "t", "exec": [self.script], "root_files": [conf, os.path.join(self.d, "gone.env")],
                                     "actions": {"status": {}}})
+        self.assertEqual(self.helper("t", "status")[0], 0)  # gone.env: its folder is the user's alone, as root's would be
+        os.chmod(conf, 0o666)
+        rc, out = self.helper("t", "status")
+        self.assertEqual(rc, 1)
+        self.assertIn("refused: group/world-writable: %s" % conf, out)
+        os.chmod(conf, 0o644)
+        os.chmod(self.d, 0o777)  # anyone could now create gone.env
+        rc, out = self.helper("t", "status")
+        os.chmod(self.d, 0o700)
+        self.assertEqual(rc, 1)
+        self.assertIn("refused: group/world-writable: %s" % self.d, out)
+
+    def test_a_program_that_is_not_there_is_refused(self):
+        write_plugin(self.plugins, {"name": "t", "exec": [os.path.join(self.d, "gone.sh")], "actions": {"status": {}}})
         rc, out = self.helper("t", "status")
         self.assertEqual(rc, 1)
         self.assertIn("refused: not found: %s" % os.path.join(self.d, "gone.sh"), out)
 
-    def test_with_systemd_run_the_env_is_passed_as_setenv(self):
+    def test_with_systemd_run_the_action_follows_its_options(self):
         log = os.path.join(self.d, "argv")
         fake = os.path.join(self.d, "systemd-run")
         with open(fake, "w") as f:
             f.write('#!/bin/sh\nfor a; do echo "$a"; done > %s\n' % log)
         os.chmod(fake, 0o755)
-        code = ("import sys; sys.path.insert(0, %r); import opsbot; sys.exit(opsbot.helper(['t', 'run'], plugins_dir=%r, run=[%r, '--wait'], uid=%d, top=%r))"
-                % (os.path.join(HERE, ".."), self.plugins, fake, os.getuid(), self.d))
-        subprocess.run([sys.executable, "-I", "-c", code], check=True)
+        self.assertEqual(self.helper("t", "run", run=repr([fake, "--wait", "--"]))[0], 0)
         with open(log) as f:
-            self.assertEqual(f.read().splitlines(), ["--wait", "--setenv=GREETING=hi", "--", self.script, "run"])
+            self.assertEqual(f.read().splitlines(), ["--wait", "--", self.script, "run"])
 
 
 class RunnerTest(unittest.TestCase):
@@ -708,8 +712,6 @@ class RunnerTest(unittest.TestCase):
         os.chmod(helper, 0o755)
         rc, out = ob.CommandRunner([helper])("demo", "status", timeout=10)
         self.assertEqual((rc, out.strip()), (3, "args:2:demo:status"))
-        with self.assertRaises(ValueError):
-            ob.CommandRunner([helper])("demo", "rm -rf /")
         shutil.rmtree(d)
 
     def test_runner_timeout_is_reported(self):

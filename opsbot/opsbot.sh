@@ -1,20 +1,5 @@
 #!/usr/bin/env bash
-# opsbot.sh - a Telegram bot through which ONE person runs the fixed actions that services register as plugins, and
-# notifications that any root script or systemd unit can send. Independent of any service.
-# Usage: opsbot.sh {install|uninstall|status|check}
-#        opsbot.sh plugin {add FILE.json|remove NAME|list}
-#   install    the notification path (opsbot-notify, opsbot-notify-unit, opsbot-alert@.service) and, with a user id, the bot
-#              service. Reads OPSBOT_TOKEN (from @BotFather), OPSBOT_CHAT_ID (where notifications go; default: the user id)
-#              and OPSBOT_USER_ID (the ONE person the bot obeys; empty = notifications only) from the environment; a re-run
-#              keeps the stored values for those not given. Sends a test message when the token or chat changes.
-#   uninstall  remove it all, registered plugins included (the services that registered them stay)
-#   status     its checks and recent bot activity;  check: the OK/FAIL lines only (exit 1 on a FAIL)
-#   plugin add FILE.json   register a plugin (see README.md): checked, copied to /etc/opsbot/plugins.d, sudo rule regenerated,
-#              the bot reloads its commands. remove NAME: the reverse. list: what is registered.
-# Security: the bot runs as the unprivileged user opsbot and may run exactly one thing as root: /usr/local/sbin/opsbot-action
-# PLUGIN ACTION for the registered pairs (the sudo rule lists each). The helper checks the pair again against the root-owned
-# plugin file and that what it runs is root's alone. The token is in /etc/opsbot/token (600), handed to the bot as a systemd
-# credential and to curl on stdin, never on a command line.
+# opsbot.sh - install opsbot (a Telegram bot for one person, and notifications) and register plugins. See README.md.
 set -euo pipefail
 umask 022
 
@@ -45,20 +30,20 @@ die()  { printf '%s [%s] ERROR: %s\n' "$(date '+%F %T')" "$CMD" "$*" >&2; exit 1
 ok()   { printf '  OK    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
-# write_file FILE [MODE] < content: replaces FILE only if the content differs (then logs it).
+# write_file FILE [MODE] < content: replaces FILE only if the content differs (then logs it); fails if it cannot (also where
+# set -e is off: in a condition).
 write_file() {
   local f=$1 m=${2:-644} tmp
   tmp=$(mktemp)
   cat >"$tmp"
   if [[ -f $f ]] && cmp -s "$tmp" "$f"; then chmod "$m" "$f"; rm -f "$tmp"; return 0; fi
-  install -m "$m" "$tmp" "$f"
+  install -m "$m" "$tmp" "$f" || { rm -f "$tmp"; echo "could not write $f" >&2; return 1; }
   rm -f "$tmp"
   log "wrote $f"
 }
 
 # conf_get NAME: a value from the stored config (empty if none)
 conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -1; }
-stored_token() { cat "$TOKEN_FILE" 2>/dev/null || true; }
 
 # tg METHOD [curl args...]: call the Bot API with TOKEN (from the environment of the caller); the URL, which holds the token,
 # goes to curl on stdin
@@ -139,7 +124,7 @@ Wants=network-online.target
 [Service]
 User=$BOT_USER
 Group=$BOT_USER
-ExecStart=/usr/bin/python3 -I $PY bot --user-id $1 --state-dir /var/lib/opsbot --plugins $PLUGINS --action-cmd "sudo -n $HELPER"
+ExecStart=/usr/bin/python3 -I $PY bot --user-id $1 --state-dir /var/lib/opsbot
 ExecReload=/bin/kill -HUP \$MAINPID
 LoadCredential=token:$TOKEN_FILE
 StateDirectory=opsbot
@@ -152,16 +137,13 @@ WantedBy=multi-user.target
 EOF
 }
 
-# write_sudoers: the rule for every registered action (none: a comment only; a broken plugin is left out and named on stderr),
-# validated before it replaces the old one. Returns 1, changing nothing, if it cannot be made.
+# sudo_rule: the rule for every registered action (none: a comment only; a broken plugin is left out and named on stderr)
+sudo_rule() { py sudoers "$BOT_USER" "$HELPER" --plugins "$PLUGINS"; }
+# write_sudoers: install it once visudo accepts it; returns 1, changing nothing, if it cannot be made
 write_sudoers() {
-  local tmp rc=0
+  local tmp rc=1
   tmp=$(mktemp)
-  if ! py sudoers "$BOT_USER" "$HELPER" --plugins "$PLUGINS" >"$tmp"; then echo "could not make the sudo rule" >&2; rc=1
-  elif ! visudo -cf "$tmp" >/dev/null; then echo "the generated sudo rule is invalid" >&2; rc=1
-  elif ! cmp -s "$tmp" "$SUDOERS"; then # each step checked: callers run this in a condition, where set -e is off
-    if install -m 440 "$tmp" "$SUDOERS"; then log "wrote $SUDOERS"; else echo "could not write $SUDOERS" >&2; rc=1; fi
-  fi
+  sudo_rule >"$tmp" && visudo -cf "$tmp" >/dev/null && write_file "$SUDOERS" 440 <"$tmp" && rc=0
   rm -f "$tmp"
   return "$rc"
 }
@@ -173,7 +155,7 @@ reload() { if systemctl is-active --quiet opsbot.service; then systemctl reload 
 cmd_install() {
   local user chat token old_user old_chat old_token src_py h
   for c in python3 curl sudo visudo systemctl iconv; do command -v "$c" >/dev/null || die "$c is not installed"; done
-  old_user=$(conf_get USER_ID) old_chat=$(conf_get CHAT_ID) old_token=$(stored_token)
+  old_user=$(conf_get USER_ID) old_chat=$(conf_get CHAT_ID) old_token=$(cat "$TOKEN_FILE" 2>/dev/null || true)
   user=${OPSBOT_USER_ID-$old_user}
   chat=${OPSBOT_CHAT_ID:-${old_chat:-$user}}
   token=${OPSBOT_TOKEN:-$old_token}
@@ -213,8 +195,10 @@ cmd_install() {
   h=$(cat "$PY" "$UNIT" "$TOKEN_FILE" | sha256sum)
   systemctl daemon-reload
   systemctl enable opsbot.service >/dev/null 2>&1
-  if [[ $h != "$(cat "$STARTED_WITH" 2>/dev/null)" ]] || ! systemctl is-active --quiet opsbot.service; then systemctl restart opsbot.service; fi
-  sleep 3
+  if [[ $h != "$(cat "$STARTED_WITH" 2>/dev/null)" ]] || ! systemctl is-active --quiet opsbot.service; then
+    systemctl restart opsbot.service
+    sleep 3 # does it stay up?
+  fi
   systemctl is-active --quiet opsbot.service || die "the bot does not stay up (journalctl -u opsbot)"
   echo "$h" >"$STARTED_WITH"
   log "opsbot installed: notifications to chat $chat, commands from user $user (send /status to the bot). Plugins: $(plugin_names)"
@@ -256,7 +240,7 @@ cmd_plugin_add() {
   name=$(py validate "$f" --plugins "$PLUGINS" 2>&1) || die "plugin refused: ${name#opsbot: }"
   write_file "$PLUGINS/$name.json" 644 <"$f"
   if bot_on; then write_sudoers || die "the sudo rule was not updated (see above)"; reload; fi
-  log "plugin $name registered: $(py list --plugins "$PLUGINS" 2>/dev/null | sed -n "s/^$name: //p")"
+  log "plugin $name registered (plugins: $(plugin_names))"
 }
 
 cmd_plugin_remove() {
@@ -268,65 +252,43 @@ cmd_plugin_remove() {
   log "plugin $name removed"
 }
 
-cmd_plugin_list() {
-  installed || die "opsbot is not installed"
-  local out; out=$(py list --plugins "$PLUGINS") || true # a broken plugin is named on stderr
-  echo "${out:-no plugins registered}"
-}
+cmd_plugin_list() { installed || die "opsbot is not installed"; plugin_names; }
 
-# ---------------------------------------------------------------- checks
-checks() {
-  local out n user p a
+# ---------------------------------------------------------------- check
+# check: OK/FAIL lines; exit 1 on a FAIL
+cmd_check() {
+  local out n user
+  installed || { bad "opsbot is not installed"; return 1; }
   user=$(conf_get USER_ID)
-  # list exits 1 and names a broken plugin on stderr (the bot and the sudo rule leave it out)
-  if out=$(py list --plugins "$PLUGINS" 2>&1 >/dev/null); then ok "plugins: $(plugin_names)"
-  else bad "a plugin is broken and left out: ${out//opsbot: /}"; fi
-  # anyone who could change what root runs for the bot could run anything as root
-  if out=$(py root-only --plugins "$PLUGINS" "$PY" "$HELPER" "$NOTIFY" "$NOTIFY_UNIT" "$CONF" "$TOKEN_FILE" "$PLUGINS" 2>/dev/null)
-  then ok "what root runs for opsbot is root's alone"
-  else bad "a file root runs for opsbot is writable by others: $out"; fi
+  # anyone who could change what root runs for the bot could run anything as root; a broken plugin (left out by the bot and
+  # the sudo rule) fails this too
+  if out=$(py root-only --plugins "$PLUGINS" "$PY" "$HELPER" "$NOTIFY" "$NOTIFY_UNIT" "$CONF" "$TOKEN_FILE" "$PLUGINS" 2>&1)
+  then ok "plugins: $(plugin_names); what root runs for them and for opsbot is root's alone"
+  else bad "a plugin is broken or a file root runs is writable by others: ${out//opsbot: /}"; fi
   [[ $(stat -c %a "$TOKEN_FILE" 2>/dev/null) == 600 ]] && ok "token file is root-only" || bad "token file $TOKEN_FILE is not mode 600"
-  if [[ -z $user ]]; then ok "notifications only (no bot: OPSBOT_USER_ID not set)"; return; fi
+  if [[ -z $user ]]; then ok "notifications only (no bot: OPSBOT_USER_ID not set)"; ((FAILS == 0)); return; fi
   if systemctl is-active --quiet opsbot.service; then ok "bot running (commands from user $user only)"
   else bad "bot not running (journalctl -u opsbot)"; fi
-  n=0
-  while read -r p a; do
-    runuser -u "$BOT_USER" -- sudo -n -l "$HELPER" "$p" "$a" >/dev/null 2>&1 || { bad "bot may not run $p $a (sudo rule $SUDOERS)"; n=1; }
-  done < <(py actions --plugins "$PLUGINS" 2>/dev/null)
-  ((n)) || ok "bot may run every registered action"
+  if sudo_rule 2>/dev/null | cmp -s - "$SUDOERS"
+  then ok "the sudo rule lists exactly the registered actions"; else bad "the sudo rule is out of date ($0 install rewrites it)"; fi
   if runuser -u "$BOT_USER" -- sudo -n -l /bin/bash >/dev/null 2>&1 || runuser -u "$BOT_USER" -- sudo -n -l "$HELPER" x y >/dev/null 2>&1
   then bad "bot may run more than its actions as root (check $SUDOERS)"; else ok "bot may run nothing else as root"; fi
   n=$(journalctl -u opsbot.service --since -1h -q -o cat 2>/dev/null | grep -cE '^[0-9-]+ [0-9:]+ Telegram API:' || true)
   if ((n <= 5)); then ok "bot reaches Telegram ($n errors in the last hour)"; else bad "bot cannot reach Telegram reliably: $n errors in the last hour"; fi
-}
-
-cmd_check() {
-  installed || { bad "opsbot is not installed"; return 1; }
-  checks
   ((FAILS == 0))
 }
 
-cmd_status() {
-  installed || { echo "opsbot is not installed ($0 install)"; return 1; }
-  checks
-  if bot_on; then echo "recent activity:"; journalctl -u opsbot.service -q -o cat -n 8 --no-pager 2>/dev/null | sed 's/^/  /'; fi
-  ((FAILS == 0))
-}
-
-usage() { echo "usage: $0 {install|uninstall|status|check} | plugin {add FILE.json|remove NAME|list}" >&2; exit 2; }
+usage() { echo "usage: $0 {install|uninstall|check} | plugin {add FILE.json|remove NAME|list}" >&2; exit 2; }
 
 # sourced (tests): define the functions only
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case "$#:${1:-}:${2:-}" in
-    1:install: | 1:uninstall: | 1:status: | 1:check: | 2:plugin:list | 3:plugin:add | 3:plugin:remove) ;;
+    1:install: | 1:uninstall: | 1:check: | 2:plugin:list | 3:plugin:add | 3:plugin:remove) ;;
     *) usage ;;
   esac
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }
   CMD="opsbot $1${2:+ $2}"
-  case $1 in
-    check) cmd_check; exit ;;   # quiet, not logged: run by other services' checks
-    status) cmd_status; exit ;;
-  esac
+  [[ $1 != check ]] || { cmd_check; exit; } # not logged: other services' checks run it
   touch "$LOG"; chmod 600 "$LOG"
   case $1 in
     install) cmd_install ;;

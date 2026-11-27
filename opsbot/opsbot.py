@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
-"""opsbot: a Telegram bot through which ONE person runs the fixed actions that services register as plugins. Stdlib only.
+"""opsbot: a Telegram bot through which ONE person runs the actions services register as plugins. Stdlib only; see README.md.
 
-It long-polls the Bot API (no open port), accepts only private messages from --user-id, drops messages older than a minute,
-and maps each command to one fixed (plugin, action) pair; no text from Telegram ever reaches a shell. Actions run through
---action-cmd (installed as `sudo -n /usr/local/sbin/opsbot-action`, which the sudo rule allows for exactly the registered
-pairs, and which checks the pair again against the root-owned plugin files).
-
-A plugin is a JSON file in /etc/opsbot/plugins.d/NAME.json (see README.md):
-  {"name": "demo", "exec": ["/bin/bash", "/opt/demo/bot.sh"], "env": {"K": "V"}, "status": "status",
-   "commands": [{"command": "backup", "description": "Back up now", "action": "backup"},
-                {"command": "proxy", "description": "Proxy state; /proxy on|off", "args": {"": "p-status", "on": "p-on", "off": "p-off"}}],
-   "actions": {"status": {}, "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed"}, ...}}
-The action name is appended to "exec". An action with "started" runs in the background (one at a time per "lock", default the
-action itself); one without is quick: its output is the reply. "status" names a quick action whose output /status shows.
-
-Modes:
   opsbot.py bot --user-id ID --state-dir DIR [--plugins DIR] [--action-cmd CMD] [--token-file FILE] [--api-base URL]
-  opsbot.py action PLUGIN ACTION        as root (the sudo helper): run one registered action
-  opsbot.py validate FILE [--plugins DIR]   check a plugin file, and that its commands are not taken; prints its name
+  opsbot.py action PLUGIN ACTION                  as root (the sudo helper): run one registered action
+  opsbot.py validate FILE [--plugins DIR]         check a plugin file before it is registered; prints its name
   opsbot.py sudoers USER HELPER [--plugins DIR]   the sudo rule for every registered action
-  opsbot.py list | actions [--plugins DIR]   plugins and their commands | "PLUGIN ACTION" lines
-  opsbot.py root-only PATH... [--plugins DIR]   check the PATHs, the plugin files and what they run are root's alone
+  opsbot.py root-only PATH... [--plugins DIR]     check the PATHs, the plugin files and what they run are root's alone
 """
 import argparse
 import http.client
@@ -39,27 +24,27 @@ import time
 import urllib.error
 import urllib.request
 
+# module settings, which the tests change
 PLUGINS_DIR = "/etc/opsbot/plugins.d"
-# how the helper starts an action: as a transient unit of its own, so it gets a clean environment and working directory
-# (nothing of the bot user's reaches root), survives a restart of the bot, and is stopped after 6 hours
-RUN = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "-p", "RuntimeMaxSec=21600"]
+TRUSTED_UIDS = {0}        # who may own what root runs
+ACTION_TIMEOUT = 6 * 3600
+# the helper runs an action as a transient unit of its own: a clean environment and working directory (nothing of the bot
+# user's reaches root), it outlives a restart of the bot, and it is stopped after ACTION_TIMEOUT
+RUN = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "-p", "RuntimeMaxSec=%d" % ACTION_TIMEOUT, "--"]
 REBOOT_FLAG = "/var/run/reboot-required"
-MAX_TEXT = 4000      # Telegram allows 4096 characters
-MAX_AGE = 60         # seconds; older commands are not run (e.g. queued while the bot was down)
-NOTICE_EVERY = 3600  # at most one notice per stranger per hour
-QUICK_TIMEOUT = 120  # seconds for a quick action (no "started"): /status waits for them
-SLOW_TIMEOUT = 6 * 3600
+MAX_TEXT = 4000           # Telegram allows 4096 characters
+MAX_AGE = 60              # seconds; older commands are not run (e.g. queued while the bot was down)
+STATUS_TIMEOUT = 120      # seconds /status waits for each plugin's status action
 RELOAD = threading.Event()  # set by SIGHUP (opsbot.sh plugin add/remove): re-read the plugins and the menu
 
 # used with fullmatch (a ^...$ match would let a trailing newline through)
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")    # plugin and action names
 CMD_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")     # Telegram command names
 ARG_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
-ENV_RE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 RESERVED = {"start", "help", "status"}
-PLUGIN_KEYS = {"name", "exec", "env", "status", "commands", "actions"}
+PLUGIN_KEYS = {"name", "exec", "root_files", "commands", "actions"}
 COMMAND_KEYS = {"command", "description", "action", "args"}
-ACTION_KEYS = {"started", "ok", "fail", "lock"}
+ACTION_KEYS = {"started", "ok", "fail"}
 
 
 # ---------------------------------------------------------------- plugins
@@ -68,11 +53,11 @@ class PluginError(ValueError):
 
 
 def _line(v):
-    return isinstance(v, str) and v.strip() != "" and "\0" not in v
+    return isinstance(v, str) and v.strip() != "" and "\0" not in v and "\n" not in v
 
 
 def check_plugin(doc, name=None):
-    """Validate one plugin document (name: the file's, which it must match); returns it. Raises PluginError."""
+    """Validate one plugin document (NAME: the file's, which it must match); returns it. Raises PluginError."""
     def need(cond, msg):
         if not cond:
             raise PluginError(msg)
@@ -82,26 +67,20 @@ def check_plugin(doc, name=None):
     need(isinstance(n, str) and NAME_RE.fullmatch(n), "name: lowercase letters, digits and dashes, starting with a letter")
     need(name is None or n == name, "name %r does not match the file name %s.json" % (n, name))
     ex = doc.get("exec")
-    need(isinstance(ex, list) and ex and all(_line(x) and "\n" not in x for x in ex), "exec: a list of one-line strings")
+    need(isinstance(ex, list) and ex and all(_line(x) for x in ex), "exec: a list of one-line strings")
     need(ex[0].startswith("/"), "exec: the program must be an absolute path")
     # systemd-run would expand ${VAR}; a path with ".." resolves differently through a symlink than it reads: what runs must be
     # exactly what was checked
     need(not any("$" in x for x in ex), "exec: no $ (it would be expanded)")
-    need(all(os.path.normpath(x) == x for x in ex if x.startswith("/")), "exec: paths without .., // or a trailing /")
-    env = doc.get("env", {})
-    need(isinstance(env, dict) and all(ENV_RE.fullmatch(k) and isinstance(v, str) and "\n" not in v and "\0" not in v
-                                       for k, v in env.items()), "env: NAMES (A-Z, 0-9, _) to one-line strings")
+    rf = doc.get("root_files", [])
+    need(isinstance(rf, list) and all(_line(x) and x.startswith("/") for x in rf), "root_files: a list of absolute paths")
+    need(all(os.path.normpath(x) == x for x in ex + rf if x.startswith("/")), "paths without .., // or a trailing /")
     actions = doc.get("actions")
     need(isinstance(actions, dict) and actions, "actions: a non-empty object")
     for a, spec in actions.items():
         need(NAME_RE.fullmatch(a), "action %r: lowercase letters, digits and dashes" % a)
         need(isinstance(spec, dict) and not set(spec) - ACTION_KEYS, "action %s: only %s" % (a, ", ".join(sorted(ACTION_KEYS))))
-        need(all(_line(v) for v in spec.values()), "action %s: its texts must not be empty" % a)
-        need("started" in spec or "lock" not in spec, "action %s: lock needs started" % a)
-        need("lock" not in spec or NAME_RE.fullmatch(spec["lock"]), "action %s: lock: lowercase letters, digits and dashes" % a)
-    st = doc.get("status")
-    need(st is None or (isinstance(st, str) and st in actions and "started" not in actions[st]),
-         "status: the name of a quick action (one without started)")
+        need(all(_line(v) for v in spec.values()), "action %s: its texts must be one non-empty line" % a)
     cmds = doc.get("commands", [])
     need(isinstance(cmds, list), "commands: a list")
     seen = set()
@@ -112,21 +91,20 @@ def check_plugin(doc, name=None):
         need(cn not in RESERVED, "/%s is the bot's own command" % cn)
         need(cn not in seen, "/%s is listed twice" % cn)
         seen.add(cn)
-        need(_line(c.get("description")) and len(c["description"]) <= 256 and "\n" not in c["description"],
-             "/%s: description: one line, at most 256 characters" % cn)
+        need(_line(c.get("description")) and len(c["description"]) <= 256, "/%s: description: one line, at most 256 characters" % cn)
         need(("action" in c) != ("args" in c), "/%s: needs either action or args" % cn)
-        args = {"": c["action"]} if "action" in c else c["args"]
+        args = command_args(c)
         need(isinstance(args, dict) and args, "/%s: args: an object of argument -> action" % cn)
         for k, v in args.items():
             need(k == "" or ARG_RE.fullmatch(k), "/%s: argument %r: lowercase letters, digits, _ and -" % (cn, k))
             need(isinstance(v, str) and v in actions, "/%s %s: %r is not one of its actions" % (cn, k, v))
-    need(cmds or st, "a plugin needs commands or a status action")
+    need(cmds or "status" in actions, "a plugin needs commands or a status action")
     return doc
 
 
 def command_args(c):
     """A command's argument -> action map ("" = no argument)."""
-    return {"": c["action"]} if "action" in c else dict(c["args"])
+    return {"": c["action"]} if "action" in c else c["args"]
 
 
 def read_plugin(path):
@@ -134,35 +112,33 @@ def read_plugin(path):
         return check_plugin(json.load(f), os.path.basename(path)[:-5])
 
 
-def load_registry(d, log=None, skip=None):
-    """The plugins in D (NAME.json, by name; not SKIP). With LOG, a broken file or a taken command is logged and skipped (the
-    bot keeps serving the rest); without, it raises PluginError."""
+def load_registry(d, log, extra=None):
+    """The plugins in D (NAME.json, by name), then the file EXTRA in place of the registered one of its name. A broken file or
+    a command an earlier plugin has is LOGged ("skipped plugin NAME.json: why") and left out: the others keep working."""
     plugins, owner = [], {}
     try:
-        names = sorted(f for f in os.listdir(d) if f.endswith(".json") and not (skip and f == skip + ".json"))
+        names = sorted(f for f in os.listdir(d) if f.endswith(".json") and not (extra and f == os.path.basename(extra)))
     except FileNotFoundError:
         names = []
-    for fn in names:
+    for path in [os.path.join(d, f) for f in names] + ([extra] if extra else []):
+        fn = os.path.basename(path)
         try:
-            p = read_plugin(os.path.join(d, fn))
+            p = read_plugin(path)
             for c in p.get("commands", []):
                 if c["command"] in owner:
                     raise PluginError("/%s is already %s's" % (c["command"], owner[c["command"]]))
         except (OSError, ValueError) as e:  # PluginError and JSON errors are ValueErrors
-            if log is None:
-                raise PluginError("%s: %s" % (fn, e)) from None
             log("skipped plugin %s: %s" % (fn, e))
             continue
-        for c in p.get("commands", []):
-            owner[c["command"]] = p["name"]
+        owner.update((c["command"], p["name"]) for c in p.get("commands", []))
         plugins.append(p)
     return plugins
 
 
-def root_only(path, uid=0, top="/"):
-    """Raise PluginError unless only UID (root) can change what PATH runs: every component of the path as written (symlinks
-    included, not followed) and of where it leads is owned by UID and not group/world-writable. A sticky directory above it,
-    like /tmp, is fine: others cannot replace root's entries in it. Tests stop at TOP, their temp dir."""
+def root_only(path):
+    """Raise PluginError unless only root can change what PATH runs: every component of the path as written (symlinks
+    included, not followed) and of where it leads is owned by a TRUSTED_UID and not group/world-writable. A sticky directory
+    above it, like /tmp, is fine: others cannot replace root's entries in it."""
     for p in (path, os.path.realpath(path)):
         d = p
         while True:
@@ -170,52 +146,47 @@ def root_only(path, uid=0, top="/"):
                 st = os.lstat(d)
             except FileNotFoundError:
                 raise PluginError("not found: %s" % d) from None
-            if st.st_uid != uid:
+            if st.st_uid not in TRUSTED_UIDS:
                 raise PluginError("not owned by root: %s" % d)
             if (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022  # a link's own mode means nothing
                     and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX and d != p)):
                 raise PluginError("group/world-writable: %s" % d)
-            if d in ("/", top):
+            if d == "/":
                 break
             d = os.path.dirname(d)
 
 
-def exec_paths(p):
-    """The absolute paths in a plugin's exec: the program and its script. Each must exist and be root's alone."""
-    return [x for x in p["exec"] if x.startswith("/")]
+def check_root_paths(p):
+    """Raise PluginError unless what plugin P runs as root is root's alone: the absolute paths in its exec (which must exist)
+    and its root_files, the files its program sources or runs (one that is missing, such as a deleted secrets file, is fine
+    when its folder is root's alone: nobody else can create it)."""
+    for x in p["exec"]:
+        if x.startswith("/"):
+            root_only(x)
+    for x in p.get("root_files", []):
+        root_only(x if os.path.lexists(x) else os.path.dirname(x))
 
 
 # ---------------------------------------------------------------- the root helper
-def helper(argv, plugins_dir=PLUGINS_DIR, run=None, uid=0, top="/", out=sys.stderr):
+def helper(argv):
     """`opsbot-action PLUGIN ACTION`, as root: check the pair against the root-owned plugin file again (the sudo rule already
-    allows only registered pairs), check that what it runs is root's alone (so nobody else can change it after the check),
-    then run it, exactly as written, as a transient unit."""
-    run = RUN if run is None else run
+    allows only registered pairs) and that what it runs is root's alone (so nobody else can change it after the check), then
+    run it, exactly as written, as a transient unit."""
     if len(argv) != 2 or not all(NAME_RE.fullmatch(a) for a in argv):
-        out.write("usage: opsbot-action PLUGIN ACTION\n")
+        sys.stderr.write("usage: opsbot-action PLUGIN ACTION\n")
         return 2
-    path = os.path.join(plugins_dir, argv[0] + ".json")
-    if not os.path.isfile(path):
-        out.write("unknown plugin\n")
-        return 2
+    path = os.path.join(PLUGINS_DIR, argv[0] + ".json")
     try:
-        root_only(path, uid, top)
+        root_only(path)
         p = read_plugin(path)
         if argv[1] not in p["actions"]:
-            out.write("unknown action\n")
+            sys.stderr.write("unknown action\n")
             return 2
-        for x in exec_paths(p):
-            root_only(x, uid, top)
+        check_root_paths(p)
     except (OSError, ValueError) as e:
-        out.write("refused: %s\n" % e)
+        sys.stderr.write("refused: %s\n" % e)
         return 1
-    prog = p["exec"] + [argv[1]]
-    env = p.get("env", {})
-    if run:
-        cmd = list(run) + ["--setenv=%s=%s" % kv for kv in sorted(env.items())] + ["--"] + prog
-    else:  # tests: no systemd-run
-        os.environ.update(env)
-        cmd = prog
+    cmd = RUN + p["exec"] + [argv[1]]
     os.chdir("/")
     os.execvp(cmd[0], cmd)
 
@@ -253,9 +224,7 @@ class CommandRunner:
     def __init__(self, prefix):
         self.prefix = list(prefix)
 
-    def __call__(self, plugin, action, timeout=SLOW_TIMEOUT):
-        if not (NAME_RE.fullmatch(plugin) and NAME_RE.fullmatch(action)):
-            raise ValueError("bad plugin or action name")
+    def __call__(self, plugin, action, timeout=ACTION_TIMEOUT):
         try:
             p = subprocess.run(self.prefix + [plugin, action], capture_output=True, text=True, timeout=timeout,
                                stdin=subprocess.DEVNULL)
@@ -292,7 +261,7 @@ def human(n):
             return ("%.1f%s" % (n, unit)) if n < 10 else ("%d%s" % (round(n), unit))
 
 
-def system_line(reboot_flag=REBOOT_FLAG):
+def system_line():
     """🖥 Disk 26% used (17G free) · RAM 1408 MB free · up 12 min[ · reboot pending]; what cannot be read is left out."""
     parts = []
     try:
@@ -304,25 +273,22 @@ def system_line(reboot_flag=REBOOT_FLAG):
             parts.append("up " + dur(float(f.read().split()[0])))
     except (OSError, StopIteration, ValueError, IndexError):
         pass
-    if os.path.exists(reboot_flag):
+    if os.path.exists(REBOOT_FLAG):
         parts.append("reboot pending")
     return "🖥 " + " · ".join(parts)
 
 
 # ---------------------------------------------------------------- the bot
 class Bot:
-    def __init__(self, api, user_id, runner, state_dir, plugins_dir=PLUGINS_DIR, log=sys.stdout, max_age=MAX_AGE,
-                 reboot_flag=REBOOT_FLAG):
-        self.api, self.user_id, self.runner, self.max_age, self._log = api, int(user_id), runner, max_age, log
-        self.plugins_dir, self.reboot_flag = plugins_dir, reboot_flag
+    def __init__(self, api, user_id, runner, state_dir, log=sys.stdout):
+        self.api, self.user_id, self.runner, self._log = api, int(user_id), runner, log
         self.offset_file = os.path.join(state_dir, "offset")
         try:
             with open(self.offset_file) as f:
                 self.offset = int(f.read().strip())
         except (OSError, ValueError):
             self.offset = 0
-        self._locks, self._locks_guard = {}, threading.Lock()
-        self.noticed = {}
+        self.busy = set()  # the commands running now: each runs one at a time
         self.load_plugins()
 
     # ---- plumbing
@@ -330,9 +296,9 @@ class Bot:
         self._log.write("%s %s\n" % (time.strftime("%F %T"), msg))
         self._log.flush()
 
-    def send(self, text, chat=None):
+    def send(self, text):
         try:
-            self.api.call("sendMessage", chat_id=chat or self.user_id, text=fit(text), disable_web_page_preview=True)
+            self.api.call("sendMessage", chat_id=self.user_id, text=fit(text), disable_web_page_preview=True)
         except ApiError as e:
             self.log("could not send a reply: %s" % e)
 
@@ -342,17 +308,16 @@ class Bot:
             f.write(str(self.offset))
         os.replace(tmp, self.offset_file)
 
-    def lock(self, key):
-        with self._locks_guard:
-            return self._locks.setdefault(key, threading.Lock())
-
     def load_plugins(self):
-        self.plugins = load_registry(self.plugins_dir, self.log)
-        self.commands = {c["command"]: (p, c) for p in self.plugins for c in p.get("commands", [])}
+        self.plugins = load_registry(PLUGINS_DIR, self.log)
+        # /status is the bot's own: each plugin's status action, then the system line
+        self.commands = {"status": (None, {"description": "Quick overview", "action": "status"})}
+        self.commands.update((c["command"], (p, c)) for p in self.plugins for c in p.get("commands", []))
+        self.menu_due = True  # the command menu follows (setMyCommands, retried each poll until it works)
         self.log("plugins: %s" % (", ".join(p["name"] for p in self.plugins) or "none"))
 
     def menu(self):
-        return [("status", "Quick overview")] + [(n, c["description"]) for n, (_, c) in self.commands.items()]
+        return [(n, c["description"]) for n, (_, c) in self.commands.items()]
 
     def help_text(self):
         return "Available actions:\n" + "\n".join("/%s – %s" % (n, d) for n, d in self.menu())
@@ -360,11 +325,13 @@ class Bot:
     def register_commands(self):
         self.api.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in self.menu()],
                       scope={"type": "chat", "chat_id": self.user_id})
+        self.menu_due = False
 
     def run_once(self):
         if RELOAD.is_set():
             RELOAD.clear()
             self.load_plugins()
+        if self.menu_due:
             try:
                 self.register_commands()
             except ApiError as e:
@@ -385,143 +352,83 @@ class Bot:
             try:
                 self.run_once()
                 delay = 1
-            except ApiError as e:
-                self.log("Telegram API: %s (retrying in %d s)" % (e, delay))
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
             except Exception as e:  # noqa: BLE001 - never exit: a restart would lose replies of running actions
-                self.log("unexpected %s (retrying in %d s)" % (type(e).__name__, delay))
+                what = "Telegram API: %s" % e if isinstance(e, ApiError) else "unexpected " + type(e).__name__
+                self.log("%s (retrying in %d s)" % (what, delay))
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
 
     # ---- one update
     def handle(self, u):
-        m = u.get("message")
-        if not m:
-            self.log("ignored update %s (not a new message)" % u.get("update_id"))
-            return
+        m = u.get("message") or {}
         sender, chat = m.get("from") or {}, m.get("chat") or {}
         text = (m.get("text") or "").strip()
-        who = "id %s%s" % (sender.get("id"), " (@%s)" % sender["username"] if sender.get("username") else "")
         if (sender.get("is_bot") or sender.get("id") != self.user_id or chat.get("id") != self.user_id
                 or chat.get("type") != "private"):
-            self.log("ignored message from %s in %s chat %s: %r" % (who, chat.get("type"), chat.get("id"), text[:40]))
-            self.notice(sender, text)
+            self.log("ignored update %s from id %s in %s chat %s: %r" % (
+                u.get("update_id"), sender.get("id"), chat.get("type"), chat.get("id"), text[:40]))
             return
         age = time.time() - int(m.get("date") or 0)
-        if age > self.max_age:
+        if age > MAX_AGE:
             self.log("ignored %r: too old (%d s)" % (text[:40], age))
-            self.send("⏰ Skipped %s: it was sent %d s ago, while offline. Send again."
-                      % (text[:40] or "your message", age))
+            self.send("⏰ Skipped %s: it was sent %d s ago, while offline. Send again." % (text[:40] or "your message", age))
             return
         self.command(text)
-
-    def notice(self, sender, text):
-        sid = sender.get("id")
-        if sid is None or sid == self.user_id or sender.get("is_bot"):
-            return
-        now = time.time()
-        if now - self.noticed.get(sid, 0) < NOTICE_EVERY:
-            return
-        self.noticed[sid] = now
-        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-        self.send("🚫 Someone else wrote, ignored: %s%s (id %s): %r" % (
-            name or "no name", " @%s" % sender["username"] if sender.get("username") else "", sid, text[:60]))
 
     def command(self, text):
         words = text.split()
         if not words or not words[0].startswith("/"):
             self.send(self.help_text())
             return
-        cmd, args = words[0][1:].split("@", 1)[0].lower(), [a.lower() for a in words[1:]]
-        if cmd == "status":
-            if args:
-                self.send("/status takes nothing after it. Just send /status.")
-                return
-            self.log("accepted /status")
-            self._background(lambda: self.send(self.status()))
-            return
+        cmd, key = words[0][1:].split("@", 1)[0].lower(), " ".join(words[1:]).lower()  # an argument never holds a space
         if cmd not in self.commands:  # also /start and /help
             self.send(self.help_text())
             return
         plugin, spec = self.commands[cmd]
         amap = command_args(spec)
-        key = "" if not args else (args[0] if len(args) == 1 else None)
         if key not in amap:
-            if list(amap) == [""]:
-                self.send("/%s takes nothing after it. Just send /%s." % (cmd, cmd))
-            else:
-                self.send("Send " + ", ".join("/%s%s" % (cmd, " " + k if k else "") for k in amap) + ".")
+            self.send("Send " + ", ".join("/%s%s" % (cmd, " " + k if k else "") for k in amap) + ".")
             return
-        action = amap[key]
-        a = plugin["actions"][action]
-        self.log("accepted /%s%s (%s %s)" % (cmd, " " + key if key else "", plugin["name"], action))
-        if "started" not in a:
-            self._background(lambda: self._run_quick(plugin["name"], action, a, cmd))
-            return
-        lock = self.lock("%s:%s" % (plugin["name"], a.get("lock", action)))
-        if not lock.acquire(blocking=False):
+        self.log("accepted /%s%s" % (cmd, " " + key if key else ""))
+        if cmd in self.busy:
             self.send("⏳ /%s is already running." % cmd)
             return
-        self.send(a["started"])
-        self._background(lambda: self._run_async(plugin["name"], action, a, cmd, lock))
+        self.busy.add(cmd)
+        if plugin is None:
+            work = self.status
+        else:
+            a = plugin["actions"][amap[key]]
+            self.send(a.get("started", "⏳ /%s..." % cmd))
+            work = lambda: self._result(plugin["name"], amap[key], a, cmd)  # noqa: E731
+        threading.Thread(target=self._run, args=(cmd, work), daemon=True).start()
 
-    @staticmethod
-    def _background(fn):
-        threading.Thread(target=fn, daemon=True).start()
-
-    def _run_quick(self, plugin, action, a, cmd):
-        rc, out = self.runner(plugin, action, timeout=QUICK_TIMEOUT)
-        title = a.get("ok") if rc == 0 else a.get("fail", "❌ /%s failed" % cmd)
-        self.send("%s\n%s" % (title, out) if title and out else (title or out))
-
-    def _run_async(self, plugin, action, a, cmd, lock):
+    def _run(self, cmd, work):
         try:
-            rc, out = self.runner(plugin, action)
-            title = a.get("ok", "✅ /%s done" % cmd) if rc == 0 else a.get("fail", "❌ /%s failed" % cmd)
-            self.send("%s\n%s" % (title, out) if out else title)
-            self.log("%s %s finished, exit %d" % (plugin, action, rc))
+            self.send(work())
         finally:
-            lock.release()
+            self.busy.discard(cmd)
+
+    def _result(self, plugin, action, a, cmd):
+        rc, out = self.runner(plugin, action)
+        self.log("%s %s finished, exit %d" % (plugin, action, rc))
+        title = a.get("ok", "✅ /%s done" % cmd) if rc == 0 else a.get("fail", "❌ /%s failed" % cmd)
+        return "%s\n%s" % (title, out) if out else title
 
     def status(self):
-        """Each plugin's status lines (in plugin order), then the system line."""
+        """Each plugin's status action's output (in plugin order), then the system line."""
         lines = []
         for p in self.plugins:
-            if not p.get("status"):
+            if "status" not in p["actions"]:
                 continue
-            rc, out = self.runner(p["name"], p["status"], timeout=QUICK_TIMEOUT)
-            if rc == 0:
-                lines.append(out)
-            else:
-                lines.append("❌ %s: no status (%s)" % (p["name"], (out.splitlines() or ["no output"])[-1][:200]))
-        lines.append(system_line(self.reboot_flag))
+            rc, out = self.runner(p["name"], "status", timeout=STATUS_TIMEOUT)
+            lines.append(out if rc == 0 else "❌ %s: no status (%s)" % (p["name"], (out.splitlines() or ["no output"])[-1][:200]))
+        lines.append(system_line())
         return "\n".join(x for x in lines if x)
 
 
 # ---------------------------------------------------------------- command line
-def main_bot(a):
-    if a.user_id <= 0:
-        sys.exit("--user-id must be a person's id (a positive number)")
-    with open(a.token_file) as f:
-        token = f.read().strip()
-    bot = Bot(TelegramAPI(a.api_base, token, a.poll_timeout), a.user_id, CommandRunner(shlex.split(a.action_cmd)),
-              a.state_dir, plugins_dir=a.plugins)
-    bot.log("opsbot started for user %d" % a.user_id)
-
-    def register():  # in the background: the bot must answer at once, whatever setMyCommands does
-        for i in range(10):
-            try:
-                bot.register_commands()
-                return
-            except ApiError as e:
-                bot.log("could not register the command menu: %s" % e)
-                time.sleep(min(2 ** i, 60))
-    threading.Thread(target=register, daemon=True).start()
-    bot.serve_forever()
-
-
 def main(argv=None):
+    global PLUGINS_DIR  # --plugins sets it for the bot
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["action"]:  # the root helper: no argparse (its messages), exact arguments only
         sys.exit(helper(argv[1:]))
@@ -542,35 +449,36 @@ def main(argv=None):
     s = sub.add_parser("sudoers", parents=[reg])
     s.add_argument("user")
     s.add_argument("helper")
-    for name in ("list", "actions"):
-        sub.add_parser(name, parents=[reg])
     sub.add_parser("root-only", parents=[reg]).add_argument("paths", nargs="*")
     a = p.parse_args(argv)
     if a.mode == "bot":
-        return main_bot(a)
+        if a.user_id <= 0:
+            sys.exit("--user-id must be a person's id (a positive number)")
+        with open(a.token_file) as f:
+            token = f.read().strip()
+        PLUGINS_DIR = a.plugins
+        bot = Bot(TelegramAPI(a.api_base, token, a.poll_timeout), a.user_id, CommandRunner(shlex.split(a.action_cmd)),
+                  a.state_dir)
+        bot.log("opsbot started for user %d" % a.user_id)
+        bot.serve_forever()
     skipped = []
+    if a.mode == "validate":  # as root, before a plugin is registered: loaded last, in place of the registered one
+        name = os.path.basename(a.file)[:-5] if a.file.endswith(".json") else None
+        plugins = load_registry(a.plugins, skipped.append, extra=a.file) if name else []
+        new = next((x for x in plugins if x["name"] == name), None)
+        try:
+            if not new:  # its reason is the last one logged (other broken plugins are left out quietly: check reports them)
+                raise PluginError(skipped[-1].split(": ", 1)[1] if name and skipped else "the file name must be NAME.json")
+            check_root_paths(new)
+        except (OSError, ValueError) as e:
+            print("opsbot: %s" % e, file=sys.stderr)
+            return 1
+        print(name)
+        return 0
 
     def warn(msg):
         skipped.append(msg)
         print("opsbot: %s" % msg, file=sys.stderr)
-    if a.mode == "validate":  # as root, before a plugin is registered: also that what it runs is root's alone
-        try:
-            if not a.file.endswith(".json"):
-                raise PluginError("the file name must be NAME.json")
-            new = read_plugin(a.file)
-            # other broken plugins are left out quietly (its output is the name; check reports them)
-            taken = {c["command"]: x["name"] for x in load_registry(a.plugins, lambda m: None, skip=new["name"])
-                     for c in x.get("commands", [])}
-            for c in new.get("commands", []):
-                if c["command"] in taken:
-                    raise PluginError("/%s is already %s's" % (c["command"], taken[c["command"]]))
-            for path in exec_paths(new):
-                root_only(path)
-        except (OSError, ValueError) as e:
-            print("opsbot: %s" % e, file=sys.stderr)
-            return 1
-        print(new["name"])
-        return 0
     plugins = load_registry(a.plugins, warn)
     if a.mode == "sudoers":
         rules = ["%s %s %s" % (a.helper, x["name"], act) for x in plugins for act in x["actions"]]
@@ -578,27 +486,18 @@ def main(argv=None):
         if rules:
             print("%s ALL=(root) NOPASSWD: %s" % (a.user, ", ".join(rules)))
         return 0
-    if a.mode == "actions":
-        for x in plugins:
-            for act in x["actions"]:
-                print(x["name"], act)
-    elif a.mode == "root-only":  # as root: what root runs for the bot, the registered plugin files and what they run
-        paths = a.paths + [os.path.join(a.plugins, x["name"] + ".json") for x in plugins]
-        paths += [path for x in plugins for path in exec_paths(x)]
-        bad = []
-        for path in paths:
-            try:
-                root_only(path)
-            except (OSError, ValueError) as e:
-                bad.append(str(e))
-        if bad:
-            print("; ".join(sorted(set(bad))))
-            return 1
-    else:
-        for x in plugins:
-            cmds = " ".join("/" + c["command"] for c in x.get("commands", []))
-            print("%s: %s%s" % (x["name"], cmds, " (+ /status)" if x.get("status") else ""))
-    return 1 if skipped else 0  # list, actions: a broken plugin shows in the exit status (check reports it)
+    # root-only, as root: what root runs for the bot, the registered plugin files and what they run (a broken plugin is
+    # named on stderr and fails it too)
+    bad = []
+    for check, arg in ([(root_only, x) for x in a.paths + [os.path.join(a.plugins, x["name"] + ".json") for x in plugins]]
+                       + [(check_root_paths, x) for x in plugins]):
+        try:
+            check(arg)
+        except (OSError, ValueError) as e:
+            bad.append(str(e))
+    if bad:
+        print("; ".join(sorted(set(bad))))
+    return 1 if bad or skipped else 0
 
 
 if __name__ == "__main__":

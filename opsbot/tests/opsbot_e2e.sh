@@ -45,7 +45,7 @@ esac
 X
 chmod 755 "$E2E/plugin.sh"
 cat >"$E2E/e2e.json" <<X
-{"name": "e2e", "exec": ["/bin/sh", "$E2E/plugin.sh"], "env": {"E2E_GREETING": "hello"}, "status": "status",
+{"name": "e2e", "exec": ["/usr/bin/env", "E2E_GREETING=hello", "/bin/sh", "$E2E/plugin.sh"],
  "commands": [{"command": "e2e_who", "description": "who runs it", "action": "who"},
               {"command": "e2e_slow", "description": "slow", "action": "slow"},
               {"command": "e2e_fail", "description": "fails", "action": "fail"},
@@ -59,7 +59,7 @@ cat >"$E2E/e2e-two.json" <<X
 {"name": "e2e-two", "exec": ["/bin/sh", "$E2E/plugin.sh"], "commands": [{"command": "e2e_two", "description": "two", "action": "two"}],
  "actions": {"two": {}}}
 X
-run "$CLI" plugin add "$E2E/e2e.json"; check "plugin add succeeds" '[[ $RC -eq 0 ]] && grep -q "plugin e2e registered: /e2e_who /e2e_slow /e2e_fail /e2e_long (+ /status)" "$T/out"' "$(cat "$T/out")"
+run "$CLI" plugin add "$E2E/e2e.json"; check "plugin add succeeds" '[[ $RC -eq 0 ]] && grep -q "plugin e2e registered" "$T/out"' "$(cat "$T/out")"
 check "the sudo rule lists its actions" 'grep -q "/usr/local/sbin/opsbot-action e2e slow" /etc/sudoers.d/opsbot'
 cp "$E2E/plugin.sh" "$E2E/bad.sh"; chmod 777 "$E2E/bad.sh"; sed "s|plugin.sh|bad.sh|; s|\"e2e\"|\"e2e-bad\"|; s|e2e_|bad_|g" "$E2E/e2e.json" >"$E2E/e2e-bad.json"
 run "$CLI" plugin add "$E2E/e2e-bad.json"; check "a plugin whose script others can write is refused" '[[ $RC -ne 0 && ! -e /etc/opsbot/plugins.d/e2e-bad.json ]]' "$(cat "$T/out")"
@@ -87,7 +87,7 @@ rm -f /var/lib/opsbot/{json,re,os,signal,argparse}.py /tmp/opsbot-e2e-pwned
 chmod 666 /etc/opsbot/plugins.d/e2e.json
 out=$(runuser -u opsbot -- sudo -n "$HELPER" e2e status 2>&1 </dev/null); RC=$?
 check "a plugin file someone could change is refused by the helper" '[[ $RC -ne 0 && $out == *"refused: group/world-writable"* ]]' "$out"
-run "$CLI" check; check "... and opsbot check reports it" '[[ $RC -ne 0 ]] && grep -q "FAIL  a file root runs for opsbot is writable by others" "$T/out"' "$(cat "$T/out")"
+run "$CLI" check; check "... and opsbot check reports it" '[[ $RC -ne 0 ]] && grep -q "FAIL  a plugin is broken or a file root runs is writable by others: group/world-writable: /etc/opsbot/plugins.d/e2e.json" "$T/out"' "$(cat "$T/out")"
 chmod 644 /etc/opsbot/plugins.d/e2e.json
 chmod 777 "$E2E/plugin.sh"
 out=$(runuser -u opsbot -- sudo -n "$HELPER" e2e status 2>&1 </dev/null); RC=$?
@@ -125,29 +125,29 @@ check "its command menu has the plugin's commands" '[[ $(menu) == *"\"status\""*
 
 ask "/status"; check "/status: the plugin's status line (with its env), then the system line" \
   '[[ $(reply) == *"🧪 e2e plugin is up (env hello)"* && $(reply | tail -1) == "🖥 Disk "*" used ("*"MB free · up "* ]]' "$(reply)"
-ask "/e2e_who"; check "a quick action replies with its title and output, run as root from /" '[[ $(reply) == "$(printf "👤 who\nuser=root cwd=/ leak=none")" ]]' "$(reply)"
+ask "/e2e_who" 2; check "an action replies with its title and output, run as root from /" '[[ $(reply) == "$(printf "👤 who\nuser=root cwd=/ leak=none")" ]]' "$(reply)"
 ask "/e2e_slow"; check "a long action says it started" '[[ $(reply) == "⏳ slow..." ]]' "$(reply)"
 ask "/e2e_slow"; check "... a second one while it runs is refused" '[[ $(reply) == "⏳ /e2e_slow is already running." ]]' "$(reply)"
 ask "/status"; check "... the bot keeps answering meanwhile" '[[ $(reply) == *"e2e plugin is up"* ]]' "$(reply)"
 for ((i = 0; i < 50; i++)); do [[ $(last) == "✅ slow done"* ]] && break; sleep 0.2; done
 check "... then its result" '[[ $(last) == "$(printf "✅ slow done\nslow done")" ]]' "$(last)"
 ask "/e2e_fail" 2; check "a failing action: its fail title and output, no exit code" '[[ $(reply) == "$(printf "❌ it failed\nERROR: it broke")" ]]' "$(reply)"
-ask "/e2e_slow now"; check "arguments a command does not take are refused" '[[ $(reply) == "/e2e_slow takes nothing after it. Just send /e2e_slow." ]]' "$(reply)"
+ask "/e2e_slow now"; check "arguments a command does not take are refused" '[[ $(reply) == "Send /e2e_slow." ]]' "$(reply)"
 ask "/e2e_who; reboot"; check "an injection attempt is just an unknown command" '[[ $(reply) == "Available actions:"* ]]' "$(reply)"
 
 echo "== plugins coming and going while it runs"
 run "$CLI" plugin add "$E2E/e2e-two.json"; check "a second plugin is registered" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
 systemctl kill -s HUP opsbot-e2e.service   # what `systemctl reload opsbot` does to the real bot
 ask "/status"  # the reload happens at the next poll
-ask "/e2e_two"; check "after a reload its command works" '[[ $(reply) == "two here" ]]' "$(reply)"
+ask "/e2e_two" 2; check "after a reload its command works" '[[ $(reply) == "$(printf "✅ /e2e_two done\ntwo here")" ]]' "$(reply)"
 check "... and is in the menu" '[[ $(menu) == *"\"e2e_two\""* ]]' "$(menu)"
 run "$CLI" plugin remove e2e-two; systemctl kill -s HUP opsbot-e2e.service; ask "/status"
 ask "/e2e_two"; check "removed and reloaded: the command is gone" '[[ $(reply) == "Available actions:"* && $(menu) != *"e2e_two"* ]]' "$(reply)"
 as_bot sudo -n -l "$HELPER" e2e-two two; RC=$?; check "... and so is its sudo rule" '[[ $RC -ne 0 ]]'
 
 echo "== other people and other chats"
-ask "/e2e_who" 1 10 "$STRANGER"; check "a stranger is ignored and the owner told" '[[ $(reply) == "🚫 Someone else wrote, ignored:"*"(id $STRANGER)"* ]]' "$(reply)"
-check "the stranger gets no answer at all" '[[ $(to_others) == 0 ]]'
+n0=$(nsent); say "{\"text\": \"/e2e_who\", \"from\": $STRANGER}"; ask "/status"
+check "a stranger is ignored: nothing runs, nothing is sent to anyone" '[[ $(nsent) == $((n0 + 1)) && $(to_others) == 0 && $(reply) == *"e2e plugin is up"* ]]' "$(reply)"
 n0=$(nsent); say "{\"text\": \"/e2e_who\", \"from\": $OWNER, \"chat\": -100555, \"type\": \"group\"}"; ask "/status"
 check "the owner's command in a group is ignored" '[[ $(nsent) == $((n0 + 1)) && $(reply) == *"e2e plugin is up"* ]]' "$(reply)"
 n0=$(nsent); say "{\"text\": \"/e2e_who\", \"from\": $OWNER, \"age\": 300}"

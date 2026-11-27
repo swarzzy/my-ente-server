@@ -35,7 +35,7 @@ false; RC=$?; check "a failing command is seen as failing (harness self-test)" '
 
 echo "== install"
 run $BOTSH install; check "install succeeds" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
-check "Ente is registered with opsbot" '[[ -f $PLUGIN ]] && /usr/local/sbin/opsbot plugin list | grep -q "^ente: /check /backup /proxy /size (+ /status)$"'
+check "Ente is registered with opsbot" '[[ -f $PLUGIN ]] && /usr/local/sbin/opsbot plugin list | grep -qw ente'
 check "the bot service runs as opsbot" '[[ $(ps -o user= -p "$(systemctl show -p MainPID --value opsbot.service)") == opsbot ]]'
 check "no bot from before opsbot is left" '! systemctl cat ente-tg-bot.service >/dev/null 2>&1 && ! id ente-tg-bot >/dev/null 2>&1'
 h0=$(sha256sum "$PLUGIN" /etc/sudoers.d/opsbot /etc/systemd/system/opsbot.service); pid0=$(systemctl show -p MainPID --value opsbot.service)
@@ -77,7 +77,7 @@ ask "/status"; check "/status: Ente's lines (services, backup, checks, buckets, 
   '[[ $(reply | head -1) == "✅ Ente is up (museum, web, postgres)" && $(reply) == *"💾 Backup: last good "*" ago · next "* && $(reply) == *" Check: "* && $(reply) == *"🪣 Buckets: "* && $(reply | tail -1) == "🖥 Disk "* && $(reply | wc -l) -le 6 ]]' "$(reply)"
 ask "/check" 2 180; check "/check: the check passed, problems listed, the rest counted" \
   '[[ $(reply | head -1) == "✅ Check passed" && $(reply | tail -1) =~ ^[0-9]+\ checks\ OK$ && $(reply) != *"  OK  "* ]]' "$(reply)"
-ask "/check@some_bot now"; check "arguments are refused" '[[ $(reply) == "/check takes nothing after it. Just send /check." ]]' "$(reply)"
+ask "/check@some_bot now"; check "arguments are refused" '[[ $(reply) == "Send /check." ]]' "$(reply)"
 ask "/proxy on; reboot"; check "injection attempt is refused" '[[ $(reply) == "Send /proxy, /proxy on, /proxy off." ]]' "$(reply)"
 check "and nothing else happened (proxy unchanged)" '[[ $(cat /var/lib/ente-setup/s3-proxy 2>/dev/null || echo off) == "$PROXY_WAS" ]]'
 
@@ -103,9 +103,9 @@ check "a real backup ran" '[[ $(systemctl show -p ExecMainStartTimestampMonotoni
 
 echo "== other people"
 t0=$(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service)
-ask "/backup" 1 20 "$STRANGER"
-check "a stranger's /backup runs nothing" '[[ $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" ]]'
-check "the owner is told about it, the stranger gets no answer" '[[ $(reply) == "🚫 Someone else wrote, ignored:"*"(id $STRANGER)"* && $(to_others) == 0 ]]' "$(reply)"
+n0=$(nsent); say "{\"text\": \"/backup\", \"from\": $STRANGER}"; ask "/status" 1 30
+check "a stranger's /backup runs nothing and gets no answer" \
+  '[[ $(systemctl show -p ExecMainStartTimestampMonotonic --value ente-backup.service) == "$t0" && $(nsent) == $((n0 + 1)) && $(to_others) == 0 ]]' "$(reply)"
 systemctl stop opsbot-e2e.service
 check "the token never appears in the bot's log" '! journalctl -u opsbot-e2e.service -u opsbot.service -q -o cat --no-pager | grep -qF "${token#*:}"'
 

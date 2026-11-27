@@ -113,8 +113,8 @@ All three are optional and installed separately; each has `install`, `uninstall`
 | --- | --- | --- |
 | `opsbot.sh install` | Notifications (`opsbot-notify`, `opsbot-notify-unit`, `opsbot-alert@.service`) to `OPSBOT_CHAT_ID`, and with `OPSBOT_USER_ID` the bot service as the unprivileged user `opsbot`. Token in `/etc/opsbot/token` (600), a test message when token or chat change; re-runs keep stored values. | Bad token, ids or an unsendable test message stop it before anything is written; re-run changes nothing; emptying the user id removes the bot only. |
 | `opsbot.sh plugin add/remove` | Validates a plugin file (names, commands not taken, files it runs root's alone), copies it to `/etc/opsbot/plugins.d`, regenerates the sudo rule (exactly the registered plugin-action pairs), reloads the bot. | Conflicts, broken files and writable scripts refused; the rule follows the registry. |
-| The bot (`opsbot.py bot`) | Long-polls; only the owner's private messages; commands older than a minute skipped; strangers noticed at most hourly. Commands come from the plugins: quick actions reply with their output, long ones say they started, then the result, one at a time per lock. `/status`: each plugin's status, then a disk/RAM/uptime line. SIGHUP reloads the plugins and menu. | Every reply kind; injection refused; locks; a broken plugin skipped; reload; the token never logged. |
-| The root helper (`opsbot-action PLUGIN ACTION`) | Re-reads the root-owned plugin file, refuses unknown pairs and files others could change, runs the action as a transient unit from `/` with a clean environment. | Refusals; planted Python modules not loaded; an action outlives the bot. |
+| The bot (`opsbot.py bot`) | Long-polls; only the owner's private messages (anything else ignored and logged); commands older than a minute skipped. Commands come from the plugins: each says it started, then its result; one command runs one at a time. `/status`: each plugin's `status` action, then a disk/RAM/uptime line. SIGHUP reloads the plugins and menu. | Every reply kind; injection refused; one at a time; a broken plugin skipped; reload; the token never logged. |
+| The root helper (`opsbot-action PLUGIN ACTION`) | Re-reads the root-owned plugin file, refuses unknown pairs and files others could change (its `exec` and `root_files`, symlinks included), runs the action as a transient unit from `/` with a clean environment. | Refusals; planted Python modules not loaded; an action outlives the bot. |
 
 ## Tests
 
@@ -126,19 +126,19 @@ All suites live in `ente-server/tests/` and `opsbot/tests/` and must pass on the
 | `test_check.sh` | anywhere (stubs) | every non-backup part of `check` | 39 |
 | `test_backup_checks.sh` | server (rclone) | backup never deletes, `verify` faults, growth line and bucket measurement, `size`, backup part of `check`, the backup following a bucket switch | 44 |
 | `test_bucket_copies.sh` | server (rclone) | the real backup script, config copies, restore from each bucket, interrupted restores, backup key rotation, timer units | 63 |
-| `test_alerts.sh` | anywhere (fake Telegram) | alerts through opsbot: install, test message, the older alerts moved, every alert's text, alerts off, news unit; the token on no command line | 26 |
+| `test_alerts.sh` | anywhere (fake Telegram) | alerts through opsbot: install, test message, the older alerts moved, every alert's text, alerts off, news unit; the token on no command line | 24 |
 | `test_update.sh` | anywhere (stubs) | `update` failures, rollback point, re-pinning; `pg-update`, `rclone-update`, `news` | 46 |
 | `test_lockdown.sh` | anywhere (stubs) | `lockdown` | 16 |
 | `test_quickstart.sh` | anywhere with network | `install`'s edits against Ente's current quickstart | 17 |
 | `test_proxy_config.sh` | anywhere; Caddy-validated on the server | proxy config, Caddyfile hooks, rollback | 70 |
-| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, token sources, the plugin file and its sudo rule, install/uninstall and the move from the older bot (incl. falling back to it), every reply (stubbed server) | 73 |
+| `test_tg_bot_config.sh` | anywhere; visudo on the server | bot config, token sources, the plugin file and its sudo rule, install/uninstall and the move from the older bot (incl. falling back to it), every reply (stubbed server) | 66 |
 | `test_vpn_config.sh` | server, after VPN install | VPN key and obfuscation config | 13 |
 | `python3 -m unittest discover -s tests` | anywhere | link rewriter | 23 |
 | `proxy_e2e.sh` | server | the proxy end to end, real signed links | 42 |
-| `tg_bot_e2e.sh` | server | Ente's plugin through the real opsbot; runs a real backup | 38 |
+| `tg_bot_e2e.sh` | server | Ente's plugin through the real opsbot; runs a real backup | 37 |
 | `opsbot/tests`: unittest | anywhere | the bot against a fake Telegram, plugin checks, helper (incl. symlinks), sudo rule | 47 |
 | `opsbot/tests/test_opsbot_cli.sh` | anywhere | install (incl. restarts on a new token), plugins (incl. broken ones), checks, notification scripts, command line | 80 |
-| `opsbot/tests/opsbot_e2e.sh` | server, opsbot with a bot | a test plugin through the real sudo rule and helper, a second bot against a fake Telegram | 50 |
+| `opsbot/tests/opsbot_e2e.sh` | server, opsbot with a bot | a test plugin through the real sudo rule and helper, a second bot against a fake Telegram | 49 |
 | `proxy_browser_e2e.sh` | server | the web app in Chromium: sign-up, uploads incl. multipart, viewing, proxy on and off | 17 |
 
 Still manual:

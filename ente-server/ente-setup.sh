@@ -1064,18 +1064,32 @@ EOF
 # setup_alerts: with TG_CHAT_ID set, Telegram alerts through opsbot (../opsbot, installed or updated here with the token and
 # chat from this config): ente-alert@.service runs ente-alert-unit (the title and the lines that say why, for Ente's units),
 # ente-check.timer runs the daily `check` at 09:00 and ente-news.timer the monthly news, each alerting when it fails. Sets
-# ALERT_ONFAIL for ente-backup.service. Each run sends a test message, so a wrong token or chat id stops it here, not on the
-# day a backup fails. Without TG_CHAT_ID Ente's alert units are removed (opsbot stays: other services may use it).
+# ALERT_ONFAIL for ente-backup.service. opsbot's install checks the token on each run and sends a test message when the token or
+# chat changes, so a wrong one stops it here, not on the day a backup fails. Without TG_CHAT_ID Ente's alert units are removed
+# (opsbot stays: other services may use it).
 ALERT_ONFAIL=
 OPSBOT_SH=${OPSBOT_SH:-$SCRIPT_DIR/../opsbot/opsbot.sh}
-OPSBOT_NOTIFY=${OPSBOT_NOTIFY:-/usr/local/bin/opsbot-notify}
 OPSBOT_NOTIFY_UNIT=${OPSBOT_NOTIFY_UNIT:-/usr/local/bin/opsbot-notify-unit}
 OPSBOT_TOKEN_FILE=${OPSBOT_TOKEN_FILE:-/etc/opsbot/token}
-# the alerts before opsbot: their token file (read once more, then removed) and sender
+# the alerts before opsbot: their token file (read once more, then removed) and sender; the bot before opsbot's token
 ALERT_LEGACY=(/etc/ente-alert.env /usr/local/bin/ente-alert)
+LEGACY_BOT_TOKEN=/etc/ente-tg-bot/token
 # the files setup_alerts installs, removed again when TG_CHAT_ID is emptied
 ALERT_FILES=(/etc/systemd/system/ente-check.timer /etc/systemd/system/ente-check.service /etc/systemd/system/ente-alert@.service
   /usr/local/bin/ente-alert-unit /etc/systemd/system/ente-news.timer /etc/systemd/system/ente-news.service "${ALERT_LEGACY[@]}")
+# opsbot_install [USER_ID]: install or update opsbot (../opsbot) with this config's token and alert chat (an empty chat keeps
+# opsbot's own), with USER_ID also its bot (without, the bot is left as it is). The token: the secrets file, else what the setup
+# before opsbot stored; none: opsbot keeps the one it has. Plain assignments, not `env`: the token must not be on a command line.
+opsbot_install() {
+  local token=$TG_BOT_TOKEN
+  [[ -n $token || ! -f ${ALERT_LEGACY[0]} ]] || token=$(. "${ALERT_LEGACY[0]}"; echo "${TG_BOT_TOKEN:-}")
+  [[ -n $token || ! -f $LEGACY_BOT_TOKEN ]] || token=$(cat "$LEGACY_BOT_TOKEN")
+  [[ -n $token || -f $OPSBOT_TOKEN_FILE ]] || need_secret TG_BOT_TOKEN
+  [[ -f $OPSBOT_SH ]] || die "opsbot is missing: $OPSBOT_SH (copy the repository's opsbot folder next to ente-server)"
+  if (($#)); then OPSBOT_USER_ID=$1 OPSBOT_TOKEN=$token OPSBOT_CHAT_ID=$TG_CHAT_ID bash "$OPSBOT_SH" install
+  else ( unset OPSBOT_USER_ID; OPSBOT_TOKEN=$token OPSBOT_CHAT_ID=$TG_CHAT_ID bash "$OPSBOT_SH" install ); fi
+}
+
 setup_alerts() {
   local f ce
   if [[ -z $TG_CHAT_ID ]]; then
@@ -1089,17 +1103,8 @@ setup_alerts() {
     done
     return 0
   fi
-  # the token: the secrets file, else what opsbot (or the alerts before it) stored
-  if [[ -z $TG_BOT_TOKEN && -f ${ALERT_LEGACY[0]} ]]; then TG_BOT_TOKEN=$(. "${ALERT_LEGACY[0]}"; echo "$TG_BOT_TOKEN"); fi
-  [[ -n $TG_BOT_TOKEN || -f $OPSBOT_TOKEN_FILE ]] || need_secret TG_BOT_TOKEN
-  [[ -f $OPSBOT_SH ]] || die "opsbot is missing: $OPSBOT_SH (copy the repository's opsbot folder next to ente-server)"
   ce=$(config_env)
-  # OPSBOT_USER_ID unset: opsbot keeps its bot as it is (ente-tg-bot.sh install sets it up). Plain assignments, not `env`:
-  # the token must not be on a command line.
-  ( unset OPSBOT_USER_ID; OPSBOT_TOKEN=$TG_BOT_TOKEN OPSBOT_CHAT_ID=$TG_CHAT_ID bash "$OPSBOT_SH" install ) ||
-    die "opsbot install failed (see above): alerts are not set up"
-  "$OPSBOT_NOTIFY" "🔔 Ente alerts on $(hostname) ($DOMAIN) are set up. Alerts arrive here when a backup or the daily check fails." </dev/null ||
-    die "could not send to TG_CHAT_ID: wrong chat id, or nobody pressed Start in the bot / the bot is not in the group"
+  opsbot_install || die "opsbot install failed (see above): alerts are not set up"
   if [[ -e ${ALERT_LEGACY[0]} || -e ${ALERT_LEGACY[1]} ]]; then rm -f "${ALERT_LEGACY[@]}"; log "removed the alerts from before opsbot"; fi
   write_file /usr/local/bin/ente-alert-unit 755 <<EOF
 #!/usr/bin/env bash
@@ -1172,7 +1177,7 @@ EOF
   systemctl daemon-reload
   systemctl enable --now ente-check.timer ente-news.timer >/dev/null 2>&1
   ALERT_ONFAIL='OnFailure=ente-alert@%n.service'
-  log "telegram alerts on through opsbot (failed backup, daily check at 09:00, newer Ente builds on the 2nd), test message sent. The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
+  log "telegram alerts on through opsbot (failed backup, daily check at 09:00, newer Ente builds on the 2nd). The check runs $SCRIPT_DIR/ente-ops.sh: keep the folder there"
 }
 
 # backup-setup: rclone remotes, refuse a foreign backup, install the timer and start a first backup.

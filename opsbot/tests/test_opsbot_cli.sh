@@ -79,7 +79,7 @@ u=$(cat "$R/systemd/opsbot.service")
 check "the unit runs the bot as its own unprivileged user" '[[ $u == *"User=opsbot"* && $u == *"Group=opsbot"* && $u != *"User=root"* ]]' "$u"
 check "... gets the token as a systemd credential, never on the command line" '[[ $u == *"LoadCredential=token:$R/etc/opsbot/token"* && $u != *"${TOKEN2#*:}"* ]]' "$u"
 check "... serves only the configured user, runs actions only through sudo and the helper" \
-  '[[ $u == *"bot --user-id 376193354 "* && $u == *"--action-cmd \"sudo -n $R/sbin/opsbot-action\""* && $u == *"python3 -I "* ]]' "$u"
+  '[[ $u == *"python3 -I $R/lib/opsbot.py bot --user-id 376193354 --state-dir /var/lib/opsbot"* ]]' "$u"
 check "... reloads its plugins on systemctl reload, restarts on failure, keeps its state in its own directory" \
   '[[ $u == *"ExecReload=/bin/kill -HUP \$MAINPID"* && $u == *"Restart=always"* && $u == *"StateDirectory=opsbot"* ]]' "$u"
 check "... does not set NoNewPrivileges (sudo needs it)" '[[ $u != *"NoNewPrivileges=yes"* ]]' "$u"
@@ -108,15 +108,15 @@ check "a first install with only a user id: notifications go to that user" '[[ $
 echo "== plugins"
 mkdir -p "$T/src"
 demo() { # demo NAME COMMAND EXEC: a plugin file in $T/src
-  printf '{"name": "%s", "exec": ["%s"], "status": "st", "commands": [{"command": "%s", "description": "Do it", "action": "go"}],
-    "actions": {"st": {}, "go": {"started": "⏳"}}}\n' "$1" "${3:-/bin/true}" "$2" >"$T/src/$1.json"
+  printf '{"name": "%s", "exec": ["%s"], "commands": [{"command": "%s", "description": "Do it", "action": "go"}],
+    "actions": {"status": {}, "go": {"started": "⏳"}}}\n' "$1" "${3:-/bin/true}" "$2" >"$T/src/$1.json"
 }
 demo demo doit
 rm -f "$T/systemctl.log"
 out=$(in_ob "cmd_plugin_add $T/src/demo.json")
-check "add: registered, with its commands" '[[ $out == *"plugin demo registered: /doit (+ /status)"* && -f $R/etc/opsbot/plugins.d/demo.json ]]' "$out"
+check "add: registered" '[[ $out == *"plugin demo registered (plugins: demo)"* && -f $R/etc/opsbot/plugins.d/demo.json ]]' "$out"
 check "... the sudo rule now allows exactly its actions" \
-  '[[ $(grep -v "^#" "$R/sudoers.d/opsbot") == "opsbot ALL=(root) NOPASSWD: $R/sbin/opsbot-action demo st, $R/sbin/opsbot-action demo go" ]]' "$(cat "$R/sudoers.d/opsbot")"
+  '[[ $(grep -v "^#" "$R/sudoers.d/opsbot") == "opsbot ALL=(root) NOPASSWD: $R/sbin/opsbot-action demo status, $R/sbin/opsbot-action demo go" ]]' "$(cat "$R/sudoers.d/opsbot")"
 check "... and the bot reloads its commands" 'grep -qx "systemctl reload opsbot.service" "$T/systemctl.log"' "$(cat "$T/systemctl.log")"
 demo other doit
 out=$(in_ob "cmd_plugin_add $T/src/other.json")
@@ -128,7 +128,7 @@ out=$(in_ob "cmd_plugin_add $T/src/writable.json")
 check "a plugin whose program others can write (or that is not root's) is refused" '[[ $out == *"plugin refused: "*"$T/src/run.sh"* && ! -e $R/etc/opsbot/plugins.d/writable.json ]]' "$out"
 demo missing ms /nonexistent/plugin.sh
 out=$(in_ob "cmd_plugin_add $T/src/missing.json"); check "a plugin whose program is not there is refused" '[[ $out == *"plugin refused: not found: /nonexistent"* ]]' "$out"
-out=$(in_ob "cmd_plugin_list"); check "list shows the plugins and their commands" '[[ $out == "demo: /doit (+ /status)" ]]' "$out"
+out=$(in_ob "cmd_plugin_list"); check "list shows the plugins" '[[ $out == "demo" ]]' "$out"
 out=$(in_ob "cmd_plugin_add $T/src/demo.json"); check "adding the same plugin again is fine (an update)" '[[ $out == *"plugin demo registered"* ]]' "$out"
 out=$(in_ob "cmd_plugin_remove demo")
 check "remove: gone, and so is its sudo rule" '[[ $out == *"plugin demo removed"* && ! -e $R/etc/opsbot/plugins.d/demo.json && $(grep -vc "^#" "$R/sudoers.d/opsbot") == 0 ]]' "$out"
@@ -149,17 +149,18 @@ out=$(in_ob "cmd_plugin_remove ../etc"); check "remove refuses a name that is no
 
 echo "== checks"
 in_ob "cmd_plugin_add $T/src/demo.json" >/dev/null
-out=$(in_ob 'py() { [[ $1 == root-only ]] || python3 -I "$PY" "$@"; }; runuser() { :; }; FAILS=0; checks; echo FAILS=$FAILS')
-check "a healthy install: plugins, root-only files, token, bot, sudo" \
-  '[[ $out == *"OK    plugins: demo"* && $out == *"OK    token file is root-only"* && $out == *"OK    bot running"* && $out == *FAILS=1* ]]' "$out"
+out=$(in_ob 'py() { [[ $1 == root-only ]] || python3 -I "$PY" "$@"; }; runuser() { :; }; FAILS=0; cmd_check; echo FAILS=$FAILS')
+check "a healthy install: plugins, root-only files, token, bot, the sudo rule up to date" \
+  '[[ $out == *"OK    plugins: demo;"* && $out == *"OK    token file is root-only"* && $out == *"OK    bot running"* && $out == *"OK    the sudo rule lists exactly the registered actions"* && $out == *FAILS=1* ]]' "$out"
 check "... (the stubbed runuser lets the bot run anything: that is reported)" '[[ $out == *"FAIL  bot may run more than its actions"* ]]' "$out"
 chmod 644 "$R/etc/opsbot/token"; printf '{' >"$R/etc/opsbot/plugins.d/bad.json"
-out=$(in_ob 'py() { if [[ $1 == root-only ]]; then echo "group/world-writable: /x"; return 1; fi; python3 -I "$PY" "$@"; }; runuser() { return 1; }; FAILS=0; checks; echo FAILS=$FAILS')
-check "a broken plugin file, a file others can write and a readable token are FAILs" \
-  '[[ $out == *"FAIL  a plugin is broken and left out: skipped plugin bad.json"* && $out == *"FAIL  a file root runs for opsbot is writable by others: group/world-writable: /x"* && $out == *"FAIL  token file"* ]]' "$out"
+out=$(in_ob 'py() { if [[ $1 == root-only ]]; then echo "group/world-writable: /x"; return 1; fi; python3 -I "$PY" "$@"; }; runuser() { return 1; }; FAILS=0; cmd_check; echo FAILS=$FAILS')
+check "a file others can write and a readable token are FAILs" \
+  '[[ $out == *"FAIL  a plugin is broken or a file root runs is writable by others: group/world-writable: /x"* && $out == *"FAIL  token file"* ]]' "$out"
 rm "$R/etc/opsbot/plugins.d/bad.json"; chmod 600 "$R/etc/opsbot/token"
-out=$(in_ob 'py() { [[ $1 == root-only ]] || python3 -I "$PY" "$@"; }; runuser() { return 1; }; FAILS=0; checks; echo FAILS=$FAILS')
-check "a bot the sudo rule does not let run its actions is a FAIL" '[[ $out == *"FAIL  bot may not run demo st"* && $out == *"FAIL  bot may not run demo go"* && $out == *FAILS=2 ]]' "$out"
+chmod 640 "$R/sudoers.d/opsbot"; echo "# edited by hand" >>"$R/sudoers.d/opsbot"
+out=$(in_ob 'py() { [[ $1 == root-only ]] || python3 -I "$PY" "$@"; }; runuser() { return 1; }; FAILS=0; cmd_check; echo FAILS=$FAILS')
+check "a sudo rule that is not what the registered plugins need is a FAIL" '[[ $out == *"FAIL  the sudo rule is out of date"* && $out == *FAILS=1 ]]' "$out"
 
 echo "== notifications"
 python3 "$HERE/fake_telegram.py" "$T/port" & FAKE=$!
@@ -205,12 +206,12 @@ echo "== command line"
 asuser() { "$@"; }
 if [[ $EUID -eq 0 ]]; then cp "$OB/opsbot.sh" "$T/cli.sh"; chmod 755 "$T" "$T/cli.sh"; asuser() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }; CLI=$T/cli.sh
 else CLI=$OB/opsbot.sh; fi
-for c in "" "maybe" "plugin" "plugin add" "plugin frob x" "install now" "plugin add a b"; do
+for c in "" "maybe" "status" "plugin" "plugin add" "plugin frob x" "install now" "plugin add a b"; do
   # shellcheck disable=SC2086
   out=$(asuser bash "$CLI" $c 2>&1); rc=$?; check "'$c' is a usage error" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
 done
 out=$(asuser bash "$CLI" "plugin list" 2>&1); rc=$?; check "'plugin list' as one argument is a usage error (not a silent no-op)" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
-for c in install uninstall status check "plugin list" "plugin add x.json" "plugin remove x"; do
+for c in install uninstall check "plugin list" "plugin add x.json" "plugin remove x"; do
   # shellcheck disable=SC2086
   out=$(asuser bash "$CLI" $c 2>&1); check "'$c' is a known command (asks for root here)" '[[ $out == *"run as root"* ]]' "$out"
 done

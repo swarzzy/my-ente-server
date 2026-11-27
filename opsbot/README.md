@@ -25,8 +25,8 @@ Needs: Debian with systemd, bash, python3 (stdlib only), sudo, curl. No open por
    - A re-run keeps the stored values for those not given; `OPSBOT_USER_ID=` (empty) removes the bot, notifications stay.
    - It checks the token and, when the token or chat changes, sends a test message (and stops if that fails).
 
-`sudo opsbot status` shows its checks and recent activity; `opsbot check` only the OK/FAIL lines (for other services' checks).
-`sudo opsbot uninstall` removes everything, registered plugins included.
+`sudo opsbot check` runs its checks (OK/FAIL lines; other services' checks include it). `sudo opsbot uninstall` removes
+everything, registered plugins included.
 
 ## Notifications
 
@@ -40,15 +40,14 @@ Needs: Debian with systemd, bash, python3 (stdlib only), sudo, curl. No open por
 ## Plugins
 
 A plugin is a JSON file. `sudo opsbot plugin add NAME.json` checks it, copies it to `/etc/opsbot/plugins.d/`, regenerates the
-sudo rule and makes the bot reload its commands (within a minute). `plugin remove NAME` undoes it; `plugin list` shows them. A plugin file that is broken (say, edited by hand) is left out
-by the bot and the sudo rule, so the others keep working, and `opsbot check` reports it.
+sudo rule and makes the bot reload its commands (within a minute). `plugin remove NAME` undoes it; `plugin list` names them. A
+broken plugin file (say, edited by hand) is left out by the bot and the sudo rule, so the others keep working; `check` reports it.
 
 ```json
 {
   "name": "demo",
-  "exec": ["/bin/bash", "/opt/demo/bot-actions.sh"],
-  "env": {"DEMO_CONFIG": "/etc/demo.conf"},
-  "status": "status",
+  "exec": ["/usr/bin/env", "DEMO_CONFIG=/etc/demo.conf", "/bin/bash", "/opt/demo/bot-actions.sh"],
+  "root_files": ["/opt/demo/lib.sh", "/etc/demo.conf"],
   "commands": [
     {"command": "backup", "description": "Back up now", "action": "backup"},
     {"command": "proxy", "description": "Proxy: state, /proxy on, /proxy off",
@@ -58,32 +57,33 @@ by the bot and the sudo rule, so the others keep working, and `opsbot check` rep
     "status": {},
     "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed"},
     "proxy-status": {"ok": "🔀 Proxy"},
-    "proxy-on": {"started": "⏳ Turning it on...", "ok": "✅ Proxy is on", "lock": "proxy"},
-    "proxy-off": {"started": "⏳ Turning it off...", "ok": "✅ Proxy is off", "lock": "proxy"}
+    "proxy-on": {"ok": "✅ Proxy is on"},
+    "proxy-off": {"ok": "✅ Proxy is off"}
   }
 }
 ```
 
 - `name`: the file name (`demo.json`); lowercase letters, digits and dashes.
-- `exec`: what runs, as root, exactly as written; the action name is appended (`/bin/bash /opt/demo/bot-actions.sh backup`).
-  The program is an absolute path; no `$` and no `..` anywhere. Every absolute path in it must exist and be root's alone: the
-  file, every folder above it and every symlink on the way (and where they lead) owned by root and not writable by others, so
-  nobody else can change what runs. `plugin add` refuses otherwise, and the helper checks again on every run. Its output is
-  the reply.
-- `env`: variables the action gets (nothing else of the bot's reaches it).
-- `actions`: each action's texts. With `started` it runs in the background: the bot replies at once, then `ok` or `fail`
-  (defaults: "✅ /cmd done", "❌ /cmd failed") with its output. Only one at a time per `lock` (default: the action itself). Without `started` it is quick (at most 2 minutes): the reply is its output, after `ok`/`fail`
-  if given. Every action runs in the background: a slow one never holds up the bot.
+- `exec`: what runs, as root, exactly as written, from `/` with a clean environment (pass variables with `/usr/bin/env` as
+  above); the action name is appended. The program is an absolute path; no `$` and no `..` anywhere. Every absolute path in it
+  must exist and be root's alone: the file, every folder above it and every symlink on the way (and where they lead) owned by
+  root and not writable by others, so nobody else can change what runs. `plugin add` refuses otherwise, and the helper checks
+  again before every action.
+- `root_files` (optional): the other files the program sources or runs as root, checked the same way before every action.
+  One that is missing (say, a secrets file deleted after setup) is fine if its folder is root's alone: nobody else can create it.
+- `actions`: what each action says. A command's action runs in the background: the bot replies `started` at once (default
+  "⏳ /cmd..."), then `ok` or `fail` (defaults "✅ /cmd done", "❌ /cmd failed") with its output. One command runs one at a
+  time (whatever its argument). The action named `status`, if any, is the plugin's part of `/status`: its output, each
+  plugin's in turn (at most 2 minutes each), then a system line ("🖥 Disk 26% used (17G free) · RAM 1408 MB free · up 5 days
+  · reboot pending").
 - `commands`: the Telegram commands (lowercase letters, digits, `_`), each with a `description` (the menu) and either one
   `action` or `args` (argument → action, `""` for none). Anything else after a command is refused, with what to send instead.
   `/status`, `/start` and `/help` are the bot's own; two plugins cannot have the same command.
-- `status`: a quick action whose output `/status` shows. `/status` is each plugin's status, then a system line
-  ("🖥 Disk 26% used (17G free) · RAM 1408 MB free · up 5 days · reboot pending").
 
 ## Security
 
-- The bot runs as its own unprivileged user `opsbot`, acts only on private messages from the one user id (others are ignored;
-  you get a notice at most once an hour per sender), does not run commands older than a minute (sent while it was down), and
+- The bot runs as its own unprivileged user `opsbot`, acts only on private messages from the one user id (anything
+  else is ignored and logged, never answered), does not run commands older than a minute (sent while it was down), and
   maps each command to a fixed plugin action: no text from Telegram reaches a shell.
 - As root it may run exactly `/usr/local/sbin/opsbot-action PLUGIN ACTION` for the registered pairs (`/etc/sudoers.d/opsbot`
   lists each). The helper reads the root-owned plugin file again, refuses a pair it does not list or files others could

@@ -32,7 +32,7 @@ run_setup() {
     set +e
     load_env
     OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_NOTIFY_UNIT=$T/bin/notify-unit OPSBOT_TOKEN_FILE=$T/none
-    ALERT_LEGACY=("$T/legacy.env" "$T/legacy-alert")
+    ALERT_LEGACY=("$T/legacy.env" "$T/legacy-alert") LEGACY_BOT_TOKEN=$T/none
     write_file() { local f=$T/root$1; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "${2:-644}" "$f"; }
     systemctl() { :; }
     PATH=$T/bin:$PATH SCRIPT_DIR=/opt/ente-server setup_alerts; echo "onfail=[$ALERT_ONFAIL]" ) >"$T/out" 2>&1
@@ -44,14 +44,9 @@ check "opsbot is installed with the token and chat of this config, and its bot l
   '[[ $(cat "$T/opsbot.log") == "$(printf "args=install\ntoken=%s\nchat=%s\nuser=unset" "$TOKEN" "$CHAT")" ]]' "$(cat "$T/opsbot.log")"
 check "... the token is on no command line (not passed through env)" \
   '! grep -qF -- "${TOKEN#*:}" "$T/env.log" 2>/dev/null && ! sed -n "/^setup_alerts()/,/^}/p" "$HERE/../ente-setup.sh" | grep -qE "env [^#]*OPSBOT_TOKEN"' "$(cat "$T/env.log" 2>/dev/null)"
-NOTIFY_FAILS=1 run_setup
-check "a test message that cannot be sent stops it, before anything is installed" \
-  'grep -q "could not send to TG_CHAT_ID" "$T/out" && [[ ! -e $T/root ]]' "$(tail -3 "$T/out")"
-rm -f "$T/notify.log"
 echo old >"$T/legacy.env"; echo old >"$T/legacy-alert"
 run_setup
 R=$T/root
-check "it sends a test message through opsbot" '[[ $(cat "$T/notify.log") == "🔔 Ente alerts on "*"(photos.example.org) are set up."* ]]' "$(cat "$T/notify.log" 2>/dev/null)"
 check "the token is in none of Ente's files (opsbot keeps it)" '! grep -rqF -- "${TOKEN#*:}" "$R"' "$(grep -rlF -- "${TOKEN#*:}" "$R")"
 check "the alerts from before opsbot are removed" '[[ ! -e $T/legacy.env && ! -e $T/legacy-alert ]] && grep -q "removed the alerts from before opsbot" "$T/out"'
 check "the backup unit gets OnFailure=ente-alert@" 'grep -qx "onfail=\[OnFailure=ente-alert@%n.service\]" "$T/out"' "$(tail -2 "$T/out")"
@@ -69,11 +64,11 @@ check "ente-alert@ runs ente-alert-unit, which hands over to opsbot-notify-unit"
   "$(tail -2 "$R/usr/local/bin/ente-alert-unit")"
 rm -f "$T/opsbot.log"
 out=$( ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; set +e; load_env
-  OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_TOKEN_FILE=$T/none ALERT_LEGACY=("$T/x" "$T/y"); setup_alerts ) 2>&1 )
+  OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_TOKEN_FILE=$T/none ALERT_LEGACY=("$T/x" "$T/y") LEGACY_BOT_TOKEN=$T/none; setup_alerts ) 2>&1 )
 check "no token in the secrets file and none stored: it asks for TG_BOT_TOKEN" '[[ $out == *"TG_BOT_TOKEN is not set"* && ! -e $T/opsbot.log ]]' "$out"
 printf "TG_BOT_TOKEN='%s'\n" "$TOKEN" >"$T/legacy.env"
 out=$( ( ENV_FILE=$T/env SECRETS_FILE=$T/none CMD=test; . "$HERE/../ente-setup.sh"; set +e; load_env
-  OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_TOKEN_FILE=$T/none ALERT_LEGACY=("$T/legacy.env" "$T/y")
+  OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_TOKEN_FILE=$T/none ALERT_LEGACY=("$T/legacy.env" "$T/y") LEGACY_BOT_TOKEN=$T/none
   write_file() { cat >/dev/null; }; systemctl() { :; }; setup_alerts ) 2>&1 )
 check "... the token of the alerts before opsbot is moved over (secrets file deleted after the first install)" \
   'grep -qx "token=$TOKEN" "$T/opsbot.log"' "$out"

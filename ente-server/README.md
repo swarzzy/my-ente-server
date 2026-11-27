@@ -160,10 +160,10 @@ problems on <host>", followed only by the lines that say why.
 1. `TG_BOT_USER_ID=<your Telegram user id>` in `ente-setup.env` (for a private chat it is the same number as `TG_CHAT_ID`).
    The bot uses the alert bot's token (`TG_BOT_TOKEN` in the secrets file, or the one opsbot stored).
 2. `sudo ./ente-tg-bot.sh install`: installs or updates opsbot with the bot on, and registers Ente as its plugin `ente`. Then
-   send `/status` to the bot. `status` and `check` as usual; `uninstall` removes Ente's commands (opsbot stays).
+   send `/status` to the bot. `check` as usual; `uninstall` removes Ente's commands (opsbot stays).
 
 Security: opsbot long-polls Telegram (no open port) as its own unprivileged user `opsbot`, acts only on private messages
-from `TG_BOT_USER_ID` (others are ignored, and you get a notice at most once an hour per sender), does not run commands older
+from `TG_BOT_USER_ID` (anything else is ignored and logged, never answered), does not run commands older
 than a minute, and maps each command to a fixed plugin action: no text from Telegram reaches a shell. As root it may run exactly
 `/usr/local/sbin/opsbot-action ente <one of seven names>` (`/etc/sudoers.d/opsbot`); that helper runs `ente-tg-bot.sh action <name>`,
 so the script folder must be root's alone (`chown -R root: ente-server; chmod -R go-w ente-server`; `install` refuses otherwise).
