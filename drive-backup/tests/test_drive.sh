@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Tests for drive-backup.sh with real rclone on local folders standing in for the buckets (rclone "alias" remotes): config
+# checks, the first sync, the guard (changes and deletions over the limit stop it, new files do not), forcing past it, the
+# /status line, check, verify, the lock, the rclone.conf it writes, the units and the plugin file (checked by opsbot's own
+# validator). Restoring an older version needs B2: tests/drive_e2e.sh. Changes nothing outside a temp dir.
+# Needs bash, python3 and rclone. Run: bash tests/test_drive.sh
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+command -v rclone >/dev/null || { echo "rclone is not installed"; exit 1; }
+OPSBOT_PY=$HERE/../../opsbot/opsbot.py
+mkdir -p "$T/src/vault/d" "$T/dst/bak" "$T/st" "$T/units" "$T/etc"
+printf '[drive]\ntype = alias\nremote = %s/src\n\n[drivebak]\ntype = alias\nremote = %s/dst\n' "$T" "$T" >"$T/rclone.conf"
+cat >"$T/env" <<'X'
+DRIVE_S3_ENDPOINT=s3.example.net
+DRIVE_S3_BUCKET=vault
+DRIVE_B2_BUCKET=bak
+DRIVE_B2_PREFIX=drive
+X
+# in_db CODE: source drive-backup.sh with every path in $T, run CODE
+in_db() {
+  ( ENV_FILE=$T/env SECRETS_FILE=$T/secrets RCLONE_CONF=$T/rclone.conf STATE=$T/st UNITS=$T/units ETC=$T/etc LOG=$T/log CMD=test
+    # shellcheck source=/dev/null
+    . "$HERE/../drive-backup.sh"
+    set +e
+    eval "$1" ) 2>&1
+}
+files() { find "$1" -type f | wc -l; }
+# SPY: in in_db, prints the real sync's arguments ("SYNC ...")
+SPY='eval "$(declare -f rc | sed "1s/^rc/rc_real/")"; rc() { [[ $1 == sync && " $* " != *" --dry-run "* ]] && echo "SYNC $*"; rc_real "$@"; };'
+for i in $(seq 1 20); do head -c $((100 + i)) /dev/urandom >"$T/src/vault/d/f$i.c9r"; done
+
+echo "== config"
+out=$(in_db 'ENV_FILE=$T/none; load_config; echo LOADED'); check "no config file: says which" '[[ $out == *"no config: copy drive-backup.env.example"* && $out != *LOADED* ]]' "$out"
+for bad in "DRIVE_S3_BUCKET=\$'a\\tb'" "DRIVE_B2_PREFIX=../x" "DRIVE_S3_ENDPOINT='x;id'" "DRIVE_MAX_CHANGE=0" "DRIVE_MAX_CHANGE=101" "DRIVE_HC_URL=http://x"; do
+  cp "$T/env" "$T/env.bak"; echo "$bad" >>"$T/env"
+  out=$(in_db 'load_config; echo LOADED'); check "refuses $bad" '[[ $out != *LOADED* && $out == *"${bad%%=*}"* ]]' "$out"
+  mv "$T/env.bak" "$T/env"
+done
+out=$(in_db 'load_config; echo "$SRC $DST $DRIVE_MAX_CHANGE"'); check "the drive and the backup paths, 10% by default" '[[ $out == "drive:vault drivebak:bak/drive 10" ]]' "$out"
+
+echo "== sync and the guard"
+out=$(in_db 'cmd_run; echo "rc=$?"')
+check "first run (an empty backup): everything copied, then verified" '[[ $out == *"syncing: 20 new"* && $out == *"verify passed"* && $out == *"rc=0" && $(files "$T/dst/bak/drive") == 20 && -s $T/st/verify-ok ]]' "$out"
+check "... and recorded: time, files, bytes" '[[ $(cut -d" " -f2 "$T/st/last-ok") == 20 && $(cut -d" " -f3 "$T/st/last-ok") == $(du -cb "$T"/src/vault/d/* | tail -1 | cut -f1) ]]' "$(cat "$T/st/last-ok")"
+out=$(in_db act_status); check "/status: when, how many files, how big" '[[ $out == "🗂 Drive: last sync "*" ago · 20 files, "*B ]]' "$out"
+head -c 500 /dev/urandom >"$T/src/vault/d/f1.c9r"; rm "$T/src/vault/d/f2.c9r"
+out=$(in_db "$SPY"' cmd_run; echo "rc=$?"')
+check "... deletions limited to what is left of the 10%: 2 of 20, minus 1 overwrite" '[[ $out == *"SYNC sync"*"--max-delete 1 "* ]]' "$out"
+check "2 of 20 changed or gone (10%): synced (verified a month ago: not again)" '[[ $out == *"2 changed or gone"* && $out != *"verify passed"* && $out == *"rc=0" && $(files "$T/dst/bak/drive") == 19 ]]' "$out"
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "nothing changed: nothing to sync, still a good sync" '[[ $out == *"nothing to sync"* && $out == *"rc=0" ]]' "$out"
+for i in $(seq 21 80); do head -c 50 /dev/urandom >"$T/src/vault/d/n$i.c9r"; done
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "60 new files: no guard (new files destroy nothing)" '[[ $out == *"rc=0" && $(files "$T/dst/bak/drive") == 79 ]]' "$out"
+sleep 1; for i in $(seq 21 30); do head -c 50 /dev/urandom >"$T/src/vault/d/n$i.c9r"; done # rewritten, same size
+out=$(in_db 'cmd_run; echo "rc=$?"')
+check "10 of 79 rewritten at the same size: the guard counts them as the sync would (a dry run, not sizes)" '[[ $out == *"guard: 10 of 79"* && $out != *"rc=0" ]]' "$out"
+in_db 'cmd_run force' >/dev/null
+cp -r "$T/dst" "$T/dst.before"
+for f in "$T"/src/vault/d/n*.c9r; do head -c 70 /dev/urandom >"$f"; done # "ransomware": most files rewritten
+out=$(in_db '(cmd_run); echo "rc=$?"')
+check "most files rewritten: the guard holds them back (a warning, exit 3), nothing changed" \
+  '[[ $out == *"WARN: guard: 60 of 79 files in the backup would change or go (75% > 10%): held back, 0 new copied"* && $out == *"rc=3" ]] && diff -r "$T/dst" "$T/dst.before" >/dev/null' "$out"
+check "... the guard is recorded" '[[ $(cat "$T/st/guard") == "60 79" ]]' "$(cat "$T/st/guard")"
+out=$(in_db act_status); check "... /status says so and what to do" '[[ $out == "⚠️ Drive: 60 of 79 files would change or go: held back, new files copied (/drive_force once the drive looks right)" ]]' "$out"
+out=$(in_db cmd_check); check "... check fails on it (the daily check alerts)" '[[ $out == *"FAIL  the guard holds back changes: 60 of 79 files would change or go"* ]]' "$out"
+head -c 70 /dev/urandom >"$T/src/vault/d/f3.c9r"; head -c 70 /dev/urandom >"$T/src/vault/d/new1.c9r"
+out=$(in_db '(cmd_run); echo "rc=$?"')
+check "... while it holds, nothing is synced at all, new files neither" '[[ $out == *"WARN: guard: 61 of 79 files in the backup would change or go: nothing synced until /drive_force"* && $out == *"rc=3" && ! -e $T/dst/bak/drive/d/new1.c9r ]] && diff -r "$T/dst" "$T/dst.before" >/dev/null' "$out"
+out=$(in_db 'bot_action sync; echo "rc=$?"'); check "... /drive_sync: the same, as a warning" '[[ $out == *"⚠️ guard: 61 of 79"* && $out == *"rc=3" ]]' "$out"
+out=$(in_db "$SPY"' bot_action force; echo "rc=$?"')
+check "/drive_force: synced everything (no deletion limit), the guard cleared" '[[ $out == *"syncing:"*"(forced)"* && $out == *"rc=0" && $out != *"--max-delete"* && ! -e $T/st/guard ]] && diff -r "$T/src/vault" "$T/dst/bak/drive" >/dev/null' "$out"
+check "... its reply without timestamps, and it is in the log" '[[ $out != *"[test]"* ]] && grep -q "(forced)" "$T/log"' "$out"
+out=$(in_db 'bot_action force; echo "rc=$?"'); check "/drive_force without a stopped sync: nothing to force" '[[ $out == "❌ nothing to force"*"rc=1" ]]' "$out"
+rm "$T"/src/vault/d/n2*.c9r "$T"/src/vault/d/n3*.c9r
+head -c 50 /dev/urandom >"$T/src/vault/d/new2.c9r"
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "19 of 80 deleted (23%): held back too, the new file copied" '[[ $out == *"guard: 19 of 80"*"1 new copied"* && $(files "$T/dst/bak/drive") == 81 ]]' "$out"
+cp "$T"/dst/bak/drive/d/n2*.c9r "$T"/dst/bak/drive/d/n3*.c9r "$T/src/vault/d/"
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "... the drive put back as the backup has it: the guard clears, syncing goes on" '[[ $out == *"rc=0" && ! -e $T/st/guard ]]' "$out"
+rm "$T"/src/vault/d/n2*.c9r "$T"/src/vault/d/n3*.c9r
+out=$(in_db '(cmd_run); echo "rc=$?"'); check "... deleted again: held back again" '[[ $out == *"guard: 19 of 81"* && $out == *"rc=3" ]]' "$out"
+for i in $(seq 41 50); do rm "$T/src/vault/d/n$i.c9r"; done # 10 more gone since
+out=$(in_db 'cmd_run force; echo "rc=$?"'); check "forcing applies every deletion, also those since the alert" '[[ $out == *"29 changed or gone"*"(forced)"* && $out == *"rc=0" && $(files "$T/dst/bak/drive") == 52 ]]' "$out"
+echo "DRIVE_MAX_CHANGE=50" >>"$T/env"; for f in "$T"/src/vault/d/n5*.c9r; do head -c 90 /dev/urandom >"$f"; done
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "DRIVE_MAX_CHANGE raises the limit" '[[ $out == *"rc=0" ]]' "$out"
+sed -i '/DRIVE_MAX_CHANGE/d' "$T/env"
+out=$(in_db 'exec 9>"$T/st/lock"; flock -n 9; (cmd_run); echo "rc=$?"'); check "a second run while one runs (or a verify): refused" '[[ $out == *"a sync is already running"* && $out != *"rc=0" ]]' "$out"
+mkdir "$T/src/vault/empty"; echo "DRIVE_S3_PREFIX=empty" >>"$T/env"; out=$(in_db 'cmd_run; echo "rc=$?"'); sed -i '/^DRIVE_S3_PREFIX=/d' "$T/env"
+check "a drive folder with no files (a typo): an error, not an empty backup" '[[ $out == *"the drive drive:vault/empty has no files"* && $out != *"rc=0" ]]' "$out"
+echo "DRIVE_B2_BUCKET=bakk" >>"$T/env"; out=$(in_db 'cmd_run; echo "rc=$?"'); sed -i '/^DRIVE_B2_BUCKET=bakk$/d' "$T/env"
+check "a backup bucket that does not exist (a typo): an error, not a first run" '[[ $out == *"cannot read the bucket drivebak:bakk (name, key?)"* && $out != *"rc=0" && ! -e $T/dst/bakk ]]' "$out"
+mv "$T/src" "$T/src.away"; out=$(in_db 'cmd_run; echo "rc=$?"'); mv "$T/src.away" "$T/src"
+check "the drive cannot be read: an error, nothing synced" '[[ $out == *"cannot read the bucket drive:vault"* && $out != *"rc=0" && $(files "$T/dst/bak/drive") == 52 ]]' "$out"
+
+echo "== status and check"
+out=$(in_db 'cmd_check; echo "rc=$?"'); check "check: a recent good sync and verify are OK (the timer is not on here)" '[[ $out == *"OK    last good sync"* && $out == *"OK    last verify passed"* && $out == *"FAIL  drive-backup.timer is off"* && $out == *"FAIL  drive-check.timer is off"* ]]' "$out"
+date -Is -d '33 days ago' >"$T/st/verify-ok"
+out=$(in_db cmd_check); check "... a verify over 32 days old is a FAIL" '[[ $out == *"FAIL  the backup has not passed a verify in 32 days (last: "* ]]' "$out"
+out=$(in_db 'cmd_run; echo "rc=$?"'); check "... and the next sync verifies" '[[ $out == *"verify passed"* && $out == *"rc=0" && $(cut -c1-10 "$T/st/verify-ok") == $(date +%F) ]]' "$out"
+date -Is -d '31 days ago' >"$T/st/verify-ok"; FAILV='verify() { log "ERROR: the backup differs" >&2; return 1; };'
+out=$(in_db "$FAILV"' (cmd_run); echo "rc=$?"'); check "a failed verify in a sync: only a warning the first time (a file in flight?)" '[[ $out == *"WARN: verify failed"*"runs again after the next sync"* && $out == *"rc=0" && -e $T/st/verify-failed ]]' "$out"
+out=$(in_db "$FAILV"' (cmd_run); echo "rc=$?"'); check "... twice in a row: an error, exit 4 (its own alert)" '[[ $out == *"verify failed twice in a row"* && $out == *"rc=4" ]]' "$out"
+out=$(in_db '(cmd_run); echo "rc=$?"'); check "... passing again clears it" '[[ $out == *"verify passed"* && $out == *"rc=0" && ! -e $T/st/verify-failed ]]' "$out"
+echo "$(date -Is -d '40 hours ago') 52 1000" >"$T/st/last-ok"
+out=$(in_db act_status); check "/status: a sync over 36 h old is a warning" '[[ $out == "⚠️ Drive: last sync 40 h ago"* ]]' "$out"
+out=$(in_db cmd_check); check "... and a FAIL in check" '[[ $out == *"FAIL  last good sync is older than 36 h"* ]]' "$out"
+rm "$T/st/last-ok"; out=$(in_db act_status); check "no sync yet: says so" '[[ $out == "⚠️ Drive: no sync yet" ]]' "$out"
+
+echo "== verify"
+out=$(in_db 'cmd_verify; echo "rc=$?"'); check "verify: every file there, a sample of those byte for byte" '[[ $out == *"verify passed: every file of the drive is in the backup, 5 sampled"* && $out == *"rc=0" ]]' "$out"
+f=$(find "$T/dst/bak/drive" -type f | head -1); head -c 7 /dev/urandom >>"$f"
+out=$(in_db 'cmd_verify; echo "rc=$?"'); check "a file in the backup that differs: verify fails" '[[ $out == *"the backup differs from the drive"* && $out != *"rc=0" ]]' "$out"
+
+echo "== keys, units, plugin"
+printf 'DRIVE_S3_ACCESS_KEY=AKID1\nDRIVE_S3_SECRET_KEY=sec/ret+1=\nDRIVE_B2_KEY_ID=0051\nDRIVE_B2_KEY=K005abc\n' >"$T/secrets"
+out=$(in_db 'load_config; RCLONE_CONF=$T/etc/rclone.conf; write_remotes; echo rc=$?')
+check "the keys go into rclone.conf (600): the drive over S3, the backup over B2's own API" \
+  '[[ $(stat -c %a "$T/etc/rclone.conf") == 600 ]] && grep -qx "type = b2" "$T/etc/rclone.conf" && grep -qx "account = 0051" "$T/etc/rclone.conf" && grep -qx "endpoint = s3.example.net" "$T/etc/rclone.conf"' "$(cat "$T/etc/rclone.conf")"
+rm "$T/secrets"; out=$(in_db 'load_config; RCLONE_CONF=$T/etc/rclone.conf; write_remotes; echo rc=$?')
+check "without the secrets file (deleted after install): the keys stay" '[[ $out == *"kept from"* ]] && grep -qx "account = 0051" "$T/etc/rclone.conf" && grep -qx "secret_access_key = sec/ret+1=" "$T/etc/rclone.conf"' "$out"
+echo "DRIVE_S3_ENDPOINT=https://s3.other.net" >>"$T/env"; out=$(in_db 'load_config; RCLONE_CONF=$T/etc/rclone.conf; write_remotes; echo rc=$?'); sed -i '/other.net/d' "$T/env"
+check "... and a new endpoint from the env file goes in with them" 'grep -qx "endpoint = https://s3.other.net" "$T/etc/rclone.conf" && grep -qx "key = K005abc" "$T/etc/rclone.conf"' "$(cat "$T/etc/rclone.conf")"
+printf 'DRIVE_S3_ACCESS_KEY="a b"\nDRIVE_S3_SECRET_KEY=x\nDRIVE_B2_KEY_ID=x\nDRIVE_B2_KEY=x\n' >"$T/secrets"
+out=$(in_db 'load_config; RCLONE_CONF=$T/etc/new.conf; write_remotes; echo rc=$?'); check "a key that is not one is refused" '[[ $out == *"DRIVE_S3_ACCESS_KEY does not look like a key"* && ! -e $T/etc/new.conf ]]' "$out"
+rm "$T/secrets"
+in_db 'load_config; units' >/dev/null
+check "the daily check at 09:30, alerting too; the alert runs this script" 'grep -qx "OnCalendar=\*-\*-\* 09:30:00" "$T/units/drive-check.timer" && grep -q "drive-backup.sh check$" "$T/units/drive-check.service" && grep -qx "OnFailure=drive-alert@%n.service" "$T/units/drive-check.service" && grep -q "drive-backup.sh alert %i$" "$T/units/drive-alert@.service"'
+check "the backup unit runs nightly at 04:00 with these config files, alerting through opsbot when it fails" \
+  'grep -qx "OnFailure=drive-alert@%n.service" "$T/units/drive-backup.service" && grep -qx "Environment=ENV_FILE=$(realpath "$T/env") SECRETS_FILE=$(realpath "$T")/secrets" "$T/units/drive-backup.service" && grep -qx "OnCalendar=\*-\*-\* 04:00:00" "$T/units/drive-backup.timer"' "$(cat "$T/units/drive-backup.service")"
+mkdir -p "$T/pj"; in_db 'load_config >/dev/null; plugin_json' >"$T/pj/drive.json"
+out=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import opsbot; p = opsbot.read_plugin(sys.argv[2]); print(p["name"], " ".join(c["command"] for c in p["commands"]), " ".join(sorted(p["actions"])), len(p["root_files"]))' \
+  "$(dirname "$OPSBOT_PY")" "$T/pj/drive.json" 2>&1)
+check "the plugin: opsbot accepts it; /drive_sync, /drive_force, a /status line; its config and keys are root_files" '[[ $out == "drive drive_sync drive_force force status sync 3" ]]' "$out"
+lc() { in_db "load_config; rc() { echo 'NOTICE: a note' >&2; echo '$1'; }; lifecycle_check"; } # a notice on stderr does not matter
+out=$(lc '[{"daysFromHidingToDeleting": 30, "daysFromUploadingToHiding": null, "fileNamePrefix": ""}]'); check "lifecycle: 30 days: OK" '[[ $out == *"OK    the backup keeps old versions 30 days"* ]]' "$out"
+out=$(lc '[{"daysFromHidingToDeleting": 1, "daysFromUploadingToHiding": null, "fileNamePrefix": "drive/"}]'); check "lifecycle: 1 day on the folder: FAIL" '[[ $out == *"FAIL  the backup bucket'"'"'s lifecycle"* ]]' "$out"
+out=$(lc '[{"daysFromHidingToDeleting": 1, "daysFromUploadingToHiding": null, "fileNamePrefix": "other/"}]'); check "... on another folder only: no rule here (WARN)" '[[ $out == *"WARN  the backup bucket has no lifecycle rule"* ]]' "$out"
+out=$(lc '[{"daysFromHidingToDeleting": 30, "daysFromUploadingToHiding": 60, "fileNamePrefix": ""}]'); check "lifecycle: hides files by age: FAIL" '[[ $out == *"FAIL"* ]]' "$out"
+out=$(lc '[]'); check "no rule: WARN (kept for good)" '[[ $out == *"WARN  the backup bucket has no lifecycle rule"* ]]' "$out"
+al() { in_db "systemctl() { case \$* in *ExecMainCode*) echo ${3:-1} ;; *) echo $2 ;; esac; }; NOTIFY_UNIT=echo; cmd_alert $1"; }
+out=$(al drive-backup.service 3); check "the alert: the guard is a warning" '[[ $out == "drive-backup.service ⚠️ Drive backup held changes back on "*" (new files copied) ERROR|WARN|FAIL" ]]' "$out"
+out=$(al drive-backup.service 4); check "... a failed verify says so" '[[ $out == *"❌ Drive backup verify failed on "* ]]' "$out"
+out=$(al drive-backup.service 3 2); check "... killed by signal 3: a failure, not the guard" '[[ $out == *"❌ Drive backup failed on "* ]]' "$out"
+out=$(al drive-backup.service 1); check "... a failed sync" '[[ $out == *"❌ Drive backup failed on "* ]]' "$out"
+out=$(al drive-check.service 1); check "... the daily check" '[[ $out == *"⚠️ Drive backup check found problems on "* ]]' "$out"
+for at in "" tomorrow "2026-11-20"; do
+  out=$(in_db "cmd_restore '$at'; echo rc=\$?"); check "restore '$at': a usage error" '[[ $out == *"usage:"*"restore '\''YYYY-MM-DD HH:MM'\''"* && $out != *"rc=0"* ]]' "$out"
+done
+out=$(in_db 'bot_action rm; echo rc=$?'); check "an action it does not know is a usage error" '[[ $out == *usage* && $out != *"rc=0"* ]]' "$out"
+
+echo "== command line"
+CLI=$HERE/../drive-backup.sh
+asuser() { "$@"; }
+if [[ $EUID -eq 0 ]]; then cp "$CLI" "$T/cli.sh"; chmod 755 "$T" "$T/cli.sh"; CLI=$T/cli.sh; asuser() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }; fi
+for c in "" maybe "run now" "restore" "restore 2026-11-20 d/AB" "install x"; do
+  # shellcheck disable=SC2086
+  out=$(asuser bash "$CLI" $c 2>&1); rc=$?; check "'$c' is a usage error" '[[ $rc -eq 2 && $out == *usage* ]]' "$out"
+done
+for c in install uninstall check run "run --force" verify "restore 2026-11-20" "action status" "alert drive-check.service"; do
+  # shellcheck disable=SC2086
+  out=$(asuser bash "$CLI" $c 2>&1); check "'$c' is a known command (asks for root here)" '[[ $out == *"run as root"* ]]' "$out"
+done
+
+summary

@@ -1,0 +1,5 @@
+# the scripts run on Linux: keep LF line endings whatever the checkout's platform
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.example text eol=lf
