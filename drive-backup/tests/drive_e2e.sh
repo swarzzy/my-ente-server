@@ -18,8 +18,8 @@ sed '/^DRIVE_S3_PREFIX=/d; /^DRIVE_B2_PREFIX=/d' "$DRIVE_E2E_ENV" >"$T/env"; pri
 install -m 600 "$DRIVE_E2E_SECRETS" "$T/secrets"
 # admin.conf: the same remotes with the test keys, to put files into the drive and to clean up (the server's keys may not)
 ( set -a; umask 077; . "$T/env"; . "$T/secrets"
-  printf '[drive]\ntype = s3\nprovider = %s\nendpoint = %s\naccess_key_id = %s\nsecret_access_key = %s\n\n[drivebak]\ntype = b2\naccount = %s\nkey = %s\n' \
-    "${DRIVE_S3_PROVIDER:-Other}" "$DRIVE_S3_ENDPOINT" "$DRIVE_S3_ACCESS_KEY" "$DRIVE_S3_SECRET_KEY" "$DRIVE_B2_KEY_ID" "$DRIVE_B2_KEY" >"$T/admin.conf"
+  printf '[drive]\ntype = s3\nprovider = %s\nendpoint = %s\nregion = %s\naccess_key_id = %s\nsecret_access_key = %s\n\n[drivebak]\ntype = b2\naccount = %s\nkey = %s\n' \
+    "${DRIVE_S3_PROVIDER:-Other}" "$DRIVE_S3_ENDPOINT" "${DRIVE_S3_REGION:-}" "$DRIVE_S3_ACCESS_KEY" "$DRIVE_S3_SECRET_KEY" "$DRIVE_B2_KEY_ID" "$DRIVE_B2_KEY" >"$T/admin.conf"
   echo "SRC=drive:$DRIVE_S3_BUCKET/$P DST=drivebak:$DRIVE_B2_BUCKET/$P" >"$T/paths" )
 . "$T/paths"
 adm() { rclone --config "$T/admin.conf" "$@"; }
@@ -37,21 +37,21 @@ echo "== install"
 mkdir -p "$T/seed/d"; for i in $(seq 1 20); do head -c $((1000 + i)) /dev/urandom >"$T/seed/d/f$i.c9r"; done
 adm copy "$T/seed" "$SRC" || { echo "cannot seed the drive" >&2; exit 1; }
 DB install; check "install succeeds" '[[ $RC -eq 0 ]]' "$(cat "$T/out")"
-check "... it tried the keys (the test keys may do more: warned)" 'grep -q "the drive can be read" "$T/out" && grep -q "the backup can be written" "$T/out" && grep -qE "(OK|WARN)  .*(cannot delete for good|can delete for good)" "$T/out" && ! adm lsf "$SRC" | grep -q key-test' "$(cat "$T/out")"
+check "... it tried the keys (the test keys may do more: warned)" 'grep -q "the backup can be written" "$T/out" && grep -qE "(OK|WARN)  .*(cannot delete for good|can delete for good)" "$T/out" && ! adm lsf "$SRC" | grep -q key-test' "$(cat "$T/out")"
 check "... the keys are in a root-only rclone.conf" '[[ $(stat -c "%U %a" /etc/drive-backup/rclone.conf) == "root 600" ]]'
-check "... registered with opsbot, timers on" '/usr/local/sbin/opsbot plugin list | grep -qw drive && systemctl is-enabled --quiet drive-backup.timer drive-verify.timer'
-# a oneshot service is "activating" while it runs
-for _ in $(seq 1 90); do [[ $(systemctl show -p ActiveState --value drive-backup.service) == activating ]] || break; sleep 2; done
-check "the first sync (started by install) copied the drive" '[[ $(adm lsf -R --files-only "$DST" | wc -l) == 20 && $(systemctl show -p Result --value drive-backup.service) == success ]]' "$(journalctl -u drive-backup.service -n 5 --no-pager)"
+check "... registered with opsbot, the timer on" '/usr/local/sbin/opsbot plugin list | grep -qw drive && systemctl is-enabled --quiet drive-backup.timer'
+# the first run has ended once its main process has an exit time
+for _ in $(seq 1 90); do [[ $(systemctl show -p ExecMainExitTimestampMonotonic --value drive-backup.service) == 0 ]] || break; sleep 2; done
+check "the first sync (started by install) copied the drive and verified it" '[[ $(adm lsf -R --files-only "$DST" | wc -l) == 20 && $(systemctl show -p Result --value drive-backup.service) == success ]] && journalctl -u drive-backup.service --no-pager | grep -q "verify passed"' "$(journalctl -u drive-backup.service -n 5 --no-pager)"
 
 echo "== versions and restore"
 adm cat "$SRC/d/f1.c9r" | sha256sum >"$T/f1.before"; adm cat "$SRC/d/f2.c9r" | sha256sum >"$T/f2.before"
-sleep 2; T1=$(date '+%F %T'); sleep 2
+sleep 2; T1=$(TZ=Asia/Tokyo date '+%F %T'); sleep 2 # restore reads the server's time: here Tokyo's, 9 h off UTC
 head -c 3000 /dev/urandom | adm rcat "$SRC/d/f1.c9r"; adm deletefile "$SRC/d/f2.c9r"
 DB run; check "a changed and a deleted file: synced" '[[ $RC -eq 0 ]] && grep -q "2 changed or gone" "$T/out"' "$(cat "$T/out")"
 check "... the backup now has the new file and no longer lists the deleted one" '[[ $(adm cat "$DST/d/f1.c9r" | wc -c) == 3000 ]] && ! adm lsf "$DST/d" | grep -qx f2.c9r'
 check "... B2 keeps the old versions" '[[ $(adm lsf --b2-versions "$DST/d" | grep -cE "^f[12]-v[0-9]") -ge 2 ]]' "$(adm lsf --b2-versions "$DST/d" | head)"
-DB restore "$T1"; out=$(sed -n 's/.*into \(\/var\/tmp\/drive-restore-[0-9-]*\).*/\1/p' "$T/out"); RESTORED=$out
+TZ=Asia/Tokyo DB restore "$T1"; out=$(sed -n 's/.*into \(\/var\/tmp\/drive-restore-[0-9-]*\).*/\1/p' "$T/out"); RESTORED=$out
 check "restore as of before: both files as they were" '[[ $RC -eq 0 && -n $out && $(sha256sum <"$out/d/f1.c9r") == $(cat "$T/f1.before") && $(sha256sum <"$out/d/f2.c9r") == $(cat "$T/f2.before") && $(find "$out" -type f | wc -l) == 20 ]]' "$(cat "$T/out")"
 
 echo "== the guard, and opsbot"
