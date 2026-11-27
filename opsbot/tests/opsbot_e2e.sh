@@ -51,7 +51,7 @@ cat >"$E2E/e2e.json" <<X
               {"command": "e2e_fail", "description": "fails", "action": "fail"},
               {"command": "e2e_long", "description": "long", "action": "long"}],
  "actions": {"status": {}, "who": {"ok": "👤 who"},
-             "slow": {"started": "⏳ slow...", "ok": "✅ slow done", "busy": "⏳ slow is busy"},
+             "slow": {"started": "⏳ slow...", "ok": "✅ slow done"},
              "fail": {"started": "⏳ failing...", "fail": "❌ it failed"},
              "long": {"started": "⏳ long..."}}}
 X
@@ -127,7 +127,7 @@ ask "/status"; check "/status: the plugin's status line (with its env), then the
   '[[ $(reply) == *"🧪 e2e plugin is up (env hello)"* && $(reply | tail -1) == "🖥 Disk "*" used ("*"MB free · up "* ]]' "$(reply)"
 ask "/e2e_who"; check "a quick action replies with its title and output, run as root from /" '[[ $(reply) == "$(printf "👤 who\nuser=root cwd=/ leak=none")" ]]' "$(reply)"
 ask "/e2e_slow"; check "a long action says it started" '[[ $(reply) == "⏳ slow..." ]]' "$(reply)"
-ask "/e2e_slow"; check "... a second one while it runs is refused" '[[ $(reply) == "⏳ slow is busy" ]]' "$(reply)"
+ask "/e2e_slow"; check "... a second one while it runs is refused" '[[ $(reply) == "⏳ /e2e_slow is already running." ]]' "$(reply)"
 ask "/status"; check "... the bot keeps answering meanwhile" '[[ $(reply) == *"e2e plugin is up"* ]]' "$(reply)"
 for ((i = 0; i < 50; i++)); do [[ $(last) == "✅ slow done"* ]] && break; sleep 0.2; done
 check "... then its result" '[[ $(last) == "$(printf "✅ slow done\nslow done")" ]]' "$(last)"

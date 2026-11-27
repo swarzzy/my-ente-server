@@ -15,11 +15,13 @@ printf '%s\n' DOMAIN=photos.example.org S3_ENDPOINT=s3.example.net S3_REGION=r1 
   BACKUP_S3_ENDPOINT=b2.example.net BACKUP_S3_REGION=r2 BACKUP_S3_BUCKET=bk "TG_CHAT_ID=$CHAT" >"$T/env"
 printf 'TG_BOT_TOKEN=%s\n' "$TOKEN" >"$T/secrets"
 mkdir -p "$T/bin"
-# a fake opsbot.sh: records how it was run; a fake opsbot-notify: records the message, fails with NOTIFY_FAILS
+# a fake opsbot.sh: records how it was run; a fake opsbot-notify: records the message, fails with NOTIFY_FAILS; an `env`
+# that records its arguments (the token must not be on a command line)
 printf '#!/bin/bash\n{ echo "args=$*"; echo "token=${OPSBOT_TOKEN-unset}"; echo "chat=${OPSBOT_CHAT_ID-unset}"; echo "user=${OPSBOT_USER_ID-unset}"; } >"%s"\nexit "${OPSBOT_FAILS:-0}"\n' \
   "$T/opsbot.log" >"$T/bin/opsbot.sh"
 printf '#!/bin/bash\necho "$1" >>"%s"\n[[ -z ${NOTIFY_FAILS:-} ]]\n' "$T/notify.log" >"$T/bin/notify"
-chmod 755 "$T/bin/opsbot.sh" "$T/bin/notify"
+printf '#!/bin/bash\necho "$*" >>"%s"\nexec /usr/bin/env "$@"\n' "$T/env.log" >"$T/bin/env"
+chmod 755 "$T/bin/opsbot.sh" "$T/bin/notify" "$T/bin/env"
 
 echo "== setup_alerts installs opsbot and Ente's alert units"
 # run_setup: setup_alerts into $T/root (the generated ente-alert-unit calls $T/bin/opsbot-notify-unit)
@@ -29,16 +31,19 @@ run_setup() {
     . "$HERE/../ente-setup.sh"
     set +e
     load_env
-    OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_TOKEN_FILE=$T/none ALERT_LEGACY=("$T/legacy.env" "$T/legacy-alert")
+    OPSBOT_SH=$T/bin/opsbot.sh OPSBOT_NOTIFY=$T/bin/notify OPSBOT_NOTIFY_UNIT=$T/bin/notify-unit OPSBOT_TOKEN_FILE=$T/none
+    ALERT_LEGACY=("$T/legacy.env" "$T/legacy-alert")
     write_file() { local f=$T/root$1; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "${2:-644}" "$f"; }
     systemctl() { :; }
-    SCRIPT_DIR=/opt/ente-server setup_alerts; echo "onfail=[$ALERT_ONFAIL]" ) >"$T/out" 2>&1
+    PATH=$T/bin:$PATH SCRIPT_DIR=/opt/ente-server setup_alerts; echo "onfail=[$ALERT_ONFAIL]" ) >"$T/out" 2>&1
 }
 OPSBOT_USER_ID=999 OPSBOT_FAILS=1 run_setup; RC=$?
 check "an opsbot install that fails stops it, before anything is installed" \
   'grep -q "opsbot install failed" "$T/out" && [[ ! -e $T/root ]]' "$(tail -3 "$T/out")"
 check "opsbot is installed with the token and chat of this config, and its bot left as it is (no user id passed)" \
   '[[ $(cat "$T/opsbot.log") == "$(printf "args=install\ntoken=%s\nchat=%s\nuser=unset" "$TOKEN" "$CHAT")" ]]' "$(cat "$T/opsbot.log")"
+check "... the token is on no command line (not passed through env)" \
+  '! grep -qF -- "${TOKEN#*:}" "$T/env.log" 2>/dev/null && ! sed -n "/^setup_alerts()/,/^}/p" "$HERE/../ente-setup.sh" | grep -qE "env [^#]*OPSBOT_TOKEN"' "$(cat "$T/env.log" 2>/dev/null)"
 NOTIFY_FAILS=1 run_setup
 check "a test message that cannot be sent stops it, before anything is installed" \
   'grep -q "could not send to TG_CHAT_ID" "$T/out" && [[ ! -e $T/root ]]' "$(tail -3 "$T/out")"

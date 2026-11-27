@@ -40,7 +40,8 @@ Needs: Debian with systemd, bash, python3 (stdlib only), sudo, curl. No open por
 ## Plugins
 
 A plugin is a JSON file. `sudo opsbot plugin add NAME.json` checks it, copies it to `/etc/opsbot/plugins.d/`, regenerates the
-sudo rule and makes the bot reload its commands (within a minute). `plugin remove NAME` undoes it; `plugin list` shows them.
+sudo rule and makes the bot reload its commands (within a minute). `plugin remove NAME` undoes it; `plugin list` shows them. A plugin file that is broken (say, edited by hand) is left out
+by the bot and the sudo rule, so the others keep working, and `opsbot check` reports it.
 
 ```json
 {
@@ -51,12 +52,11 @@ sudo rule and makes the bot reload its commands (within a minute). `plugin remov
   "commands": [
     {"command": "backup", "description": "Back up now", "action": "backup"},
     {"command": "proxy", "description": "Proxy: state, /proxy on, /proxy off",
-     "args": {"": "proxy-status", "on": "proxy-on", "off": "proxy-off"}, "usage": "Send /proxy, /proxy on or /proxy off."}
+     "args": {"": "proxy-status", "on": "proxy-on", "off": "proxy-off"}}
   ],
   "actions": {
     "status": {},
-    "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed",
-               "busy": "⏳ A backup is already running."},
+    "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed"},
     "proxy-status": {"ok": "🔀 Proxy"},
     "proxy-on": {"started": "⏳ Turning it on...", "ok": "✅ Proxy is on", "lock": "proxy"},
     "proxy-off": {"started": "⏳ Turning it off...", "ok": "✅ Proxy is off", "lock": "proxy"}
@@ -65,16 +65,17 @@ sudo rule and makes the bot reload its commands (within a minute). `plugin remov
 ```
 
 - `name`: the file name (`demo.json`); lowercase letters, digits and dashes.
-- `exec`: what runs, as root; the action name is appended (`/bin/bash /opt/demo/bot-actions.sh backup`). An absolute path.
-  Everything in it that is a file must be root's alone (owned by root, not writable by others, nor the folders above it):
-  `plugin add` refuses otherwise, and the helper checks again on every run. Its output is the reply.
+- `exec`: what runs, as root, exactly as written; the action name is appended (`/bin/bash /opt/demo/bot-actions.sh backup`).
+  The program is an absolute path; no `$` and no `..` anywhere. Every absolute path in it must exist and be root's alone: the
+  file, every folder above it and every symlink on the way (and where they lead) owned by root and not writable by others, so
+  nobody else can change what runs. `plugin add` refuses otherwise, and the helper checks again on every run. Its output is
+  the reply.
 - `env`: variables the action gets (nothing else of the bot's reaches it).
 - `actions`: each action's texts. With `started` it runs in the background: the bot replies at once, then `ok` or `fail`
-  (defaults: "✅ /cmd done", "❌ /cmd failed") with its output. Only one at a time per `lock` (default: the action itself;
-  `busy` is the reply meanwhile). Without `started` it is quick (at most 2 minutes): the reply is its output, after `ok`/`fail`
-  if given.
+  (defaults: "✅ /cmd done", "❌ /cmd failed") with its output. Only one at a time per `lock` (default: the action itself). Without `started` it is quick (at most 2 minutes): the reply is its output, after `ok`/`fail`
+  if given. Every action runs in the background: a slow one never holds up the bot.
 - `commands`: the Telegram commands (lowercase letters, digits, `_`), each with a `description` (the menu) and either one
-  `action` or `args` (argument → action, `""` for none). Anything else after a command is refused (`usage` says what to send).
+  `action` or `args` (argument → action, `""` for none). Anything else after a command is refused, with what to send instead.
   `/status`, `/start` and `/help` are the bot's own; two plugins cannot have the same command.
 - `status`: a quick action whose output `/status` shows. `/status` is each plugin's status, then a system line
   ("🖥 Disk 26% used (17G free) · RAM 1408 MB free · up 5 days · reboot pending").

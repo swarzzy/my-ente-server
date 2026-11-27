@@ -78,7 +78,7 @@ ask "/status"; check "/status: Ente's lines (services, backup, checks, buckets, 
 ask "/check" 2 180; check "/check: the check passed, problems listed, the rest counted" \
   '[[ $(reply | head -1) == "✅ Check passed" && $(reply | tail -1) =~ ^[0-9]+\ checks\ OK$ && $(reply) != *"  OK  "* ]]' "$(reply)"
 ask "/check@some_bot now"; check "arguments are refused" '[[ $(reply) == "/check takes nothing after it. Just send /check." ]]' "$(reply)"
-ask "/proxy on; reboot"; check "injection attempt is refused" '[[ $(reply) == "Send /proxy, /proxy on or /proxy off." ]]' "$(reply)"
+ask "/proxy on; reboot"; check "injection attempt is refused" '[[ $(reply) == "Send /proxy, /proxy on, /proxy off." ]]' "$(reply)"
 check "and nothing else happened (proxy unchanged)" '[[ $(cat /var/lib/ente-setup/s3-proxy 2>/dev/null || echo off) == "$PROXY_WAS" ]]'
 
 if [[ $PROXY_INSTALLED == yes ]]; then

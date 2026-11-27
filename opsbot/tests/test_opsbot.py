@@ -33,24 +33,19 @@ DEMO = {
         {"command": "check", "description": "Full health check", "action": "check"},
         {"command": "backup", "description": "Back up now", "action": "backup"},
         {"command": "proxy", "description": "S3 proxy: state, /proxy on, /proxy off",
-         "args": {"": "proxy-status", "status": "proxy-status", "on": "proxy-on", "off": "proxy-off"},
-         "usage": "Send /proxy, /proxy on or /proxy off."},
+         "args": {"": "proxy-status", "status": "proxy-status", "on": "proxy-on", "off": "proxy-off"}},
         {"command": "size", "description": "Measure the buckets now", "action": "size"},
         {"command": "uptime", "description": "How long it runs", "action": "uptime"},
     ],
     "actions": {
         "status": {},
         "uptime": {"ok": "⏱ Uptime"},
-        "check": {"started": "⏳ Checking...", "ok": "✅ Check passed", "fail": "❌ Check found problems",
-                  "busy": "⏳ A check is already running."},
-        "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed",
-                   "busy": "⏳ A backup is already running."},
+        "check": {"started": "⏳ Checking...", "ok": "✅ Check passed", "fail": "❌ Check found problems"},
+        "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed"},
         "proxy-status": {"started": "⏳ Checking the S3 proxy...", "ok": "🔀 S3 proxy", "fail": "❌ S3 proxy has problems",
-                         "lock": "proxy", "busy": "⏳ Busy: the last /proxy command hasn't finished yet."},
-        "proxy-on": {"started": "⏳ Turning the S3 proxy on...", "ok": "✅ S3 proxy is on", "lock": "proxy",
-                     "busy": "⏳ Busy: the last /proxy command hasn't finished yet."},
-        "proxy-off": {"started": "⏳ Turning the S3 proxy off...", "ok": "✅ S3 proxy is off", "lock": "proxy",
-                      "busy": "⏳ Busy: the last /proxy command hasn't finished yet."},
+                         "lock": "proxy"},
+        "proxy-on": {"started": "⏳ Turning the S3 proxy on...", "ok": "✅ S3 proxy is on", "lock": "proxy"},
+        "proxy-off": {"started": "⏳ Turning the S3 proxy off...", "ok": "✅ S3 proxy is off", "lock": "proxy"},
         "size": {"started": "⏳ Measuring the buckets..."},
     },
 }
@@ -185,6 +180,7 @@ class BotTest(unittest.TestCase):
     def test_owner_private_message_runs_the_action_and_gets_the_reply(self):
         self.msg("/status")
         self.poll()
+        self.wait_sent(1)
         self.assertEqual(self.runner.calls, ["status"])
         self.assertEqual(self.texts()[0].splitlines()[0], "output of status")
 
@@ -259,18 +255,9 @@ class BotTest(unittest.TestCase):
         self.assertEqual(self.runner.calls, [])
         t = self.texts()
         self.assertEqual(len(t), 7)
-        self.assertEqual(t[0], "Send /proxy, /proxy on or /proxy off.")  # the plugin's usage
+        self.assertEqual(t[0], "Send /proxy, /proxy status, /proxy on, /proxy off.")
         self.assertEqual(t[3], "/status takes nothing after it. Just send /status.")
         self.assertEqual(t[4], "/backup takes nothing after it. Just send /backup.")
-
-    def test_without_a_usage_text_the_arguments_are_listed(self):
-        doc = copy.deepcopy(DEMO)
-        del doc["commands"][2]["usage"]
-        write_plugin(self.plugins, doc)
-        self.bot.load_plugins()
-        self.msg("/proxy maybe")
-        self.poll()
-        self.assertEqual(self.texts(), ["Send /proxy, /proxy status, /proxy on, /proxy off."])
 
     def test_bot_name_suffix_is_accepted(self):
         self.msg("/check@ente_test_bot")
@@ -281,11 +268,13 @@ class BotTest(unittest.TestCase):
     def test_a_quick_action_replies_with_its_title_and_output(self):
         self.msg("/uptime")
         self.poll()
+        self.wait_sent(1)
         self.assertEqual(self.texts(), ["⏱ Uptime\noutput of uptime"])
         self.assertEqual(self.runner.timeouts["uptime"], ob.QUICK_TIMEOUT)
         self.runner.out["uptime"] = (1, "broken")
         self.msg("/uptime")
         self.poll()
+        self.wait_sent(2)
         self.assertEqual(self.texts()[-1], "❌ /uptime failed\nbroken")
 
     # ---- /status
@@ -296,6 +285,7 @@ class BotTest(unittest.TestCase):
         self.runner.out["status"] = (0, "✅ Demo is up\n💾 Backup: fine")
         self.msg("/status")
         self.poll()
+        self.wait_sent(1)
         lines = self.texts()[0].splitlines()
         self.assertEqual(lines[:3], ["✅ Demo is up", "💾 Backup: fine", "output of st"])
         self.assertTrue(lines[3].startswith("🖥 Disk ") and " used (" in lines[3] and "MB free · up " in lines[3], lines)
@@ -307,6 +297,7 @@ class BotTest(unittest.TestCase):
         open(os.path.join(self.state, "no-reboot"), "w").close()
         self.msg("/status")
         self.poll()
+        self.wait_sent(1)
         lines = self.texts()[0].splitlines()
         self.assertEqual(lines[0], "❌ demo: no status (ERROR: database down)")
         self.assertTrue(lines[1].startswith("🖥 ") and lines[1].endswith(" · reboot pending"), lines)
@@ -316,8 +307,20 @@ class BotTest(unittest.TestCase):
         self.bot.load_plugins()
         self.msg("/status")
         self.poll()
+        self.wait_sent(1)
         self.assertEqual(len(self.texts()[0].splitlines()), 1)
         self.assertEqual(self.runner.calls, [])
+
+    def test_a_slow_status_does_not_hold_up_other_commands(self):
+        self.runner.gates["status"] = threading.Event()
+        self.msg("/status")
+        self.msg("/uptime")
+        self.poll()
+        self.wait_sent(1)
+        self.assertEqual(self.texts(), ["⏱ Uptime\noutput of uptime"])  # answered while /status still waits
+        self.runner.gates["status"].set()
+        self.wait_sent(2)
+        self.assertTrue(self.texts()[1].startswith("output of status"), self.texts())
 
     # ---- long actions
     def test_backup_replies_at_once_then_with_the_result(self):
@@ -343,7 +346,7 @@ class BotTest(unittest.TestCase):
         self.poll()
         self.wait_sent(2)
         self.assertEqual(self.runner.calls.count("backup"), 1)
-        self.assertIn("⏳ A backup is already running.", self.texts())
+        self.assertIn("⏳ /backup is already running.", self.texts())
         self.runner.gates["backup"].set()
         self.wait_sent(3)
 
@@ -354,7 +357,7 @@ class BotTest(unittest.TestCase):
         self.poll()
         self.wait_sent(2)
         self.assertEqual(self.runner.calls, ["proxy-on"])
-        self.assertIn("⏳ Busy: the last /proxy command hasn't finished yet.", self.texts())
+        self.assertIn("⏳ /proxy is already running.", self.texts())
         self.runner.gates["proxy-on"].set()
         self.wait_sent(3)
 
@@ -401,6 +404,7 @@ class BotTest(unittest.TestCase):
         self.runner.out["uptime"] = (0, "x" * 10000 + "THE END")
         self.msg("/uptime")
         self.poll()
+        self.wait_sent(1)
         t = self.texts()[0]
         self.assertLessEqual(len(t), 4096)
         self.assertTrue(t.endswith("THE END"))
@@ -413,7 +417,7 @@ class BotTest(unittest.TestCase):
         self.msg("/drive")
         self.poll()  # not reloaded yet: unknown command
         self.assertEqual(self.runner.calls, [])
-        self.bot.reload_pending = True
+        ob.RELOAD.set()  # what SIGHUP does
         self.msg("/drive")
         self.poll()
         self.wait_sent(3)
@@ -441,6 +445,7 @@ class BotTest(unittest.TestCase):
     def test_offset_is_persisted_so_nothing_runs_twice_after_a_restart(self):
         self.msg("/uptime")
         self.poll()
+        self.wait_sent(1)
         self.bot = self.make_bot()  # restart
         self.poll()
         self.assertEqual(self.runner.calls, ["uptime"])
@@ -453,6 +458,7 @@ class BotTest(unittest.TestCase):
                 self.bot.run_once()
             except ob.ApiError:
                 pass
+        self.wait_sent(1)
         self.assertEqual(self.runner.calls, ["uptime"])
         self.assertNotIn(TOKEN, self.log.getvalue())
         self.assertNotIn(TOKEN.split(":")[1], self.log.getvalue())
@@ -510,7 +516,8 @@ class PluginTest(unittest.TestCase):
         self.bad(lambda d: d.update(actions={}), "actions:")
         self.bad(lambda d: d["actions"].update({"Bad Name": {}}), "action 'Bad Name'")
         self.bad(lambda d: d["actions"].update({"x": {"title": "?"}}), "action x: only")
-        self.bad(lambda d: d["actions"].update({"x": {"lock": "l"}}), "busy and lock need started")
+        self.bad(lambda d: d["actions"].update({"x": {"lock": "l"}}), "lock needs started")
+        self.bad(lambda d: d["actions"].update({"x": {"started": "⏳", "busy": "?"}}), "action x: only")
         self.bad(lambda d: d["actions"].update({"x": {"started": ""}}), "must not be empty")
         self.bad(lambda d: d.update(status="check"), "status: the name of a quick action")
         self.bad(lambda d: d.update(status="nope"), "status:")
@@ -526,6 +533,14 @@ class PluginTest(unittest.TestCase):
         self.bad(lambda d: d["commands"].append({"command": "x", "description": "x", "action": "rm"}), "'rm' is not one of its actions")
         self.bad(lambda d: d["commands"].append({"command": "x", "description": "x", "args": {"a b": "status"}}), "argument 'a b'")
         self.bad(lambda d: d.update(commands=[], status=None), "needs commands or a status")
+        # a trailing newline must not pass (it would break the sudo rule)
+        self.bad(lambda d: d.update(name="demo\n"), "name:")
+        self.bad(lambda d: d["actions"].update({"x\n": {}}), "action 'x\\n'")
+        self.bad(lambda d: d["commands"].append({"command": "x\n", "description": "x", "action": "status"}), "command 'x\\n'")
+        self.bad(lambda d: d.update(env={"OK\n": "x"}), "env:")
+        self.bad(lambda d: d.update(exec=["/bin/sh", "${HOME}/x.sh"]), "no $")
+        self.bad(lambda d: d.update(exec=["/bin/sh", "/opt/link/../x.sh"]), "without ..")
+        self.bad(lambda d: d.update(exec=["/bin//sh"]), "without ..")
 
     def test_registry_refuses_a_command_two_plugins_want(self):
         d = tempfile.mkdtemp()
@@ -543,10 +558,14 @@ class PluginTest(unittest.TestCase):
         d, src = tempfile.mkdtemp(), tempfile.mkdtemp()
         py = [sys.executable, "-I", os.path.join(HERE, "..", "opsbot.py")]
         try:
-            write_plugin(src, DEMO)
+            write_plugin(src, DEMO)  # /nonexistent/demo.sh: validate refuses a program that is not there
+            out = subprocess.run(py + ["validate", os.path.join(src, "demo.json"), "--plugins", d], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 1)
+            self.assertIn("not found: /nonexistent", out.stderr)
+            write_plugin(src, dict(DEMO, exec=["/bin/true"]))
             out = subprocess.run(py + ["validate", os.path.join(src, "demo.json"), "--plugins", d], capture_output=True, text=True)
             self.assertEqual((out.returncode, out.stdout), (0, "demo\n"))
-            write_plugin(d, dict(DEMO, name="other"), "other")
+            write_plugin(d, dict(DEMO, name="other", exec=["/bin/true"]), "other")
             out = subprocess.run(py + ["validate", os.path.join(src, "demo.json"), "--plugins", d], capture_output=True, text=True)
             self.assertEqual(out.returncode, 1)
             self.assertIn("/check is already other's", out.stderr)
@@ -562,6 +581,22 @@ class PluginTest(unittest.TestCase):
             self.assertEqual(out.stdout.splitlines(), ["demo " + a for a in DEMO["actions"]])
             out = subprocess.run(py + ["list", "--plugins", d], capture_output=True, text=True)
             self.assertEqual(out.stdout, "demo: /check /backup /proxy /size /uptime (+ /status)\n")
+            with open(os.path.join(d, "broken.json"), "w") as f:
+                f.write("{")
+            out = subprocess.run(py + ["sudoers", "opsbot", "/h", "--plugins", d], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0)  # a broken plugin is left out of the rule, not fatal for the others
+            self.assertIn("/h demo status", out.stdout)
+            self.assertNotIn("broken", out.stdout)
+            self.assertIn("skipped plugin broken.json", out.stderr)
+            out = subprocess.run(py + ["list", "--plugins", d], capture_output=True, text=True)
+            self.assertEqual((out.returncode, out.stdout), (1, "demo: /check /backup /proxy /size /uptime (+ /status)\n"))
+            os.unlink(os.path.join(d, "broken.json"))
+            with open(os.path.join(d, "demo.json"), "w") as f:
+                f.write('{"name": "demo", "old_key": 1}')  # the registered copy is broken: re-adding a good one must work
+            demo = dict(DEMO, exec=["/bin/true"])
+            write_plugin(src, demo)
+            out = subprocess.run(py + ["validate", os.path.join(src, "demo.json"), "--plugins", d], capture_output=True, text=True)
+            self.assertEqual((out.returncode, out.stdout), (0, "demo\n"), out.stderr)
         finally:
             shutil.rmtree(d)
             shutil.rmtree(src)
@@ -616,6 +651,40 @@ class HelperTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
         self.assertIn("not owned by root", p.stderr)
+
+    def test_a_symlink_root_alone_controls_runs_as_written(self):
+        # e.g. a virtualenv's python: it must keep its own path (run by its target it would lose the venv)
+        real = os.path.join(self.d, "real.sh")
+        with open(real, "w") as f:
+            f.write('#!/bin/sh\necho "ran:$0"\n')
+        os.chmod(real, 0o755)
+        link = os.path.join(self.d, "link.sh")
+        os.symlink(real, link)
+        write_plugin(self.plugins, {"name": "t", "exec": [link], "status": "status", "actions": {"status": {}}})
+        self.assertEqual(self.helper("t", "status"), (0, "ran:%s" % link))
+
+    def test_a_symlink_in_a_directory_others_can_write_is_refused(self):
+        # its target is fine, but someone could point the link elsewhere between the check and the run
+        real = os.path.join(self.d, "real.sh")
+        with open(real, "w") as f:
+            f.write('#!/bin/sh\necho ran\n')
+        os.chmod(real, 0o755)
+        shared = os.path.join(self.d, "shared")
+        os.mkdir(shared)
+        os.chmod(shared, 0o777)
+        os.symlink(real, os.path.join(shared, "link.sh"))
+        write_plugin(self.plugins, {"name": "t", "exec": [os.path.join(shared, "link.sh")], "status": "status",
+                                    "actions": {"status": {}}})
+        rc, out = self.helper("t", "status")
+        self.assertEqual(rc, 1)
+        self.assertIn("refused: group/world-writable: %s" % shared, out)
+
+    def test_a_program_that_is_not_there_is_refused(self):
+        write_plugin(self.plugins, {"name": "t", "exec": [os.path.join(self.d, "gone.sh")], "status": "status",
+                                    "actions": {"status": {}}})
+        rc, out = self.helper("t", "status")
+        self.assertEqual(rc, 1)
+        self.assertIn("refused: not found: %s" % os.path.join(self.d, "gone.sh"), out)
 
     def test_with_systemd_run_the_env_is_passed_as_setenv(self):
         log = os.path.join(self.d, "argv")

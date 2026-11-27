@@ -1069,6 +1069,7 @@ EOF
 ALERT_ONFAIL=
 OPSBOT_SH=${OPSBOT_SH:-$SCRIPT_DIR/../opsbot/opsbot.sh}
 OPSBOT_NOTIFY=${OPSBOT_NOTIFY:-/usr/local/bin/opsbot-notify}
+OPSBOT_NOTIFY_UNIT=${OPSBOT_NOTIFY_UNIT:-/usr/local/bin/opsbot-notify-unit}
 OPSBOT_TOKEN_FILE=${OPSBOT_TOKEN_FILE:-/etc/opsbot/token}
 # the alerts before opsbot: their token file (read once more, then removed) and sender
 ALERT_LEGACY=(/etc/ente-alert.env /usr/local/bin/ente-alert)
@@ -1093,8 +1094,9 @@ setup_alerts() {
   [[ -n $TG_BOT_TOKEN || -f $OPSBOT_TOKEN_FILE ]] || need_secret TG_BOT_TOKEN
   [[ -f $OPSBOT_SH ]] || die "opsbot is missing: $OPSBOT_SH (copy the repository's opsbot folder next to ente-server)"
   ce=$(config_env)
-  # OPSBOT_USER_ID unset: opsbot keeps its bot as it is (ente-tg-bot.sh install sets it up)
-  env -u OPSBOT_USER_ID OPSBOT_TOKEN="$TG_BOT_TOKEN" OPSBOT_CHAT_ID="$TG_CHAT_ID" bash "$OPSBOT_SH" install ||
+  # OPSBOT_USER_ID unset: opsbot keeps its bot as it is (ente-tg-bot.sh install sets it up). Plain assignments, not `env`:
+  # the token must not be on a command line.
+  ( unset OPSBOT_USER_ID; OPSBOT_TOKEN=$TG_BOT_TOKEN OPSBOT_CHAT_ID=$TG_CHAT_ID bash "$OPSBOT_SH" install ) ||
     die "opsbot install failed (see above): alerts are not set up"
   "$OPSBOT_NOTIFY" "🔔 Ente alerts on $(hostname) ($DOMAIN) are set up. Alerts arrive here when a backup or the daily check fails." </dev/null ||
     die "could not send to TG_CHAT_ID: wrong chat id, or nobody pressed Start in the bot / the bot is not in the group"
@@ -1111,7 +1113,7 @@ case \$u in
   ente-backup.service) title="❌ Backup failed on \$h"; why='ERROR|WARNING' ;;
   *) title="❌ \$u failed on \$h"; why='ERROR' ;;
 esac
-exec $OPSBOT_NOTIFY-unit "\$u" "\$title" "\$why"
+exec $OPSBOT_NOTIFY_UNIT "\$u" "\$title" "\$why"
 EOF
   write_file /etc/systemd/system/ente-alert@.service <<'EOF'
 [Unit]

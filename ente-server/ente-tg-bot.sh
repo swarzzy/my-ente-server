@@ -6,7 +6,8 @@
 #   /proxy    the S3 proxy's state; /proxy on | /proxy off      /size   measure both buckets now
 # Usage: ente-tg-bot.sh {install|uninstall|status|check}     (and `action NAME`, which opsbot's root helper runs)
 #   install    installs or updates opsbot from ../opsbot (token, chat and user from Ente's config) and registers Ente as its
-#              plugin "ente". An older ente-tg-bot service (before opsbot) is removed first: both cannot poll one token.
+#              plugin "ente". An older ente-tg-bot service (before opsbot) is stopped first (both cannot poll one token) and
+#              removed once opsbot serves Ente; if that fails, opsbot's bot is stopped and the older one started again.
 #   uninstall  unregisters the plugin (opsbot itself stays: other services may use it; `opsbot uninstall` removes it)
 # Config: TG_BOT_USER_ID in ente-setup.env (your Telegram user id: the same number as TG_CHAT_ID for a private chat).
 # Token: TG_BOT_TOKEN in ente-setup.secrets, else the one opsbot (or the older alerts or bot) stored.
@@ -66,7 +67,6 @@ plugin_json() {
 import json, sys
 script, ce = sys.argv[1], sys.argv[2]
 env = dict(kv.split("=", 1) for kv in ce.split())
-busy_proxy = "⏳ Busy: the last /proxy command hasn't finished yet."
 print(json.dumps({
     "name": "ente",
     "exec": ["/bin/bash", script, "action"],
@@ -76,25 +76,21 @@ print(json.dumps({
         {"command": "check", "description": "Full health check (about 30 s)", "action": "check"},
         {"command": "backup", "description": "Back up now", "action": "backup"},
         {"command": "proxy", "description": "S3 proxy: state, /proxy on, /proxy off",
-         "args": {"": "proxy-status", "status": "proxy-status", "on": "proxy-on", "off": "proxy-off"},
-         "usage": "Send /proxy, /proxy on or /proxy off."},
+         "args": {"": "proxy-status", "on": "proxy-on", "off": "proxy-off"}},
         {"command": "size", "description": "Measure both buckets now", "action": "size"},
     ],
     "actions": {
         "status": {"fail": "❌ Could not get Ente's status"},
-        "check": {"started": "⏳ Checking (about 30 s)...", "ok": "✅ Check passed", "fail": "❌ Check found problems",
-                  "busy": "⏳ A check is already running."},
-        "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed",
-                   "busy": "⏳ A backup is already running."},
+        "check": {"started": "⏳ Checking (about 30 s)...", "ok": "✅ Check passed", "fail": "❌ Check found problems"},
+        "backup": {"started": "⏳ Backing up...", "ok": "✅ Backup done", "fail": "❌ Backup failed"},
         "proxy-status": {"started": "⏳ Checking the S3 proxy...", "ok": "🔀 S3 proxy", "fail": "❌ S3 proxy has problems",
-                         "lock": "proxy", "busy": busy_proxy},
+                         "lock": "proxy"},
         "proxy-on": {"started": "⏳ Turning the S3 proxy on...", "ok": "✅ S3 proxy is on",
-                     "fail": "❌ Could not turn the S3 proxy on", "lock": "proxy", "busy": busy_proxy},
+                     "fail": "❌ Could not turn the S3 proxy on", "lock": "proxy"},
         "proxy-off": {"started": "⏳ Turning the S3 proxy off...", "ok": "✅ S3 proxy is off",
-                      "fail": "❌ Could not turn the S3 proxy off", "lock": "proxy", "busy": busy_proxy},
+                      "fail": "❌ Could not turn the S3 proxy off", "lock": "proxy"},
         "size": {"started": "⏳ Measuring the buckets (lists every object: a minute for a big library)...",
-                 "ok": "🪣 Bucket usage", "fail": "❌ Could not measure the buckets",
-                 "busy": "⏳ The buckets are already being measured."},
+                 "ok": "🪣 Bucket usage", "fail": "❌ Could not measure the buckets"},
     },
 }, indent=2, ensure_ascii=False))
 PY
@@ -258,13 +254,24 @@ bot_cmd_install() {
   # shellcheck disable=SC2046
   root_only_writable $(bot_root_files) ||
     die "the files the bot's actions run as root must be owned by root and writable by root only (chown -R root: $BOT_DIR; chmod -R go-w $BOT_DIR)"
-  remove_legacy
-  OPSBOT_TOKEN=$token OPSBOT_CHAT_ID=${TG_CHAT_ID:-$TG_BOT_USER_ID} OPSBOT_USER_ID=$TG_BOT_USER_ID bash "$OPSBOT_SH" install ||
-    die "opsbot install failed (see above)"
+  # The older bot polls the same token, which Telegram allows only once: stop it now (whatever state it is in) and remove it,
+  # with its token, only once opsbot serves Ente. If anything fails before, opsbot's bot is stopped and the older one started
+  # again. An empty OPSBOT_CHAT_ID keeps opsbot's chat (default: the user).
+  local legacy=no
+  if systemctl cat ente-tg-bot.service >/dev/null 2>&1; then systemctl stop ente-tg-bot.service; legacy=yes; fi
   tmp=$(mktemp -d)
-  plugin_json >"$tmp/ente.json" || { rm -rf "$tmp"; die "could not write the plugin file"; }
-  "$OPSBOT_CLI" plugin add "$tmp/ente.json" || { rm -rf "$tmp"; die "opsbot refused the plugin (see above)"; }
+  if ! OPSBOT_TOKEN=$token OPSBOT_CHAT_ID=${TG_CHAT_ID:-} OPSBOT_USER_ID=$TG_BOT_USER_ID bash "$OPSBOT_SH" install ||
+    ! plugin_json >"$tmp/ente.json" || ! "$OPSBOT_CLI" plugin add "$tmp/ente.json"; then
+    rm -rf "$tmp"
+    if [[ $legacy == yes ]]; then
+      systemctl disable --now opsbot.service >/dev/null 2>&1 || true
+      systemctl start ente-tg-bot.service || true
+      die "opsbot could not take over (see above); the older bot runs again"
+    fi
+    die "opsbot could not be set up for Ente (see above)"
+  fi
   rm -rf "$tmp"
+  remove_legacy
   log "telegram bot ready: send /status to it from your Telegram account (user $TG_BOT_USER_ID)"
 }
 
@@ -294,9 +301,9 @@ bot_usage() { echo "usage: $0 {install|uninstall|status|check}" >&2; exit 2; }
 
 # sourced (tests): define the functions only
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  case "$*" in
-    install | uninstall | status | check) ;;
-    "action status" | "action check" | "action backup" | "action proxy-on" | "action proxy-off" | "action proxy-status" | "action size") ;;
+  case "$#:${1:-}:${2:-}" in
+    1:install: | 1:uninstall: | 1:status: | 1:check:) ;;
+    2:action:status | 2:action:check | 2:action:backup | 2:action:proxy-on | 2:action:proxy-off | 2:action:proxy-status | 2:action:size) ;;
     *) bot_usage ;;
   esac
   [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }

@@ -173,8 +173,9 @@ More in `../opsbot/README.md`; other services can add their own commands as opsb
 
 **From the older bot (before opsbot).** After updating the repository (with `opsbot/` next to `ente-server/`):
 `sudo ./ente-setup.sh backup-setup` (the alerts move to opsbot; it also starts a backup) and `sudo ./ente-tg-bot.sh install`
-(stops and removes `ente-tg-bot.service`, its user, sudo rule and token, and turns on opsbot's bot). Either order works; the
-token is taken from where the older setup stored it, so a deleted secrets file is fine. The commands in Telegram stay the same.
+(stops `ente-tg-bot.service`, turns on opsbot's bot, then removes the older bot's service, user, sudo rule and token; if opsbot's
+install fails, the older bot is started again). Either order works; the token is taken from where the older setup stored it, so
+a deleted secrets file is fine. The commands in Telegram stay the same.
 
 ## Daily, automatic: `check`
 

@@ -33,7 +33,7 @@ in_bot() {
     LEGACY_UNIT=$T/legacy/ente-tg-bot.service LEGACY_TOKEN=$T/legacy/tok/token
     LEGACY_FILES=("$LEGACY_UNIT" "$T/legacy/sudoers" "$T/legacy/helper" "$T/legacy/ente_tg_bot.py")
     id() { [[ -n ${LEGACY_USER:-} ]]; }; userdel() { echo "userdel $*"; }; pkill() { return 1; }
-    systemctl() { echo "systemctl $*" >>"$T/systemctl.log"; }
+    systemctl() { echo "systemctl $*" >>"$T/systemctl.log"; [[ $1 != cat || -e $LEGACY_UNIT ]]; }
     set +e
     eval "$3" )
 }
@@ -76,8 +76,13 @@ out=$(in_bot "$U" "" 'bot_load_env; bot_token </dev/null && echo GOT' 2>&1); che
 echo "== the plugin file"
 mkdir -p "$T/pj"
 in_bot "$U" "" 'bot_load_env; plugin_json' >"$T/pj/ente.json" 2>"$T/pj.err"
-out=$(python3 -I "$OPSBOT_PY" validate "$T/pj/ente.json" --plugins "$T/none" 2>&1)
-check "opsbot's validator accepts it" '[[ $out == ente ]]' "$out $(cat "$T/pj.err")"
+out=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import opsbot; print(opsbot.read_plugin(sys.argv[2])["name"])' \
+  "$(dirname "$OPSBOT_PY")" "$T/pj/ente.json" 2>&1)
+check "opsbot's plugin checks accept it" '[[ $out == ente ]]' "$out $(cat "$T/pj.err")"
+if [[ $EUID -eq 0 ]]; then # the full validator also wants what it runs to be root's alone: only true as root
+  out=$(python3 -I "$OPSBOT_PY" validate "$T/pj/ente.json" --plugins "$T/none" 2>&1)
+  check "... and so does opsbot's validator, which also checks the scripts it runs are root's alone" '[[ $out == ente ]]' "$out"
+fi
 pj() { python3 -I -c "import json, sys; d = json.load(open(sys.argv[1])); print($1)" "$T/pj/ente.json"; }
 check "the helper runs this script's action command" '[[ $(pj "d[\"exec\"]") == "[$(printf "%s" "'"'"'/bin/bash'"'"', '"'"'$(realpath "$HERE/..")/ente-tg-bot.sh'"'"', '"'"'action'"'"'")]" ]]' "$(pj 'd["exec"]')"
 check "... with the config and secrets files this install used" \
@@ -86,10 +91,10 @@ check "commands: /check /backup /proxy /size, and Ente's /status lines" \
   '[[ $(pj "\" \".join(c[\"command\"] for c in d[\"commands\"]), d[\"status\"]") == "check backup proxy size status" ]]' "$(pj 'd["commands"]')"
 check "the seven actions, exactly those the script accepts" \
   '[[ $(pj "\" \".join(sorted(d[\"actions\"]))") == "backup check proxy-off proxy-on proxy-status size status" ]] &&
-   [[ $(grep -o "\"action [a-z-]*\"" "$HERE/../ente-tg-bot.sh" | tr -d "\"" | sed "s/action //" | sort | paste -sd" ") == "backup check proxy-off proxy-on proxy-status size status" ]]'
+   [[ $(grep -o "2:action:[a-z-]*" "$HERE/../ente-tg-bot.sh" | sed "s/2:action://" | sort | paste -sd" ") == "backup check proxy-off proxy-on proxy-status size status" ]]'
 check "/proxy on and off share one lock with /proxy" '[[ $(pj "{d[\"actions\"][a].get(\"lock\") for a in (\"proxy-on\", \"proxy-off\", \"proxy-status\")}") == "{'"'"'proxy'"'"'}" ]]'
 check "every long action says it started, and how it ended" \
-  '[[ $(pj "all({\"started\", \"ok\", \"fail\", \"busy\"} <= set(a) for n, a in d[\"actions\"].items() if n != \"status\")") == True ]]'
+  '[[ $(pj "all({\"started\", \"ok\", \"fail\"} <= set(a) for n, a in d[\"actions\"].items() if n != \"status\")") == True ]]'
 python3 -I "$OPSBOT_PY" sudoers opsbot /usr/local/sbin/opsbot-action --plugins "$T/pj" >"$T/sudoers"
 check "opsbot's sudo rule for it: exactly the seven actions, as root, for the bot user only" \
   '[[ $(grep -c "^opsbot ALL=(root) NOPASSWD:" "$T/sudoers") == 1 && $(grep -o "/usr/local/sbin/opsbot-action ente [a-z-]*" "$T/sudoers" | sort | sed "s|.* ||" | paste -sd" ") == "backup check proxy-off proxy-on proxy-status size status" ]]' "$(cat "$T/sudoers")"
@@ -103,23 +108,34 @@ fi
 echo "== install and uninstall"
 root_ok='root_only_writable() { :; }'
 out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
-check "install: opsbot with the token, the user, and the user as chat when TG_CHAT_ID is empty" \
-  '[[ $(cat "$T/opsbot.log") == "$(printf "args=install\ntoken=%s\nchat=376193354\nuser=376193354" "$TOKEN")" ]]' "$(cat "$T/opsbot.log"; echo "$out")"
+check "install: opsbot with the token and the user; no chat when TG_CHAT_ID is empty (opsbot keeps its own, else the user)" \
+  '[[ $(cat "$T/opsbot.log") == "$(printf "args=install\ntoken=%s\nchat=\nuser=376193354" "$TOKEN")" ]]' "$(cat "$T/opsbot.log"; echo "$out")"
 check "... then registers the plugin" '[[ $(cat "$T/cli.log") == "cli plugin add "*"/ente.json" && -s $T/plugins/ente.json ]] && grep -q "telegram bot ready" <<<"$out"' "$out"
 out=$(in_bot "$U
 TG_CHAT_ID=-1001234567" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
 check "... alerts to TG_CHAT_ID when it is set" 'grep -qx "chat=-1001234567" "$T/opsbot.log"' "$(cat "$T/opsbot.log")"
 rm -f "$T/cli.log"
 out=$(OPSBOT_FAILS=1 in_bot "$U" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
-check "a failed opsbot install stops it: nothing registered" '[[ $out == *"opsbot install failed"* && ! -e $T/cli.log ]]' "$out"
+check "a failed opsbot install stops it: nothing registered" '[[ $out == *"opsbot could not be set up for Ente"* && ! -e $T/cli.log ]]' "$out"
 out=$(in_bot "$U" "TG_BOT_TOKEN=$TOKEN" 'root_only_writable() { return 1; }; bot_cmd_install' 2>&1)
 check "scripts others can write: refused before anything is done" '[[ $out == *"must be owned by root"* && ! -e $T/cli.log ]]' "$out"
-mkdir -p "$T/legacy/tok"; touch "$T/legacy/ente-tg-bot.service" "$T/legacy/sudoers" "$T/legacy/helper" "$T/legacy/ente_tg_bot.py" "$T/legacy/tok/token"
+mkdir -p "$T/legacy/tok"; touch "$T/legacy/ente-tg-bot.service" "$T/legacy/sudoers" "$T/legacy/helper" "$T/legacy/ente_tg_bot.py"
+echo "$TOKEN" >"$T/legacy/tok/token"
+rm -f "$T/systemctl.log" "$T/opsbot.log"
+out=$(LEGACY_USER=1 OPSBOT_FAILS=1 in_bot "$U" "" "$root_ok; bot_cmd_install" 2>&1)
+check "opsbot's install fails while moving from the older bot: opsbot's bot stopped, the older one runs again, its token and files stay" \
+  '[[ $out == *"the older bot runs again"* && $(cat "$T/systemctl.log") == *"stop ente-tg-bot.service"*"disable --now opsbot.service"*"start ente-tg-bot.service"* && -f $T/legacy/tok/token && -f $T/legacy/ente-tg-bot.service ]]' "$out $(cat "$T/systemctl.log")"
+check "... (the older bot's token was offered to opsbot)" 'grep -qx "token=$TOKEN" "$T/opsbot.log"' "$(cat "$T/opsbot.log")"
 rm -f "$T/systemctl.log"
-out=$(LEGACY_USER=1 in_bot "$U" "TG_BOT_TOKEN=$TOKEN" "$root_ok; bot_cmd_install" 2>&1)
-check "the bot from before opsbot is removed first: service, files, token, user" \
-  '[[ -z $(find "$T/legacy" -type f) && $(cat "$T/systemctl.log") == *"disable --now ente-tg-bot.service"* && $out == *"userdel ente-tg-bot"* && $out == *"opsbot takes over"* ]]' "$out"
-check "... before opsbot starts polling the same token" '[[ $(grep -n "opsbot takes over" <<<"$out" | cut -d: -f1) -lt $(grep -n "telegram bot ready" <<<"$out" | cut -d: -f1) ]]' "$out"
+out=$(CLI_FAILS=1 LEGACY_USER=1 in_bot "$U" "" "$root_ok; bot_cmd_install" 2>&1)
+check "... the same when opsbot refuses Ente's plugin" \
+  '[[ $out == *"the older bot runs again"* && $(cat "$T/systemctl.log") == *"start ente-tg-bot.service"* && -f $T/legacy/tok/token ]]' "$out"
+rm -f "$T/systemctl.log"
+out=$(LEGACY_USER=1 in_bot "$U" "" "$root_ok; bot_cmd_install" 2>&1)
+check "the bot from before opsbot is stopped (whatever its state) before opsbot polls the same token" \
+  '[[ $(head -1 "$T/systemctl.log") == "systemctl cat ente-tg-bot.service" && $(sed -n 2p "$T/systemctl.log") == "systemctl stop ente-tg-bot.service" ]]' "$(cat "$T/systemctl.log")"
+check "... and removed once opsbot serves Ente: service, files, token, user" \
+  '[[ -z $(find "$T/legacy" -type f) && $(cat "$T/systemctl.log") == *"disable --now ente-tg-bot.service"* && $out == *"userdel ente-tg-bot"* && $out == *"opsbot takes over"* && $out == *"telegram bot ready"* ]]' "$out"
 rm -f "$T/cli.log"
 out=$(in_bot "$U" "" 'bot_cmd_uninstall' 2>&1)
 check "uninstall: unregisters the plugin, opsbot stays" '[[ $(cat "$T/cli.log") == "cli plugin remove ente" && ! -e $T/plugins/ente.json && $out == *"opsbot stays"* ]]' "$out"

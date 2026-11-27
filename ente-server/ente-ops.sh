@@ -421,7 +421,7 @@ cmd_news() {
 '"Read the release notes (https://github.com/ente/ente/releases), then: sudo $SCRIPT_DIR/ente-setup.sh update"
   printf '%s
 ' "$msg"
-  if [[ -x $ALERT_BIN ]]; then printf '%s
+  if [[ -n $TG_CHAT_ID && -x $ALERT_BIN ]]; then printf '%s
 ' "$msg" | "$ALERT_BIN" "🆕 Newer Ente builds for $(hostname)" || die "could not send to Telegram"; fi
 }
 

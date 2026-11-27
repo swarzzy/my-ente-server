@@ -227,7 +227,8 @@ check "a backup is running: waits for next week" '((RC == 0)) && grep -q "ente-b
 
 echo "== news: newer Ente builds"
 # news_run: ente-ops.sh news with the registry stubbed: LM / LW = the digest numbers of museum's and web's latest (the pins are
-# 1 and 2); REG_DOWN: the registry does not answer; NO_ALERT: alerts not set up; SEND_FAIL: Telegram rejects. Sent messages go to $T/sent.
+# 1 and 2); REG_DOWN: the registry does not answer; NO_ALERT: opsbot not installed; NO_CHAT: Ente's alerts off (TG_CHAT_ID empty,
+# opsbot still there for others); SEND_FAIL: Telegram rejects. Sent messages go to $T/sent.
 news_run() {
   reset; rm -f "$T/sent"
   printf '#!/bin/bash\n[[ -z $SEND_FAIL ]] || exit 1\n{ echo "TITLE $1"; cat; } >"%s"\n' "$T/sent" >"$T/alert"; chmod 755 "$T/alert"
@@ -237,6 +238,7 @@ news_run() {
     ENTE_DIR=$T/ente PINS=$T/ente/image-pins ALERT_BIN=$T/alert
     [[ -z ${NO_ALERT:-} ]] || ALERT_BIN=$T/none
     set +e
+    load_env; TG_CHAT_ID=$([[ -n ${NO_CHAT:-} ]] || echo -1001234567); load_env() { :; }
     docker() {
       [[ -z ${REG_DOWN:-} ]] || return 1
       case "$1 $2 $3 $4" in
@@ -259,6 +261,8 @@ LM=3 LW=4 news_run; RC=$?
 check "both newer: both listed" '((RC == 0)) && grep -q "^museum: running the build of 2026-10-01, a newer one is from 2026-11-15$" "$T/sent" && grep -q "^web:" "$T/sent"' "$(cat "$T/sent" 2>&1)"
 LW=4 NO_ALERT=1 news_run; RC=$?
 check "without Telegram alerts: only printed" '((RC == 0)) && grep -q "^web: running" "$T/out" && [[ ! -e $T/sent ]]' "$(cat "$T/out")"
+LW=4 NO_CHAT=1 news_run; RC=$?
+check "Ente's alerts off (TG_CHAT_ID empty) while opsbot stays for others: only printed" '((RC == 0)) && grep -q "^web: running" "$T/out" && [[ ! -e $T/sent ]]' "$(cat "$T/out")"
 LW=4 SEND_FAIL=1 news_run; RC=$?
 check "Telegram rejects it: it fails (the unit's alert retries the message)" '((RC != 0)) && grep -q "could not send to Telegram" "$T/out"' "$(cat "$T/out")"
 REG_DOWN=1 news_run; RC=$?
