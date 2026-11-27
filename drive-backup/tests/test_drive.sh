@@ -8,7 +8,7 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 command -v rclone >/dev/null || { echo "rclone is not installed"; exit 1; }
 OPSBOT_PY=$HERE/../../opsbot/opsbot.py
-mkdir -p "$T/src/vault/d" "$T/dst" "$T/st" "$T/units" "$T/etc"
+mkdir -p "$T/src/vault/d" "$T/dst/bak" "$T/st" "$T/units" "$T/etc"
 printf '[drive]\ntype = alias\nremote = %s/src\n\n[drivebak]\ntype = alias\nremote = %s/dst\n' "$T" "$T" >"$T/rclone.conf"
 cat >"$T/env" <<'X'
 DRIVE_S3_ENDPOINT=s3.example.net
@@ -46,6 +46,10 @@ out=$(in_db 'cmd_run; echo "rc=$?"')
 check "2 of 20 changed or gone (10%): synced" '[[ $out == *"2 changed or gone"* && $out == *"rc=0" && $(files "$T/dst/bak/drive") == 19 ]]' "$out"
 for i in $(seq 21 80); do head -c 50 /dev/urandom >"$T/src/vault/d/n$i.c9r"; done
 out=$(in_db 'cmd_run; echo "rc=$?"'); check "60 new files: no guard (new files destroy nothing)" '[[ $out == *"rc=0" && $(files "$T/dst/bak/drive") == 79 ]]' "$out"
+sleep 1; for i in $(seq 21 30); do head -c 50 /dev/urandom >"$T/src/vault/d/n$i.c9r"; done # rewritten, same size
+out=$(in_db 'cmd_run; echo "rc=$?"')
+check "10 of 79 rewritten at the same size: the guard counts them as the sync would (a dry run, not sizes)" '[[ $out == *"guard: 10 of 79"* && $out != *"rc=0" ]]' "$out"
+in_db 'cmd_run force' >/dev/null
 cp -r "$T/dst" "$T/dst.before"
 for f in "$T"/src/vault/d/n*.c9r; do head -c 70 /dev/urandom >"$f"; done # "ransomware": most files rewritten
 out=$(in_db 'cmd_run; echo "rc=$?"')
@@ -65,7 +69,9 @@ out=$(in_db 'cmd_run force; echo "rc=$?"'); check "forced (run --force): synced"
 echo "DRIVE_MAX_CHANGE=50" >>"$T/env"; for f in "$T"/src/vault/d/n5*.c9r; do head -c 90 /dev/urandom >"$f"; done
 out=$(in_db 'cmd_run; echo "rc=$?"'); check "DRIVE_MAX_CHANGE raises the limit" '[[ $out == *"rc=0" ]]' "$out"
 sed -i '/DRIVE_MAX_CHANGE/d' "$T/env"
-out=$(in_db 'exec 9>"$T/st/lock"; flock -n 9; (cmd_run); echo "rc=$?"'); check "a second run while one runs: refused" '[[ $out == *"a sync is already running"* && $out != *"rc=0" ]]' "$out"
+out=$(in_db 'exec 9>"$T/st/lock"; flock -n 9; (cmd_run); echo "rc=$?"'); check "a second run while one runs (or a verify): refused" '[[ $out == *"a sync or verify is already running"* && $out != *"rc=0" ]]' "$out"
+echo "DRIVE_B2_BUCKET=bakk" >>"$T/env"; out=$(in_db 'cmd_run; echo "rc=$?"'); sed -i '/^DRIVE_B2_BUCKET=bakk$/d' "$T/env"
+check "a backup bucket that does not exist (a typo): an error, not a first run" '[[ $out == *"cannot read the backup drivebak:bakk/drive (bucket, key?)"* && $out != *"rc=0" && ! -e $T/dst/bakk ]]' "$out"
 mv "$T/src" "$T/src.away"; out=$(in_db 'cmd_run; echo "rc=$?"'); mv "$T/src.away" "$T/src"
 check "the drive cannot be read: an error, nothing synced" '[[ $out == *"cannot read the drive drive:vault"* && $out != *"rc=0" && $(files "$T/dst/bak/drive") == 60 ]]' "$out"
 

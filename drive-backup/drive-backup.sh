@@ -10,7 +10,7 @@ ENV_FILE=${ENV_FILE:-$DB_DIR/drive-backup.env}
 SECRETS_FILE=${SECRETS_FILE:-$DB_DIR/drive-backup.secrets}
 ETC=${ETC:-/etc/drive-backup}
 RCLONE_CONF=${RCLONE_CONF:-$ETC/rclone.conf}
-STATE=${STATE:-/var/lib/drive-backup}   # last-ok, guard, verify-ok, plan
+STATE=${STATE:-/var/lib/drive-backup}   # last-ok, guard, verify-ok, the plan of the last run
 UNITS=${UNITS:-/etc/systemd/system}
 OPSBOT_CLI=${OPSBOT_CLI:-/usr/local/sbin/opsbot}
 LOG=/var/log/drive-backup.log
@@ -74,35 +74,63 @@ config_env() {
 }
 
 # ---------------------------------------------------------------- sync
-# cmd_run [force]: the guard, then the sync. The guard compares the drive with the backup (rclone check: per file =, * changed,
-# - only in the backup, + new) and stops when more than DRIVE_MAX_CHANGE % of the backup's files would be overwritten or
-# removed: a ransomware-encrypted or wiped drive must not replace the backup unnoticed. FORCE syncs anyway (after a look).
+# plan: what the sync would do, from its own dry run (so the guard and the sync always judge a file the same way) and the
+# backup's listing with sizes: "NEW CHANGED TOTAL COUNT BYTES": files new to the backup, files of it the sync would overwrite
+# or remove, the files it holds now, and how many files and bytes it will hold afterwards
+plan() {
+  python3 -I - "$STATE/plan.json" "$STATE/backup.list" <<'PY'
+import json, sys
+have = {}
+for line in open(sys.argv[2]):
+    size, _, name = line.rstrip("\n").partition(";")
+    have[name] = int(size)
+new = changed = 0
+count, size = len(have), sum(have.values())
+for line in open(sys.argv[1]):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    what, name = e.get("skipped"), e.get("object")
+    if what == "copy" and name in have:
+        changed, size = changed + 1, size - have[name] + e.get("size", 0)
+    elif what == "copy":
+        new, count, size = new + 1, count + 1, size + e.get("size", 0)
+    elif what == "delete" and name in have:
+        changed, count, size = changed + 1, count - 1, size - have[name]
+print(new, changed, len(have), count, size)
+PY
+}
+
+# cmd_run [force]: the guard, then the sync. The guard stops when more than DRIVE_MAX_CHANGE % of the backup's files would be
+# overwritten or removed: a ransomware-encrypted or wiped drive must not replace the backup unnoticed. FORCE syncs anyway.
 cmd_run() {
-  local force=${1:-} total changed n
+  local force=${1:-} new changed total count bytes st=0
   load_config
   install -d -m 700 "$STATE"
   exec 9>"$STATE/lock"
-  flock -n 9 || die "a sync is already running"
-  # both sides answer (the backup's folder may not exist yet: exit 3, the first run); then the per-file comparison, whose exit
-  # status only says that something differs
+  flock -n 9 || die "a sync or verify is already running"
   rc lsf --max-depth 1 "$SRC" >/dev/null 2>"$STATE/plan.err" || die "cannot read the drive $SRC: $(tail -1 "$STATE/plan.err")"
-  rc lsf --max-depth 1 "$DST" >/dev/null 2>"$STATE/plan.err" || [[ $? == 3 ]] || die "cannot read the backup $DST: $(tail -1 "$STATE/plan.err")"
-  rc check "$SRC" "$DST" --combined "$STATE/plan" >/dev/null 2>"$STATE/plan.err" || true
-  ! grep -q '^! ' "$STATE/plan" || die "cannot compare the drive with the backup: $(grep -m1 '^! ' "$STATE/plan")"
-  total=$(grep -c '^[=*-] ' "$STATE/plan" || true) changed=$(grep -c '^[*-] ' "$STATE/plan" || true)
+  # the backup's files; its folder may not exist yet (exit 3: the first run), but its bucket must
+  rc lsf -R --files-only --format sp "$DST" >"$STATE/backup.list" 2>"$STATE/plan.err" || st=$?
+  if ((st)); then
+    ((st == 3)) && rc lsf --max-depth 1 drivebak: 2>/dev/null | grep -qx "$DRIVE_B2_BUCKET/" ||
+      die "cannot read the backup $DST (bucket, key?): $(tail -1 "$STATE/plan.err")"
+  fi
+  rc sync "$SRC" "$DST" --fast-list --dry-run --use-json-log -v 2>"$STATE/plan.json" ||
+    die "cannot plan the sync: $(grep -o '"msg":"[^"]*' "$STATE/plan.json" | tail -1 | cut -c8-)"
+  read -r new changed total count bytes < <(plan)
   if [[ $force != force ]] && ((total > 0 && changed * 100 > total * DRIVE_MAX_CHANGE)); then
     echo "$changed $total" >"$STATE/guard"
     die "guard: $changed of $total files in the backup would change or go ($((changed * 100 / total))% > $DRIVE_MAX_CHANGE%), nothing synced. Look at the drive; if it is right: /drive_force (or $0 run --force)"
   fi
-  n=$(grep -c '^+ ' "$STATE/plan" || true)
-  log "syncing: $n new, $changed changed or gone, $((total - changed)) unchanged${force:+ (forced)}"
-  # --max-delete: a second stop, for what changed since the check
+  log "syncing: $new new, $changed changed or gone, $((total - changed)) unchanged${force:+ (forced)}"
+  # --max-delete: a second stop, for what changed since the plan
   rc sync "$SRC" "$DST" --fast-list $([[ $force == force ]] || echo "--max-delete $((total * DRIVE_MAX_CHANGE / 100 + 1))") ||
     die "sync failed (the backup keeps what it had; the next run continues)"
   rm -f "$STATE/guard"
-  n=$(rc size --json "$DST" 2>/dev/null | python3 -I -c 'import json, sys; d = json.load(sys.stdin); print(d["count"], d["bytes"])' || echo "? ?")
-  echo "$(date -Is) $n" >"$STATE/last-ok"
-  log "synced: the backup holds ${n% *} files"
+  echo "$(date -Is) $count $bytes" >"$STATE/last-ok"
+  log "synced: the backup holds $count files"
   [[ -z $DRIVE_HC_URL ]] || curl -fsS -m 20 --retry 3 -o /dev/null "$DRIVE_HC_URL" || log "heartbeat ping failed"
 }
 
@@ -111,6 +139,8 @@ cmd_verify() {
   local out
   load_config
   install -d -m 700 "$STATE"
+  exec 9>"$STATE/lock"
+  flock -w 21600 9 || die "a sync has run for 6 hours: verify skipped" # files in flight are not differences
   out=$(rc check "$SRC" "$DST" --one-way 2>&1) || die "the backup differs from the drive: $(grep -E 'ERROR|differences' <<<"$out" | tail -3)"
   rc lsf -R --files-only "$SRC" | shuf -n 5 >"$STATE/sample" || true
   if [[ -s $STATE/sample ]]; then
@@ -184,7 +214,8 @@ key = $DRIVE_B2_KEY
 EOF
 }
 
-# key_checks: both buckets answer; and what the keys could do beyond their job (WARN: the setup is still safe, less so)
+# key_checks: both buckets answer, and whether the backup key could delete for good (WARN: still safe, less so). Whether the
+# drive key could write is not tried: that would put a file into the vault.
 key_checks() {
   local t=.drive-backup-key-test
   rc lsf --max-depth 1 "$SRC" >/dev/null 2>&1 && ok "the drive can be read" || bad "cannot read the drive $SRC (endpoint, bucket, key?)"
@@ -193,9 +224,6 @@ key_checks() {
   if rc deletefile --b2-hard-delete "$DST/$t" 2>/dev/null; then warn "the backup key can delete for good: give it no deleteFiles (README)"
   else ok "the backup key cannot delete for good (no deleteFiles): changed and deleted files stay for the lifecycle's days"
     rc deletefile "$DST/$t" 2>/dev/null || true; fi # hidden; the lifecycle removes it
-  if echo test | rc rcat "$SRC/$t" 2>/dev/null; then
-    warn "the drive key may write: the server needs it read-only (README)"; rc deletefile "$SRC/$t" 2>/dev/null || true
-  else ok "the drive key is read-only"; fi
 }
 
 units() { # the backup and verify services and timers
@@ -299,11 +327,11 @@ cmd_uninstall() {
 
 # check: OK/WARN/FAIL lines; exit 1 on a FAIL
 cmd_check() {
-  local d
+  local d t
   load_config
   if systemctl is-enabled --quiet drive-backup.timer 2>/dev/null; then ok "nightly backup timer on"; else bad "the nightly backup timer is off ($0 install)"; fi
   [[ $(stat -c '%U %a' "$RCLONE_CONF" 2>/dev/null) == "root 600" ]] && ok "keys root-only" || bad "$RCLONE_CONF is missing or not root's alone (600)"
-  if [[ -f $STATE/guard ]]; then bad "the guard stopped the last sync: $(cat "$STATE/guard" | awk '{print $1 " of " $2}') files would change (/drive_force)"
+  if [[ -f $STATE/guard ]]; then read -r d t <"$STATE/guard"; bad "the guard stopped the last sync: $d of $t files would change (/drive_force)"
   elif [[ ! -f $STATE/last-ok ]]; then bad "no good sync yet (journalctl -u drive-backup)"
   else
     read -r d _ <"$STATE/last-ok"

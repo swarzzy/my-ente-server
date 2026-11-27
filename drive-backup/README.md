@@ -6,7 +6,7 @@ It plugs into [opsbot](../opsbot/README.md) for alerts and Telegram commands; it
 
 - **Nightly at 04:00** (`drive-backup.timer`): `rclone sync` of the drive bucket to the backup bucket. A file changed or deleted
   on the drive is changed or hidden in the backup, and B2 keeps the old version for the lifecycle's days.
-- **The guard:** before syncing, it compares both. If more than `DRIVE_MAX_CHANGE` % (default 10) of the backup's files would
+- **The guard:** before syncing, it plans the sync (a dry run, so it judges each file exactly as the sync will). If more than `DRIVE_MAX_CHANGE` % (default 10) of the backup's files would
   be overwritten or removed (a wiped drive, or ransomware that re-encrypted it), it stops, changes nothing and alerts you.
   New files do not count. After a look at the drive: `/drive_force` in Telegram (or `drive-backup.sh run --force`).
 - **The keys cannot destroy the backup:** the server's drive key only reads; its backup key has no `deleteFiles`, so the worst
@@ -29,7 +29,8 @@ pip install b2
 b2 account authorize                 # your master key, only here
 b2 key create --bucket my-drive-backup drive-backup-server listBuckets,listFiles,readFiles,writeFiles
 ```
-`install` tries what each key can do and warns if the drive key may write or the backup key may delete.
+`install` tries the backup key and warns if it may delete for good. It does not try whether the drive key may write (that
+would put a file into your vault): give it read rights only.
 
 ## Install
 
