@@ -120,9 +120,9 @@ All three are optional and installed separately; each has `install`, `uninstall`
 
 | Part | What it does | What to test |
 | --- | --- | --- |
-| `run` (nightly 04:00, `/drive_sync`) | The guard first: the sync's own dry run against the backup's listing; more than `DRIVE_MAX_CHANGE` % (10) of the backup's files would change or go: stop, alert, change nothing. Else `rclone sync` to B2 (its own API: deleted files are hidden, old versions kept by the bucket's lifecycle), `--max-delete` as a second stop. `run --force` / `/drive_force` (only while the guard holds) syncs anyway. | New files never trip it; changes and deletions over the limit do; nothing is synced then; force clears it; an unreadable side is an error. |
+| `run` (nightly 04:00, `/drive_sync`) | The guard first: the sync's own dry run against the backup's listing; more than `DRIVE_MAX_CHANGE` % (10) of the backup's files would change or go: stop, alert, change nothing. Else `rclone sync` to B2 (its own API: deleted files are hidden, old versions kept by the bucket's lifecycle), `--max-delete` as a second stop. `run --force` / `/drive_force` (only while the guard holds) accepts the changes the guard saw (+10%), not more. | New files never trip it; changes and deletions over the limit do; nothing is synced then; force clears it; an unreadable side is an error. |
 | `verify` (monthly) | Every drive file in the backup at the same size, 5 random ones byte for byte. | A differing file fails it. |
-| `restore TIME [PATH]` | The backup as it was at TIME (`--b2-version-at`) into `/var/tmp/drive-restore-*`. | A changed and a deleted file come back as they were (end to end, real B2). |
+| `restore TIME` | The whole vault as it was at TIME (`--b2-version-at`) into `/var/tmp/drive-restore-*`. | A changed and a deleted file come back as they were (end to end, real B2). |
 | `install` | rclone.conf (600) from the secrets file, tries the backup key (warns if it may delete for good), timers, the opsbot plugin `drive`, a first sync. | Keys kept when the secrets file is gone; the plugin passes opsbot's validator. |
 
 ## Tests

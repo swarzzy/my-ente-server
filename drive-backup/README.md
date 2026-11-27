@@ -8,7 +8,9 @@ It plugs into [opsbot](../opsbot/README.md) for alerts and Telegram commands; it
   on the drive is changed or hidden in the backup, and B2 keeps the old version for the lifecycle's days.
 - **The guard:** before syncing, it plans the sync (a dry run, so it judges each file exactly as the sync will). If more than `DRIVE_MAX_CHANGE` % (default 10) of the backup's files would
   be overwritten or removed (a wiped drive, or ransomware that re-encrypted it), it stops, changes nothing and alerts you.
-  New files do not count. After a look at the drive: `/drive_force` in Telegram (or `drive-backup.sh run --force`).
+  New files do not count; on a quiet night nothing else runs. After a look at the drive: `/drive_force` in Telegram (or
+  `drive-backup.sh run --force`). Forcing accepts the changes the guard saw (and 10% more, as the drive keeps changing), not
+  more: if the drive changed further meanwhile, the guard stops again with the new numbers.
 - **The keys cannot destroy the backup:** the server's drive key only reads; its backup key has no `deleteFiles`, so the worst
   it can do is hide files, which B2 keeps for 30 days (the lifecycle rule, which this key cannot change).
 - **Monthly verify** (the 1st, 05:00): every file of the drive is in the backup at the same size, and 5 random ones are the
@@ -34,7 +36,8 @@ would put a file into your vault): give it read rights only.
 
 ## Install
 
-Needs opsbot with its bot (`../opsbot`; on the Ente server `ente-tg-bot.sh install` sets it up) and rclone (installed if missing).
+Needs opsbot with its bot (`../opsbot`; on the Ente server `ente-tg-bot.sh install` sets it up) and rclone 1.66 or newer
+(installed if missing; Debian's own package is too old).
 ```
 cp drive-backup.env.example drive-backup.env          # fill in
 cp drive-backup.secrets.example drive-backup.secrets  # the two keys; chmod 600
@@ -48,15 +51,14 @@ checks this script, the config and the keys before each action). `check` (OK/FAI
 
 ```
 sudo ./drive-backup.sh restore '2026-11-20 12:00'          # the whole vault as it was then (the server's time)
-sudo ./drive-backup.sh restore '2026-11-20 12:00' d/AB      # one folder of it
 ```
-It goes into a new folder `/var/tmp/drive-restore-<time>/`: the vault's encrypted files. Open it with Cryptomator (copy it to a
-PC), or copy it back into the drive bucket with a key that may write (from a PC: `rclone copy`). Inside the vault the folder
-names are encrypted too, so restoring the whole vault is the usual way.
+It goes into a new folder `/var/tmp/drive-restore-<time>/`: the vault's encrypted files (its folder names are encrypted too, so
+it is always the whole vault). Open it with Cryptomator (copy it to a PC), or copy it back into the drive bucket with a key that
+may write (from a PC: `rclone copy`).
 
 ## Tests
 
 | Command | Where | What |
 | --- | --- | --- |
-| `bash tests/test_drive.sh` | anywhere with rclone (local folders stand in for the buckets) | config checks, first sync, the guard (changes and deletions over the limit stop it, new files do not), forcing past it, `/status`, check, verify, the lock, rclone.conf, units, the plugin file |
+| `bash tests/test_drive.sh` | anywhere with rclone 1.66+ (local folders stand in for the buckets) | config checks, first sync, the guard (changes, same-size rewrites and deletions over the limit stop it, new files do not), forcing past it (only what was seen), `/status`, check, verify, the lock, a missing bucket, rclone.conf, units, the plugin file |
 | `sudo bash tests/drive_e2e.sh` | a server with opsbot's bot, `DRIVE_E2E_ENV`/`DRIVE_E2E_SECRETS` pointing at test buckets | against real buckets (a test folder in each): sync, a change and a deletion kept as versions in B2 and restored as of before, the guard and `/drive_force` through opsbot's real helper, what the keys may do; removes its test folders |
